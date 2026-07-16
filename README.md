@@ -60,7 +60,7 @@ Then run `chmod +x start.command` once in Terminal. After that, double-clicking 
 ## Data & privacy
 
 - Your watchlist, portfolio, ticker settings, and weather location are stored in your browser's local storage — on your machine only, never uploaded anywhere.
-- If you use the miner-tracking feature, discovered miner IPs are saved to a local `miners.json` file created next to `proxy.py`. This file is machine-specific; avoid committing it if you fork or contribute to this repo.
+- If you use the miner-tracking feature, discovered miner IPs are saved to a local `miners.json` file created next to `proxy.py` the first time you add a miner. This file is machine-specific and isn't included in the repo — see `miners.example.json` for the expected format. Avoid committing your real `miners.json` if you fork or contribute to this repo.
 - If you log into the Nostr client with a private key (nsec), it's stored in your browser's local storage in plain text. Use this only on a trusted device, or prefer a browser extension signer (NIP-07) when available.
 
 ## Optional: extended financial data
