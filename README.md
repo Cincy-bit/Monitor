@@ -76,6 +76,3 @@ python3 proxy.py
 
 Issues and pull requests are welcome. Please avoid committing any personal data (API keys, `miners.json`, browser-exported settings) in contributions.
 
-## License
-
-Add a license of your choice (e.g. MIT) here.
