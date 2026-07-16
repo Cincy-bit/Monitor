@@ -1,70 +1,81 @@
 # Monitor-App
 
-A personal dashboard that tracks news, financial markets, your portfolio, weather, and Bitcoin miners on your network — with customizable watchlists and tickers. It also acts as a Nostr client with adjustable panes.
+A personal dashboard for tracking financial markets, news, your portfolio, weather, and Bitcoin miners on your local network — all in one customizable view. It also doubles as a lightweight Nostr client.
 
-**Currently only works on Mac.**
+> **Platform:** macOS only (for now)
+
+## Features
+
+- 📈 Live prices for stocks, ETFs, indices, commodities, and crypto, with a customizable watchlist and scrolling ticker
+- 📰 Aggregated news from multiple sources, sorted by category
+- 💼 Personal portfolio tracking (cost basis, P/L) — stored locally, never sent anywhere
+- ⛏️ Bitcoin miner monitoring for devices on your local network
+- 🌦️ Weather by ZIP code or coordinates
+- 🟣 Built-in Nostr client with adjustable panes
 
 ## Requirements
 
 - macOS
-- Python 3 (comes pre-installed on modern Macs — check with `python3 --version` in Terminal)
-- A modern web browser (Chrome, Safari, etc.)
+- Python 3 (pre-installed on modern Macs — check with `python3 --version`)
+- A modern web browser
 
-No other installs, API keys, or accounts are required to get the dashboard running. (Financial statement data optionally uses a free [Financial Modeling Prep](https://financialmodelingprep.com/) key — see **Optional** below.)
+No accounts, sign-ups, or paid API keys are required to run the dashboard. All optional third-party data sources used are free.
 
-## Setup
+## Getting started
 
-1. **Download the files.** Click the green `Code` button on this repo → `Download ZIP`, then unzip it. Or, if you have git installed:
+1. **Download this repo.**
+   - Click **Code → Download ZIP** above and unzip it, or
+   - Clone it with git:
+     ```bash
+     git clone https://github.com/Cincy-bit/Monitor-App.git
+     ```
+2. Keep `monitor.html` and `proxy.py` in the same folder — the server looks for `monitor.html` alongside itself.
+3. Open **Terminal**, navigate to the folder, and run the server:
    ```bash
-   git clone https://github.com/<your-username>/Monitor-App.git
-   ```
-2. Make sure `monitor.html` and `proxy.py` are in the **same folder** — the server looks for `monitor.html` right next to itself.
-
-## Running it
-
-1. Open **Terminal** (search for it with Spotlight — `Cmd + Space`, type "Terminal").
-2. Navigate to the folder where you saved the files, for example:
-   ```bash
-   cd ~/Downloads/Monitor-App
-   ```
-3. Start the server:
-   ```bash
+   cd path/to/Monitor-App
    python3 proxy.py
    ```
-   You should see a message confirming the server is running on port `8082`.
-4. Open your browser and go to:
+4. Open your browser to:
    ```
    http://127.0.0.1:8082
    ```
-5. Leave the Terminal window open — closing it stops the server. To stop it manually, click into the Terminal window and press `Ctrl + C`.
+5. Keep the Terminal window open while using the dashboard. Press `Ctrl + C` in Terminal to stop the server.
 
-## Restarting later
+### Optional: one-click launcher
 
-Every time you want to use the dashboard again, just repeat the "Running it" steps: `cd` into the folder, run `python3 proxy.py`, and open `http://127.0.0.1:8082` in your browser.
+To avoid retyping commands each time, save this as `start.command` in the same folder:
 
-If you'd rather not retype the `cd` command each time, you can create a simple double-clickable script:
-1. Open TextEdit (or any text editor), paste in:
-   ```bash
-   #!/bin/bash
-   cd "$(dirname "$0")"
-   python3 proxy.py
-   ```
-2. Save it as `start.command` in the same folder as `monitor.html` and `proxy.py`.
-3. In Terminal, run `chmod +x start.command` once to make it executable.
-4. After that, you can just double-click `start.command` to launch the server.
+```bash
+#!/bin/bash
+cd "$(dirname "$0")"
+python3 proxy.py
+```
 
-## Notes
+Then run `chmod +x start.command` once in Terminal. After that, double-clicking `start.command` starts the server.
 
-- **Local only:** the server binds to `127.0.0.1`, meaning it's only accessible from your own Mac — it isn't exposed to your network or the internet.
-- **Your data stays local:** watchlist, portfolio, ticker settings, and weather location are all saved in your browser's local storage on your machine, not in this repo or anywhere online.
-- **Miners:** if you use the Bitcoin miner tracking feature, miner IPs are saved to a `miners.json` file that the server creates in this folder. That file is specific to your setup — don't commit it if you push further changes back to GitHub.
-- **Nostr login:** if you log into the Nostr client features using a private key (nsec), be aware it's stored in your browser's local storage in plain text. Only do this on a device you trust, and consider using a browser extension signer (NIP-07) instead where possible.
+## How it works
 
-## Optional: Financial statement data
+`proxy.py` runs a small local server on `127.0.0.1:8082` that serves the dashboard and proxies requests to public data sources (Yahoo Finance, Open-Meteo, RSS feeds, SEC EDGAR, and others) to work around CORS restrictions. It only binds to your local machine — it is not exposed to your network or the internet.
 
-Company financial statements pull from free public sources (SEC EDGAR) by default and need no setup. If you want to add a [Financial Modeling Prep](https://financialmodelingprep.com/) API key for extended data, set it as an environment variable before starting the server:
+## Data & privacy
+
+- Your watchlist, portfolio, ticker settings, and weather location are stored in your browser's local storage — on your machine only, never uploaded anywhere.
+- If you use the miner-tracking feature, discovered miner IPs are saved to a local `miners.json` file created next to `proxy.py`. This file is machine-specific; avoid committing it if you fork or contribute to this repo.
+- If you log into the Nostr client with a private key (nsec), it's stored in your browser's local storage in plain text. Use this only on a trusted device, or prefer a browser extension signer (NIP-07) when available.
+
+## Optional: extended financial data
+
+Financial statements pull from free public SEC EDGAR data by default — no setup needed. To use [Financial Modeling Prep](https://financialmodelingprep.com/) for extended data instead, set an API key as an environment variable before starting the server:
 
 ```bash
 export FMP_API_KEY=your_key_here
 python3 proxy.py
 ```
+
+## Contributing
+
+Issues and pull requests are welcome. Please avoid committing any personal data (API keys, `miners.json`, browser-exported settings) in contributions.
+
+## License
+
+Add a license of your choice (e.g. MIT) here.
