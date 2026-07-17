@@ -27,12 +27,12 @@ No accounts, sign-ups, or paid API keys are required to run the dashboard. All o
    - Click **Code → Download ZIP** above and unzip it, or
    - Clone it with git:
      ```bash
-     git clone https://github.com/Cincy-bit/Monitor-App.git
+     git clone https://github.com/Cincy-bit/Monitor.git
      ```
 2. Keep `monitor.html` and `proxy.py` in the same folder — the server looks for `monitor.html` alongside itself.
 3. Open **Terminal**, navigate to the folder, and run the server:
    ```bash
-   cd path/to/Monitor-App
+   cd path/to/Monitor
    python3 proxy.py
    ```
 4. Open your browser to:
