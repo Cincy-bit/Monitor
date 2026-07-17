@@ -6,12 +6,12 @@ A personal dashboard for tracking financial markets, news, your portfolio, weath
 
 ## Features
 
-- 📈 Live prices for stocks, ETFs, indices, commodities, and crypto, with a customizable watchlist and scrolling ticker
-- 📰 Aggregated news from multiple sources, sorted by category
-- 💼 Personal portfolio tracking (cost basis, P/L) — stored locally, never sent anywhere
-- ⛏️ Bitcoin miner monitoring for devices on your local network
-- 🌦️ Weather by ZIP code or coordinates
-- 🟣 Built-in Nostr client with adjustable panes
+- Live prices for stocks, ETFs, indices, commodities, and crypto, with a customizable watchlist and scrolling ticker
+- Aggregated news from multiple sources, sorted by category
+- Personal portfolio tracking (cost basis, P/L) — stored locally, never sent anywhere
+- Bitcoin miner monitoring for devices on your local network
+- Weather by ZIP code or coordinates
+- Built-in Nostr client with adjustable panes
 
 ## Requirements
 
