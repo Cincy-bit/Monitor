@@ -4532,9 +4532,15 @@ async function loadPortChart(tf) {
     window._portChartSeries = [...weightedSeries];
     // Also show current portfolio dollar value from live prices
     const portVal = `$${port.totalValue.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})}`;
+    // NOTE: this box must describe the line actually drawn on the chart, so it uses
+    // periodReturn (= weightedSeries[N-1], the chart's own last point) rather than
+    // trueReturn. trueReturn spans a wider window (full day vs prevClose) than the chart's
+    // intersection window, so it can legitimately fall outside [lo2, hi] — that's correct
+    // for the header/watchlist stat it feeds, but would be visually inconsistent here.
+    const periodSg = periodReturn>=0?'+':'';
     document.getElementById('port-cstats').innerHTML=`
       <div class="sb"><div class="sl">Portfolio Value</div><div class="sv" style="color:var(--gold);">${portVal}</div></div>
-      <div class="sb"><div class="sl">Period Return</div><div class="sv" style="color:${trueReturn>=0?'var(--green)':'var(--red)'}">${trueSg}${trueReturn.toFixed(2)}%</div></div>
+      <div class="sb"><div class="sl">Period Return</div><div class="sv" style="color:${periodReturn>=0?'var(--green)':'var(--red)'}">${periodSg}${periodReturn.toFixed(2)}%</div></div>
       <div class="sb"><div class="sl">Period High</div><div class="sv" style="color:var(--green);">${hi>=0?'+':''}${hi.toFixed(2)}%</div></div>
       <div class="sb"><div class="sl">Period Low</div><div class="sv" style="color:${lo2<0?'var(--red)':'var(--t1)'};">${lo2>=0?'+':''}${lo2.toFixed(2)}%</div></div>`;
   } catch(e) { cl.textContent=`Failed: ${e.message}`; cl.style.display='flex'; cv.style.display='none'; }
