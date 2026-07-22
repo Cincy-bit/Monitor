@@ -1171,6 +1171,44 @@ async function fetchT(url, timeoutMs=8000) {
 // All other symbols (stocks, ETFs) use Yahoo pre/post market prices during extended hours.
 const FUTURES_SYMS = new Set(['^GSPC','^IXIC','^DJI','^RUT','^NYA','^FTSE','^N225']);
 
+// ═══════════════════════════════════════════════════════
+//  STALE-PRICE DETECTION (mutual funds & other once-a-day-priced assets)
+// ═══════════════════════════════════════════════════════
+// Mutual fund NAVs strike once per day, often well after the 4pm ET close —
+// sometimes not until 6-9pm ET depending on the fund family. Until that NAV
+// posts, Yahoo's regularMarketPrice/PreviousClose pair is still YESTERDAY's,
+// so the % change we compute silently reflects yesterday's already-known move
+// rather than today's, without any visual indication. This flags that case:
+// weekday, past the 4pm close, but the underlying quote's timestamp (asOf)
+// hasn't rolled over to today yet.
+function _nowET() {
+  const now = new Date();
+  const year = now.getUTCFullYear();
+  const dstStart = new Date(Date.UTC(year, 2, 8, 7));
+  dstStart.setUTCDate(8 + (7 - new Date(Date.UTC(year, 2, 8)).getUTCDay()) % 7);
+  const dstEnd = new Date(Date.UTC(year, 10, 1, 6));
+  dstEnd.setUTCDate(1 + (7 - new Date(Date.UTC(year, 10, 1)).getUTCDay()) % 7);
+  const offsetMs = (now >= dstStart && now < dstEnd) ? -4 * 3600000 : -5 * 3600000;
+  return new Date(now.getTime() + offsetMs);
+}
+function isStaleAfterClose(asOfSec) {
+  if (!asOfSec) return false;
+  const nowET = _nowET();
+  const dow = nowET.getUTCDay(); // Sun=0..Sat=6
+  if (dow === 0 || dow === 6) return false; // weekend: no session expected, nothing "stale"
+  const hm = nowET.getUTCHours() * 60 + nowET.getUTCMinutes();
+  if (hm < 960) return false; // before 4:00pm ET — today's close hasn't happened yet either way
+  const asOfET = new Date(asOfSec * 1000 + (nowET.getTime() - Date.now()));
+  return !(asOfET.getUTCFullYear() === nowET.getUTCFullYear() &&
+           asOfET.getUTCMonth() === nowET.getUTCMonth() &&
+           asOfET.getUTCDate() === nowET.getUTCDate());
+}
+function staleAsOfLabel(asOfSec) {
+  if (!asOfSec) return '';
+  const d = new Date(asOfSec * 1000);
+  return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+}
+
 async function fetchQ(sym) {
   // Helper: is it currently outside regular NYSE hours?
   // Used to decide whether to request includePrePost on the sparkline.
@@ -1265,15 +1303,14 @@ async function fetchQ(sym) {
                   } catch {}
                 }
               }
-              // Override pct using chartPreviousClose from this same fetch — identical
-              // baseline to the chart modal, guaranteeing the watchlist % always matches.
-              if (smeta && d.price > 0 && !d.isFutures) {
-                const chartPrev = smeta.chartPreviousClose || smeta.previousClose;
-                if (chartPrev && chartPrev > 0) {
-                  d.pct = (d.price - chartPrev) / chartPrev * 100;
-                  d.prev = chartPrev;
-                }
-              }
+              // NOTE: we intentionally do NOT override d.pct/d.prev here anymore.
+              // d.pct/d.prev already come from the primary /futures-price endpoint,
+              // computed from ONE atomic Yahoo API call — price and previousClose are
+              // guaranteed to be from the same snapshot. This secondary /yahoo fetch is
+              // a second, independent request whose chartPreviousClose can disagree with
+              // the primary source (stale caching, different chart window, etc.) — trusting
+              // it here was silently replacing correct numbers with wrong ones. We still use
+              // this fetch for the sparkline candles (below), just not for price/pct.
             }
           } catch {}
           return {
@@ -1286,6 +1323,7 @@ async function fetchQ(sym) {
             futuresSym: d.futuresSym,
             marketState: d.marketState,
             hasExtendedData: d.hasExtendedData || false,
+            asOf: d.asOf || null,
           };
         }
       }
@@ -1312,7 +1350,7 @@ async function fetchQ(sym) {
       const pct   = prev ? (price - prev) / prev * 100 : 0;
       let spark = [];
       if (q?.close && ts) spark = q.close.map((v,i)=>({t:ts[i]*1000,v})).filter(x=>x.v!=null);
-      const fallbackResult = { price, prev, pct, spark, sym: meta.symbol || sym, marketState: meta.marketState, isFutures: false };
+      const fallbackResult = { price, prev, pct, spark, sym: meta.symbol || sym, marketState: meta.marketState, isFutures: false, asOf: meta.regularMarketTime || null };
       // During extended hours the plain chart fallback returns the regular-session close,
       // which would overwrite a good PRE/POST entry already in PC. Suppress it.
       const existing = PC[sym];
@@ -1945,7 +1983,8 @@ async function openChart(sym) {
     const pct = q?.pct || 0;
     const dayChange = value - (q?.prev || price) * holding.qty;
     const gainLoss = holding.costBasis ? (price - holding.costBasis) * holding.qty : null;
-    const pctCls = pct >= 0 ? 'var(--green)' : 'var(--red)';
+    const stale = isStaleAfterClose(q?.asOf);
+    const pctCls = stale ? 'var(--t2)' : (pct >= 0 ? 'var(--green)' : 'var(--red)');
     const isBtc = sym === 'BTC-USD';
     const qtyLabel = isBtc ? `₿ ${holding.qty}` : `${holding.qty} shares`;
     cmPortBody.innerHTML = `
@@ -1958,7 +1997,7 @@ async function openChart(sym) {
         <div style="font-family:var(--fm);font-size:14px;font-weight:600;color:var(--t0);">$${value.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})}</div>
       </div>
       <div style="display:flex;flex-direction:column;gap:2px;">
-        <div style="font-family:var(--fm);font-size:9px;color:var(--t3);text-transform:uppercase;letter-spacing:.08em;">Today</div>
+        <div style="font-family:var(--fm);font-size:9px;color:var(--t3);text-transform:uppercase;letter-spacing:.08em;">${stale?`As of ${staleAsOfLabel(q?.asOf)}`:'Today'}</div>
         <div style="font-family:var(--fm);font-size:14px;font-weight:600;color:${pctCls};">${pct>=0?'+':''}${pct.toFixed(2)}% <span style="font-size:11px;font-weight:400;">(${dayChange>=0?'+':''}$${Math.abs(dayChange).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})})</span></div>
       </div>
       ${gainLoss !== null ? `<div style="display:flex;flex-direction:column;gap:2px;">
@@ -4458,13 +4497,19 @@ async function loadPortChart(tf) {
     });
 
     const hi=Math.max(...weightedSeries), lo2=Math.min(...weightedSeries);
-    // Period Return: for 1D use calcPortfolio().totalPct (authoritative live return vs prev close).
-    // For all other timeframes use the chart series return (last point - first point = 0,
-    // so periodReturn = l = the actual change over the selected period).
-    // trueReturn = periodReturn for all timeframes.
-    // For 1D: periodReturn = change since open (series offset-normalized above).
-    // This matches what the chart line shows visually, the sparkline, and the watchlist %.
-    const trueReturn = periodReturn;
+    // Period Return: the VISUAL chart line always starts at 0 at the shared intersection
+    // window (see tStart/tEnd logic above), so periodReturn describes "the shape of the
+    // line you're looking at" — that's fine for the chart's own stat box.
+    //
+    // BUT window._port1DReturn feeds the "Today's Change" header, watchlist row, and
+    // portfolio-tab %, which need the AUTHORITATIVE full-day return (matching the sum of
+    // each holding's own %, which compares full current price vs full previous close).
+    // Using periodReturn there was a bug: the intersection window excludes any movement
+    // a holding made before the latest-starting holding's first data point (e.g. a
+    // Bitcoin ETF/crypto-adjacent holding moving overnight before equities open at 9:30
+    // AM) — real money made, but invisible to that header stat. calcPortfolio().totalPct
+    // has no such blind spot; it's a straight dollar-weighted price-vs-prevClose sum.
+    const trueReturn = (tf === '1d') ? port.totalPct : periodReturn;
     const trueSg = trueReturn>=0?'+':'';
     window._portChartReturn = trueReturn;  // watchlist picks this up
     if (tf === '1d') window._port1DReturn = trueReturn;  // stable 1D reference, never overwritten by other TFs
@@ -4521,7 +4566,9 @@ function renderPortfolioHoldings() {
 
   document.getElementById('port-holdings-list').innerHTML = port.holdings.map((h,i) => {
     const weight = port.totalValue ? (h.value / port.totalValue * 100) : 0;
-    const cls = h.pct>=0?'var(--green)':'var(--red)', sg=h.pct>=0?'+':'';
+    const stale = isStaleAfterClose(PC[h.sym]?.asOf);
+    const cls = stale ? 'var(--t2)' : (h.pct>=0?'var(--green)':'var(--red)');
+    const sg=h.pct>=0?'+':'';
     const gainLoss = h.costBasis ? (h.price - h.costBasis) * h.qty : null;
     const origIdx = portfolio.findIndex(p=>p.sym===h.sym);
     return `<div class="port-hold-item" id="phi-${h.sym.replace(/[^a-zA-Z0-9]/g,'_')}">
@@ -4537,7 +4584,7 @@ function renderPortfolioHoldings() {
       </div>
       <div class="port-hold-value">
         <div class="port-hold-val">$${h.value.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})}</div>
-        <div style="font-family:var(--fm);font-size:11px;color:${cls};margin-top:2px;">${sg}${h.pct.toFixed(2)}%</div>
+        <div style="font-family:var(--fm);font-size:11px;color:${cls};margin-top:2px;" title="${stale?`Fund hasn't posted today's NAV yet — this % is still last close (as of ${staleAsOfLabel(PC[h.sym]?.asOf)})`:''}">${sg}${h.pct.toFixed(2)}%${stale?` <span style="font-size:9px;">· as of ${staleAsOfLabel(PC[h.sym]?.asOf)}</span>`:''}</div>
         <div class="port-hold-weight">${weight.toFixed(1)}% weight</div>
         ${gainLoss!==null?`<div style="font-family:var(--fm);font-size:10px;color:${gainLoss>=0?'var(--green)':'var(--red)'};">${gainLoss>=0?'+':'-'}$${Math.abs(gainLoss).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})}</div>`:''}
       </div>

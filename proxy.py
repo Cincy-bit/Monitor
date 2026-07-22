@@ -433,6 +433,12 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                     meta = result.get('meta', {})
                     reg_price  = meta.get('regularMarketPrice') or 0
                     prev_close = meta.get('chartPreviousClose') or meta.get('previousClose') or 0
+                    # Timestamp (unix seconds) of when reg_price was actually struck.
+                    # Critical for once-a-day-priced assets (mutual funds): their NAV
+                    # doesn't update until well after the 4pm ET close, so without this
+                    # we can't tell "today's close" apart from "still showing yesterday's
+                    # close because today's NAV hasn't posted yet".
+                    mkt_time   = meta.get('regularMarketTime') or 0
                     # Compute pct ourselves from chartPreviousClose — same baseline the chart uses.
                     # Yahoo's regularMarketChangePercent can use a different prev close than
                     # chartPreviousClose (e.g. after weekends or data delays), causing the
@@ -442,6 +448,67 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
 
                     if not reg_price:
                         continue  # no data at all, try other host
+
+                    # Once-a-day-priced assets (mutual funds) have no real minute-level
+                    # data, so the interval=1m request above often gets served meta that's
+                    # stale relative to what Yahoo actually has posted. Detect "basically no
+                    # real candles came back" and re-fetch with a plain daily interval.
+                    _candle_count = len(result.get('timestamp') or [])
+                    if _candle_count < 5:
+                        try:
+                            daily_url = f"https://{host}/v8/finance/chart/{sym}?interval=1d&range=5d&includePrePost=false"
+                            req_d = urllib.request.Request(daily_url, headers=HDR)
+                            with urllib.request.urlopen(req_d, context=ssl_ctx, timeout=10) as rd:
+                                ddata = _json.loads(rd.read())
+                            dresult = ddata.get('chart', {}).get('result', [{}])[0]
+                            dmeta   = dresult.get('meta', {})
+                            d_reg_price = dmeta.get('regularMarketPrice') or 0
+
+                            # DO NOT trust dmeta['chartPreviousClose']/['previousClose'] — for
+                            # this mutual fund, that field has been independently confirmed
+                            # wrong on the v8 chart API, quoteSummary, AND v7 quote, all
+                            # returning the SAME wrong value. That means Yahoo's own
+                            # "previousClose" metadata is stale for this symbol/asset class,
+                            # not that any one of our requests is malformed. Instead, derive
+                            # previous close ourselves from the actual daily bars: find which
+                            # bar (by real calendar date, in the exchange's own timezone) is
+                            # "today", and take the close immediately before it. This can't be
+                            # thrown off by a metadata field lagging behind reality.
+                            d_ts = dresult.get('timestamp') or []
+                            d_closes = ((dresult.get('indicators', {})
+                                                 .get('quote', [{}])[0]
+                                                 .get('close')) or [])
+                            gmtoffset = dmeta.get('gmtoffset', -14400)  # seconds; exchange-local offset Yahoo reports
+                            bars = [(t, c) for t, c in zip(d_ts, d_closes) if t is not None and c is not None]
+
+                            d_prev_close = 0
+                            if bars:
+                                from datetime import datetime as _dt3, timezone as _tz3
+                                def _local_date(ts):
+                                    return _dt3.fromtimestamp(ts + gmtoffset, tz=_tz3.utc).date()
+                                today_local = _local_date(_dt3.now(_tz3.utc).timestamp())
+                                last_bar_date = _local_date(bars[-1][0])
+                                if last_bar_date == today_local and len(bars) >= 2:
+                                    # Most recent bar IS today's close — use the one before it.
+                                    d_prev_close = bars[-2][1]
+                                else:
+                                    # Chart hasn't posted a bar for today yet, but reg_price is
+                                    # already fresh (confirmed live/current) — so the LAST bar
+                                    # in the chart, whatever its date, is the correct "previous
+                                    # close" to compare that fresh price against.
+                                    d_prev_close = bars[-1][1]
+
+                            if d_reg_price and d_prev_close:
+                                print(f"[v8] {sym}: only {_candle_count} intraday candles — "
+                                      f"using date-derived daily close: price {reg_price}->{d_reg_price} "
+                                      f"prev {prev_close}->{d_prev_close} (was meta-trusted value "
+                                      f"{dmeta.get('chartPreviousClose') or dmeta.get('previousClose')})")
+                                reg_price  = d_reg_price
+                                prev_close = d_prev_close
+                                mkt_time   = dmeta.get('regularMarketTime') or mkt_time
+                                reg_pct    = (reg_price - prev_close) / prev_close * 100
+                        except Exception as ex:
+                            print(f"[v8] {sym}: daily cross-check failed: {ex}")
 
                     candle_pre_price  = 0
                     candle_post_price = 0
@@ -529,6 +596,7 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                         'regularMarketPreviousClose': prev_close,
                         'regularMarketChangePercent': reg_pct,
                         'marketState':                mkt_state,
+                        'regularMarketTime':          mkt_time,
                     }
                 except Exception as ex:
                     print(f"[futures-price] v8 {host} failed for {sym}: {ex}")
@@ -570,6 +638,7 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                     'postMarketPrice':            _val('postMarketPrice'),
                     'postMarketChangePercent':    _val('postMarketChangePercent'),
                     'marketState':                price.get('marketState', 'UNKNOWN'),
+                    'regularMarketTime':          _val('regularMarketTime'),
                 }
                 print(f"[quoteSummary] {sym}: state={result['marketState']} "
                       f"pre={result['preMarketPrice']:.4f} post={result['postMarketPrice']:.4f}")
@@ -707,11 +776,20 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                     if not base.get(field) and src.get(field):
                         base[field] = src[field]
                         print(f"[fetch_base] {symbol}: filled {field}={src[field]:.4f} from {src_label}")
+                # NOTE: quoteSummary's own regularMarketChangePercent/PreviousClose is
+                # deliberately NOT trusted here anymore. It was tried as the authoritative
+                # source, but for mutual funds it returns the SAME stale previousClose as the
+                # v8 chart meta — confirming Yahoo's own "previousClose" field lags for this
+                # asset class across every endpoint, not just one. base's regularMarketChangePercent
+                # (from fetch_v8_chart, now date-derived from actual daily bars rather than any
+                # Yahoo meta field) is more trustworthy and is left untouched here.
                 # Fill reg price if v8 failed entirely
                 if not base.get('regularMarketPrice') and src.get('regularMarketPrice'):
                     base['regularMarketPrice'] = src['regularMarketPrice']
                 if not base.get('regularMarketPreviousClose') and src.get('regularMarketPreviousClose'):
                     base['regularMarketPreviousClose'] = src['regularMarketPreviousClose']
+                if not base.get('regularMarketTime') and src.get('regularMarketTime'):
+                    base['regularMarketTime'] = src['regularMarketTime']
                 # STRK / low-volume preferred stock fix:
                 # Yahoo's preMarketPrice field is 0 for these symbols even in both v8 and
                 # quoteSummary. But quoteSummary DOES return the correct live price in
@@ -754,6 +832,10 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         post_pct   = base.get('postMarketChangePercent') or 0
         pre_price  = base.get('preMarketPrice') or 0
         pre_pct    = base.get('preMarketChangePercent') or 0
+        # When this regularMarketPrice/PreviousClose pair was actually struck.
+        # For once-a-day-priced assets (mutual funds) this can lag well behind
+        # "now" even after the market has closed for the day — see asOf usage below.
+        as_of      = base.get('regularMarketTime') or 0
         # Futures live price — v8 with includePrePost=true gives overnight data
         fut_price  = fut_data.get('regularMarketPrice') or 0
         fut_prev   = (fut_data.get('regularMarketPreviousClose') or
@@ -772,7 +854,7 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             send_result({'symbol': symbol, 'price': base_price, 'pct': base_pct,
                          'prev': base_prev, 'marketState': 'REGULAR',
                          'isFutures': False, 'futuresSym': None,
-                         'hasExtendedData': False})
+                         'hasExtendedData': False, 'asOf': as_of})
             return
 
         def _pct(price, prev):
@@ -783,9 +865,10 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         def _send_futures(state_label):
             pct = _pct(fut_price, fut_prev) if fut_prev else fut_data.get('regularMarketChangePercent') or 0
             print(f"[{state_label}] {symbol} via {futures_sym}: {fut_price:.2f} ({pct:+.2f}%)")
+            import time as _t
             send_result({'symbol': symbol, 'price': fut_price, 'pct': pct,
                          'prev': fut_prev, 'marketState': state_label,
-                         'isFutures': True, 'futuresSym': futures_sym})
+                         'isFutures': True, 'futuresSym': futures_sym, 'asOf': _t.time()})
 
         # ── WALL-CLOCK ET TIME CHECK ─────────────────────────────────────────────
         # Yahoo's marketState can lag by several minutes at open/close transitions.
@@ -823,7 +906,7 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             send_result({'symbol': symbol, 'price': base_price, 'pct': base_pct,
                          'prev': base_prev, 'marketState': 'REGULAR',
                          'isFutures': False, 'futuresSym': futures_sym,
-                         'hasExtendedData': False})
+                         'hasExtendedData': False, 'asOf': as_of})
             return
 
         # ── POST-MARKET (4:00–8:00 PM ET weekdays) ───────────────────────────────
@@ -833,10 +916,11 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                 return
             if post_price > 0:
                 pct = post_pct or _pct(post_price, base_prev)
+                import time as _t
                 send_result({'symbol': symbol, 'price': post_price, 'pct': pct,
                              'prev': base_prev, 'marketState': 'POST',
                              'isFutures': False, 'futuresSym': futures_sym,
-                             'hasExtendedData': True})
+                             'hasExtendedData': True, 'asOf': _t.time()})
                 return
             # 4:00–4:15 PM ET gap: futures maintenance, no post-market data yet
             # Show last regular-session close labeled POST so UI shows "Post-Market"
@@ -845,7 +929,7 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                 send_result({'symbol': symbol, 'price': base_price, 'pct': base_pct,
                              'prev': base_prev, 'marketState': 'POST',
                              'isFutures': False, 'futuresSym': futures_sym,
-                             'hasExtendedData': False})
+                             'hasExtendedData': False, 'asOf': as_of})
                 return
 
         # ── PRE-MARKET (4:00–9:30 AM ET weekdays) ────────────────────────────────
@@ -855,10 +939,11 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                 return
             if pre_price > 0:
                 pct = pre_pct or _pct(pre_price, base_prev)
+                import time as _t
                 send_result({'symbol': symbol, 'price': pre_price, 'pct': pct,
                              'prev': base_prev, 'marketState': 'PRE',
                              'isFutures': False, 'futuresSym': futures_sym,
-                             'hasExtendedData': True})
+                             'hasExtendedData': True, 'asOf': _t.time()})
                 return
             # Pre-market gap: no pre-market trades yet (low-volume ETFs, early morning).
             # Show last regular-session close labeled PRE so the UI badge appears
@@ -868,7 +953,7 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                 send_result({'symbol': symbol, 'price': base_price, 'pct': base_pct,
                              'prev': base_prev, 'marketState': 'PRE',
                              'isFutures': False, 'futuresSym': futures_sym,
-                             'hasExtendedData': False})
+                             'hasExtendedData': False, 'asOf': as_of})
                 return
 
         # ── CLOSED / OVERNIGHT / WEEKEND ─────────────────────────────────────────
@@ -883,10 +968,11 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         if post_price > 0 and not clock_regular and not clock_pre:
             pct = post_pct or _pct(post_price, base_prev)
             print(f"[POST-carry] {symbol}: overnight/weekend, carrying post-market price {post_price:.2f}")
+            import time as _t
             send_result({'symbol': symbol, 'price': post_price, 'pct': pct,
                          'prev': base_prev, 'marketState': 'POST',
                          'isFutures': False, 'futuresSym': futures_sym,
-                         'hasExtendedData': True})
+                         'hasExtendedData': True, 'asOf': _t.time()})
             return
 
         # ── LAST RESORT: stale close (better than nothing) ───────────────────────
@@ -900,12 +986,13 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             send_result({'symbol': symbol, 'price': base_price, 'pct': base_pct,
                          'prev': base_prev, 'marketState': stale_state,
                          'isFutures': False, 'futuresSym': futures_sym,
-                         'hasExtendedData': False})
+                         'hasExtendedData': False, 'asOf': as_of})
             return
 
         print(f"[futures-price] COMPLETE FAILURE for {symbol}")
         send_result({'symbol': symbol, 'price': 0, 'pct': 0, 'prev': 0,
-                     'marketState': 'UNKNOWN', 'isFutures': False, 'futuresSym': futures_sym})
+                     'marketState': 'UNKNOWN', 'isFutures': False, 'futuresSym': futures_sym,
+                     'asOf': 0})
 
     def handle_debug_price(self):
         """Raw Yahoo diagnostic — hit /debug-price?symbol=VXUS in browser."""
@@ -1034,34 +1121,56 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                 f"?interval={interval}&range={range_}&includePrePost={ipp}"
             )
             data = fetch_url(intraday_url)
-
-            # If regularMarketChangePercent is missing (common for futures with intraday interval),
-            # fetch a 5-day daily chart to get the authoritative previous close and compute it.
             meta = data.get("chart", {}).get("result", [{}])[0].get("meta", {})
-            if meta.get("regularMarketChangePercent") is None:
-                try:
-                    daily_url = (
-                        f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-                        f"?interval=1d&range=5d&includePrePost=false"
-                    )
-                    daily_data = fetch_url(daily_url)
-                    daily_meta = daily_data.get("chart", {}).get("result", [{}])[0].get("meta", {})
-                    daily_quotes = daily_data.get("chart", {}).get("result", [{}])[0].get("indicators", {}).get("quote", [{}])[0]
-                    daily_closes = [c for c in (daily_quotes.get("close") or []) if c is not None]
 
-                    pct = daily_meta.get("regularMarketChangePercent")
-                    if pct is None and len(daily_closes) >= 2:
-                        prev_close = daily_closes[-2]
-                        curr_price = meta.get("regularMarketPrice") or daily_closes[-1]
-                        if prev_close and prev_close != 0:
-                            pct = (curr_price - prev_close) / prev_close * 100
-                    if pct is not None:
-                        data["chart"]["result"][0]["meta"]["regularMarketChangePercent"] = pct
-                        # Also fix chartPreviousClose if it's wrong
-                        if len(daily_closes) >= 2:
-                            data["chart"]["result"][0]["meta"]["chartPreviousClose"] = daily_closes[-2]
-                except Exception:
-                    pass  # Best effort — return original data if daily fetch fails
+            # Correct chartPreviousClose/regularMarketChangePercent for once-a-day-priced
+            # assets (mutual funds). We do this UNCONDITIONALLY, not just when
+            # regularMarketChangePercent is missing — Yahoo can return a non-null
+            # regularMarketChangePercent that's still wrong, computed from the same stale
+            # chartPreviousClose we can't trust (confirmed: v8 chart meta, quoteSummary, and
+            # v7 quote all independently return the SAME wrong previousClose for these
+            # symbols). This endpoint feeds loadPortChart's portfolio-total calculation
+            # directly via rt.meta.chartPreviousClose, so a wrong value here silently wrongs
+            # the total portfolio return shown in the UI, not just the per-holding number.
+            try:
+                daily_url = (
+                    f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+                    f"?interval=1d&range=5d&includePrePost=false"
+                )
+                daily_data = fetch_url(daily_url)
+                dresult = daily_data.get("chart", {}).get("result", [{}])[0]
+                dmeta   = dresult.get("meta", {})
+                d_ts     = dresult.get("timestamp") or []
+                d_closes = (dresult.get("indicators", {}).get("quote", [{}])[0].get("close") or [])
+                gmtoffset = dmeta.get("gmtoffset", -14400)
+                bars = [(t, c) for t, c in zip(d_ts, d_closes) if t is not None and c is not None]
+
+                curr_price = meta.get("regularMarketPrice") or dmeta.get("regularMarketPrice")
+                derived_prev = None
+                if bars and curr_price:
+                    # NOTE: this file's top-level `from datetime import datetime, timezone`
+                    # binds `datetime` to the CLASS, not the module — datetime.datetime would
+                    # AttributeError here. Alias locally to avoid that trap.
+                    from datetime import datetime as _dtY, timezone as _tzY
+                    def _local_date(ts):
+                        return _dtY.fromtimestamp(ts + gmtoffset, tz=_tzY.utc).date()
+                    today_local = _local_date(_dtY.now(_tzY.utc).timestamp())
+                    last_bar_date = _local_date(bars[-1][0])
+                    if last_bar_date == today_local and len(bars) >= 2:
+                        derived_prev = bars[-2][1]
+                    else:
+                        # Today's bar hasn't posted to the daily chart yet, but the live
+                        # price is already fresh — the last bar we DO have is yesterday's
+                        # close, which is exactly the baseline we want.
+                        derived_prev = bars[-1][1]
+
+                if derived_prev and curr_price:
+                    pct = (curr_price - derived_prev) / derived_prev * 100
+                    data["chart"]["result"][0]["meta"]["regularMarketChangePercent"] = pct
+                    data["chart"]["result"][0]["meta"]["chartPreviousClose"] = derived_prev
+                    data["chart"]["result"][0]["meta"]["regularMarketPreviousClose"] = derived_prev
+            except Exception:
+                pass  # Best effort — return original data if daily cross-check fails
 
             out = _json.dumps(data).encode()
             self.send_response(200)
