@@ -453,10 +453,29 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                     # data, so the interval=1m request above often gets served meta that's
                     # stale relative to what Yahoo actually has posted. Detect "basically no
                     # real candles came back" and re-fetch with a plain daily interval.
+                    #
+                    # BUG FIX: this same daily-bar re-derivation is ALSO required for every
+                    # normal, liquid stock/ETF request — not just sparse-candle ones. We
+                    # request range=2d (so today's pre-market candles exist even for
+                    # low-volume names), but Yahoo's meta.chartPreviousClose for a 2-day
+                    # window is the close BEFORE the window starts — i.e. TWO trading days
+                    # ago, not yesterday. For a liquid symbol like MSTR that never triggers
+                    # the <5-candle branch, this silently made prev_close (and therefore
+                    # every %-change derived from it, in every market session) off by a
+                    # full trading day. Always re-derive prevClose from actual calendar-
+                    # dated daily bars whenever chart_range == '2d', not only when candles
+                    # are sparse.
                     _candle_count = len(result.get('timestamp') or [])
-                    if _candle_count < 5:
+                    if _candle_count < 5 or chart_range == '2d':
                         try:
-                            daily_url = f"https://{host}/v8/finance/chart/{sym}?interval=1d&range=5d&includePrePost=false"
+                            # BUG FIX: range=5d was frequently returning only ONE daily bar
+                            # for sparsely-charted mutual funds (Yahoo's chart API just has
+                            # thin history for these symbols). With only 1 bar available,
+                            # there's nothing to use as a distinct previous close, so the
+                            # logic below was forced to compare reg_price to itself — a
+                            # second, different source of the exact-0% bug. range=1mo
+                            # reliably returns enough trading days for a real comparison.
+                            daily_url = f"https://{host}/v8/finance/chart/{sym}?interval=1d&range=1mo&includePrePost=false"
                             req_d = urllib.request.Request(daily_url, headers=HDR)
                             with urllib.request.urlopen(req_d, context=ssl_ctx, timeout=10) as rd:
                                 ddata = _json.loads(rd.read())
@@ -478,7 +497,17 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                             d_closes = ((dresult.get('indicators', {})
                                                  .get('quote', [{}])[0]
                                                  .get('close')) or [])
-                            gmtoffset = dmeta.get('gmtoffset', -14400)  # seconds; exchange-local offset Yahoo reports
+                            # BUG FIX: `.get('gmtoffset', -14400)` only falls back to -14400
+                            # when the key is MISSING — if Yahoo returns it as explicit
+                            # `null` (plausible for mutual funds, which have no real
+                            # exchange/session info), gmtoffset ends up None instead. That
+                            # then throws inside _local_date's `ts + gmtoffset` below, which
+                            # gets silently swallowed by this block's `except Exception`,
+                            # leaving prev_close/reg_price at their original — wrong,
+                            # 0%-producing — values. Explicitly coalesce None too.
+                            gmtoffset = dmeta.get('gmtoffset')
+                            if gmtoffset is None:
+                                gmtoffset = -14400  # seconds; assume ET (EDT) if Yahoo gives us nothing
                             bars = [(t, c) for t, c in zip(d_ts, d_closes) if t is not None and c is not None]
 
                             d_prev_close = 0
@@ -488,18 +517,51 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                                     return _dt3.fromtimestamp(ts + gmtoffset, tz=_tz3.utc).date()
                                 today_local = _local_date(_dt3.now(_tz3.utc).timestamp())
                                 last_bar_date = _local_date(bars[-1][0])
-                                if last_bar_date == today_local and len(bars) >= 2:
-                                    # Most recent bar IS today's close — use the one before it.
-                                    d_prev_close = bars[-2][1]
+                                # BUG FIX: once-a-day-priced assets (mutual funds) don't get a
+                                # fresh intraday tick beyond their daily bars — the "current"
+                                # price IS the most recent daily bar's close. The old logic
+                                # assumed that whenever the last bar wasn't dated "today", the
+                                # live reg_price must be a fresher price the chart hadn't caught
+                                # up to yet, and used that same last bar as prevClose — but for
+                                # mutual funds reg_price VS bars[-1] are the same value, so
+                                # comparing them always yielded exactly 0% change. Detect that
+                                # case (reg_price matches the last bar almost exactly) and step
+                                # back one more bar for prevClose, same as the "dated today"
+                                # branch below — that gives the most recent actual day-over-day
+                                # move, which is what "today's return" should show until the
+                                # next NAV posts.
+                                _reg_is_last_bar = (d_reg_price and bars
+                                                     and abs(d_reg_price - bars[-1][1]) < 1e-6)
+                                if (last_bar_date == today_local or _reg_is_last_bar):
+                                    if len(bars) >= 2:
+                                        # Most recent bar IS today's close (or IS reg_price
+                                        # itself, for once-daily assets) — use the one before it.
+                                        d_prev_close = bars[-2][1]
+                                    # else: only one bar exists even with the wider lookback —
+                                    # leave d_prev_close at 0 (guard below) rather than comparing
+                                    # reg_price to itself, which would fabricate an exact 0%.
                                 else:
                                     # Chart hasn't posted a bar for today yet, but reg_price is
-                                    # already fresh (confirmed live/current) — so the LAST bar
-                                    # in the chart, whatever its date, is the correct "previous
-                                    # close" to compare that fresh price against.
+                                    # already fresh (confirmed live/current, and different from
+                                    # any daily bar we have) — so the LAST bar in the chart,
+                                    # whatever its date, is the correct "previous close" to
+                                    # compare that fresh price against.
                                     d_prev_close = bars[-1][1]
 
+                            # Guard: never accept a derived prevClose that's identical to the
+                            # derived price — that's a degenerate comparison (not a real 0%
+                            # move), almost always meaning we didn't actually have a distinct
+                            # prior bar to compare against. Skip the override in that case and
+                            # fall through to whatever reg_price/prev_close we already had.
+                            if d_prev_close and d_reg_price and abs(d_reg_price - d_prev_close) < 1e-6:
+                                print(f"[v8] {sym}: derived prevClose == price ({d_prev_close}) — "
+                                      f"not enough distinct daily bars, skipping override")
+                                d_prev_close = 0
+
                             if d_reg_price and d_prev_close:
-                                print(f"[v8] {sym}: only {_candle_count} intraday candles — "
+                                _reason = (f"only {_candle_count} intraday candles" if _candle_count < 5
+                                           else f"range={chart_range} meta.chartPreviousClose is pre-window, not pre-today")
+                                print(f"[v8] {sym}: {_reason} — "
                                       f"using date-derived daily close: price {reg_price}->{d_reg_price} "
                                       f"prev {prev_close}->{d_prev_close} (was meta-trusted value "
                                       f"{dmeta.get('chartPreviousClose') or dmeta.get('previousClose')})")
@@ -579,9 +641,21 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
 
                     # Candle-derived prices beat meta fields (candles are tick-accurate)
                     final_pre_price  = candle_pre_price  or meta.get('preMarketPrice')  or 0
-                    final_pre_pct    = candle_pre_pct    or meta.get('preMarketChangePercent') or 0
                     final_post_price = candle_post_price or meta.get('postMarketPrice') or 0
-                    final_post_pct   = candle_post_pct   or meta.get('postMarketChangePercent') or 0
+
+                    # BUG FIX: never trust Yahoo's raw meta.preMarketChangePercent /
+                    # meta.postMarketChangePercent fields. Yahoo computes those against
+                    # *today's* regularMarketPrice (i.e. "how much has it moved since the
+                    # regular close"), not against prev_close ("total change from yesterday's
+                    # close") like every other pct in this app and like the watchlist/chart
+                    # are labeled to show. Falling back to them (which happened whenever
+                    # candle_pre_pct/candle_post_pct came out 0 — common for choppy,
+                    # thinly-candled post-market data) silently swapped in a number
+                    # answering a different question, which could even flip the sign
+                    # relative to the displayed price. Always derive pct ourselves from
+                    # the final price vs prev_close so price and pct are always consistent.
+                    final_pre_pct  = ((final_pre_price  - prev_close) / prev_close * 100) if (final_pre_price  and prev_close) else 0
+                    final_post_pct = ((final_post_price - prev_close) / prev_close * 100) if (final_post_price and prev_close) else 0
 
                     print(f"[v8] {sym}: state={mkt_state} reg={reg_price:.4f} "
                           f"pre_meta={meta.get('preMarketPrice') or 0:.4f} pre_candle={candle_pre_price:.4f} "
@@ -600,6 +674,66 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                     }
                 except Exception as ex:
                     print(f"[futures-price] v8 {host} failed for {sym}: {ex}")
+
+            # ── LAST-RESORT FALLBACK: the interval=1m/2d request above failed or
+            # returned reg_price=0 on BOTH hosts. This happens for mutual funds
+            # that have no true intraday quotes at all — Yahoo sometimes errors
+            # out (rather than returning a sparse-but-valid candle set) when asked
+            # for 1-minute data on these symbols, which meant we never reached the
+            # daily-bar cross-check above and fell through to a stale/0%-producing
+            # value pulled from quoteSummary elsewhere in this file. Retry using
+            # ONLY a plain daily chart (which mutual funds always support) and
+            # derive price/prevClose from calendar-dated daily bars, exactly like
+            # the low-candle-count branch above.
+            for host in ('query2.finance.yahoo.com', 'query1.finance.yahoo.com'):
+                try:
+                    daily_url = f"https://{host}/v8/finance/chart/{sym}?interval=1d&range=10d&includePrePost=false"
+                    req_d = urllib.request.Request(daily_url, headers=HDR)
+                    with urllib.request.urlopen(req_d, context=ssl_ctx, timeout=10) as rd:
+                        ddata = _json.loads(rd.read())
+                    dresult = ddata.get('chart', {}).get('result', [{}])[0]
+                    dmeta   = dresult.get('meta', {})
+                    d_reg_price = dmeta.get('regularMarketPrice') or 0
+                    if not d_reg_price:
+                        continue
+                    gmtoffset = dmeta.get('gmtoffset')
+                    if gmtoffset is None:
+                        gmtoffset = -14400
+                    d_ts     = dresult.get('timestamp') or []
+                    d_closes = ((dresult.get('indicators', {})
+                                         .get('quote', [{}])[0]
+                                         .get('close')) or [])
+                    bars = [(t, c) for t, c in zip(d_ts, d_closes) if t is not None and c is not None]
+                    if not bars:
+                        continue
+                    from datetime import datetime as _dt5, timezone as _tz5
+                    def _local_date5(ts):
+                        return _dt5.fromtimestamp(ts + gmtoffset, tz=_tz5.utc).date()
+                    today_local   = _local_date5(_dt5.now(_tz5.utc).timestamp())
+                    last_bar_date = _local_date5(bars[-1][0])
+                    reg_is_last_bar = abs(d_reg_price - bars[-1][1]) < 1e-6
+                    if (last_bar_date == today_local or reg_is_last_bar) and len(bars) >= 2:
+                        d_prev_close = bars[-2][1]
+                    else:
+                        d_prev_close = bars[-1][1]
+                    if not d_prev_close:
+                        continue
+                    pct = (d_reg_price - d_prev_close) / d_prev_close * 100
+                    print(f"[v8-daily-fallback] {sym}: 1m/2d chart unavailable on both hosts — "
+                          f"derived from pure daily bars: price={d_reg_price} prev={d_prev_close} pct={pct:+.2f}%")
+                    return {
+                        'regularMarketPrice':         d_reg_price,
+                        'postMarketPrice':            0,
+                        'postMarketChangePercent':    0,
+                        'preMarketPrice':             0,
+                        'preMarketChangePercent':     0,
+                        'regularMarketPreviousClose': d_prev_close,
+                        'regularMarketChangePercent': pct,
+                        'marketState':                dmeta.get('marketState') or 'REGULAR',
+                        'regularMarketTime':          dmeta.get('regularMarketTime') or 0,
+                    }
+                except Exception as ex:
+                    print(f"[v8-daily-fallback] {sym}: {host} failed: {ex}")
             return {}
 
         def fetch_quoteSummary(sym):
@@ -829,9 +963,17 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             ((base_price - base_prev) / base_prev * 100) if base_prev else 0
         )
         post_price = base.get('postMarketPrice') or 0
-        post_pct   = base.get('postMarketChangePercent') or 0
         pre_price  = base.get('preMarketPrice') or 0
-        pre_pct    = base.get('preMarketChangePercent') or 0
+        # BUG FIX: don't trust base.get('postMarketChangePercent')/('preMarketChangePercent')
+        # here. Those can originate from Yahoo's raw quoteSummary/v7 fields (computed vs
+        # today's regularMarketPrice, not vs prev_close) via the field-by-field fill-in
+        # above, and — because price and pct are filled in independently per source — the
+        # price shown could even come from one source while its pct came from another.
+        # Always recompute both from the FINAL price vs base_prev here, at a single choke
+        # point, so price and pct are guaranteed to agree and use the same "vs previous
+        # close" baseline as everything else in the app.
+        post_pct = ((post_price - base_prev) / base_prev * 100) if (post_price and base_prev) else 0
+        pre_pct  = ((pre_price  - base_prev) / base_prev * 100) if (pre_price  and base_prev) else 0
         # When this regularMarketPrice/PreviousClose pair was actually struck.
         # For once-a-day-priced assets (mutual funds) this can lag well behind
         # "now" even after the market has closed for the day — see asOf usage below.
@@ -1133,16 +1275,28 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             # directly via rt.meta.chartPreviousClose, so a wrong value here silently wrongs
             # the total portfolio return shown in the UI, not just the per-holding number.
             try:
+                # BUG FIX: range=5d often returned only 1 daily bar for sparsely-
+                # charted mutual funds, leaving nothing to derive a distinct previous
+                # close from (see matching fix in handle_futures_price). range=1mo
+                # reliably returns enough trading days for a real comparison.
                 daily_url = (
                     f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-                    f"?interval=1d&range=5d&includePrePost=false"
+                    f"?interval=1d&range=1mo&includePrePost=false"
                 )
                 daily_data = fetch_url(daily_url)
                 dresult = daily_data.get("chart", {}).get("result", [{}])[0]
                 dmeta   = dresult.get("meta", {})
                 d_ts     = dresult.get("timestamp") or []
                 d_closes = (dresult.get("indicators", {}).get("quote", [{}])[0].get("close") or [])
-                gmtoffset = dmeta.get("gmtoffset", -14400)
+                # Same dict.get() pitfall as the /futures-price copy of this logic: only
+                # falls back when the key is MISSING, not when Yahoo returns it as null
+                # (plausible for mutual funds, which have no real exchange/session info).
+                # A null here throws inside _local_date below, gets swallowed by the
+                # `except Exception: pass` around this whole block, and silently reverts
+                # to Yahoo's original (wrong) chartPreviousClose for that request.
+                gmtoffset = dmeta.get("gmtoffset")
+                if gmtoffset is None:
+                    gmtoffset = -14400
                 bars = [(t, c) for t, c in zip(d_ts, d_closes) if t is not None and c is not None]
 
                 curr_price = meta.get("regularMarketPrice") or dmeta.get("regularMarketPrice")
@@ -1156,21 +1310,37 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                         return _dtY.fromtimestamp(ts + gmtoffset, tz=_tzY.utc).date()
                     today_local = _local_date(_dtY.now(_tzY.utc).timestamp())
                     last_bar_date = _local_date(bars[-1][0])
-                    if last_bar_date == today_local and len(bars) >= 2:
-                        derived_prev = bars[-2][1]
+                    # Same mutual-fund fix as the /futures-price copy: once-a-day-priced
+                    # assets don't get a fresh intraday tick beyond their daily bars — the
+                    # "current" price IS the last bar's close. If we don't detect that and
+                    # just compare curr_price to that same bar, we always get exactly 0%.
+                    _curr_is_last_bar = abs(curr_price - bars[-1][1]) < 1e-6
+                    if (last_bar_date == today_local or _curr_is_last_bar):
+                        if len(bars) >= 2:
+                            derived_prev = bars[-2][1]
+                        # else: only one bar even with the wider lookback — leave
+                        # derived_prev as None (guard below) rather than fabricating
+                        # a same-value 0% comparison.
                     else:
                         # Today's bar hasn't posted to the daily chart yet, but the live
                         # price is already fresh — the last bar we DO have is yesterday's
                         # close, which is exactly the baseline we want.
                         derived_prev = bars[-1][1]
 
+                # Guard: never accept a derived prevClose identical to curr_price —
+                # that's a degenerate comparison, not a real 0% move.
+                if derived_prev and curr_price and abs(curr_price - derived_prev) < 1e-6:
+                    print(f"[handle_yahoo] {symbol}: derived prevClose == price — "
+                          f"not enough distinct daily bars, skipping override")
+                    derived_prev = None
+
                 if derived_prev and curr_price:
                     pct = (curr_price - derived_prev) / derived_prev * 100
                     data["chart"]["result"][0]["meta"]["regularMarketChangePercent"] = pct
                     data["chart"]["result"][0]["meta"]["chartPreviousClose"] = derived_prev
                     data["chart"]["result"][0]["meta"]["regularMarketPreviousClose"] = derived_prev
-            except Exception:
-                pass  # Best effort — return original data if daily cross-check fails
+            except Exception as ex:
+                print(f"[handle_yahoo] {symbol}: daily cross-check failed: {ex}")  # Best effort — return original data
 
             out = _json.dumps(data).encode()
             self.send_response(200)

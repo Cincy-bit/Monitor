@@ -1376,6 +1376,13 @@ async function refreshAll() {
   }));
   renderTicker();
   renderWL();
+  // BUG FIX: this used to be missing, so the Portfolio holdings panel only
+  // refreshed when opened or edited — it never picked up the live prices this
+  // function just fetched. Watchlist/ticker/chart all update every 15s; the
+  // portfolio view sat stale until manually reopened, which was most visible
+  // for a fast-moving 24/7 asset like BTC-USD. Cheap to call even when the
+  // portfolio modal isn't open — it just writes to hidden DOM elements.
+  renderPortfolioHoldings();
   document.getElementById('upd-lbl').textContent = `Updated ${new Date().toLocaleTimeString()}`;
   setStatus('ok','Data refreshed');
 }
@@ -2067,17 +2074,26 @@ async function loadChart(sym, tf) {
     if(cInst) cInst.destroy();
     const ctx=cv.getContext('2d');
     const l=vd[vd.length-1].c;
-    // For 1D: use prevClose (chartPreviousClose) as baseline — same source as watchlist pct.
-    // For other timeframes: use first data point as baseline (no prevClose concept).
+    // For 1D: baseline must be the SAME prevClose the watchlist uses (PC[sym].prev, sourced
+    // from fetchQ()/proxy /futures-price, which has stale-previousClose correction logic).
+    // Recomputing prevClose from this separate /yahoo chart fetch (no includePrePost, and
+    // none of that correction logic) can disagree with the watchlist and produce a
+    // contradictory Change % — e.g. a line trending up all day but showing a negative %.
+    // For other timeframes there's no "prevClose" concept — use the first data point.
+    const q1d = PC[sym];
     const prevClose = rt.meta?.chartPreviousClose || rt.meta?.previousClose || null;
-    const base = (tf==='1d' && prevClose) ? prevClose : vd[0].c;
-    const ip=l>=base;
+    const base = (tf==='1d') ? (q1d?.prev ?? prevClose ?? vd[0].c) : vd[0].c;
+    // Likewise, use the watchlist's live price/pct for the 1D "Current"/"Change" stats so
+    // they always match the watchlist exactly. The chart LINE itself still plots the
+    // fetched intraday candles (vd) — only the summary numbers are pinned to PC[sym].
+    const curPrice = (tf==='1d' && q1d?.price != null) ? q1d.price : l;
+    const ip = curPrice>=base;
     const g=ctx.createLinearGradient(0,0,0,280);
     g.addColorStop(0,ip?'rgba(0,212,160,.2)':'rgba(255,77,106,.2)');
     g.addColorStop(1,'rgba(0,0,0,0)');
     cInst = new Chart(cv,{type:'line',data:{labels:vd.map(x=>new Date(x.t).toLocaleDateString()),datasets:[{data:vd.map(x=>x.c),borderColor:ip?'#00d4a0':'#ff4d6a',borderWidth:2,fill:true,backgroundColor:g,pointRadius:0,tension:.2}]},options:{animation:{duration:400},responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{mode:'index',intersect:false,backgroundColor:'#1e2028',borderColor:'#2a2d38',borderWidth:1,titleColor:'#b8bccf',bodyColor:'#f0f2f8',titleFont:{family:'IBM Plex Mono',size:10},bodyFont:{family:'IBM Plex Mono',size:12},callbacks:{label:c=>` ${fp(c.raw,sym)}`}}},scales:{x:{grid:{color:'rgba(42,45,56,.6)'},ticks:{color:'#42465a',font:{family:'IBM Plex Mono',size:9},maxTicksLimit:8},border:{color:'#2a2d38'}},y:{grid:{color:'rgba(42,45,56,.6)'},ticks:{color:'#42465a',font:{family:'IBM Plex Mono',size:9},callback:v=>fp(v,sym)},border:{color:'#2a2d38'},position:'right'}}}});
-    const hi=Math.max(...vd.map(x=>x.h||x.c)),lo=Math.min(...vd.map(x=>x.l||x.c)),ch=((l-base)/base*100),sg=ch>=0?'+':'';
-    document.getElementById('cstats').innerHTML=`<div class="sb"><div class="sl">Current</div><div class="sv">${fp(l,sym)}</div></div><div class="sb"><div class="sl">Change</div><div class="sv" style="color:${ch>=0?'var(--green)':'var(--red)'}">${sg}${ch.toFixed(2)}%</div></div><div class="sb"><div class="sl">Period High</div><div class="sv">${fp(hi,sym)}</div></div><div class="sb"><div class="sl">Period Low</div><div class="sv">${fp(lo,sym)}</div></div>`;
+    const hi=Math.max(...vd.map(x=>x.h||x.c)),lo=Math.min(...vd.map(x=>x.l||x.c)),ch=((curPrice-base)/base*100),sg=ch>=0?'+':'';
+    document.getElementById('cstats').innerHTML=`<div class="sb"><div class="sl">Current</div><div class="sv">${fp(curPrice,sym)}</div></div><div class="sb"><div class="sl">Change</div><div class="sv" style="color:${ch>=0?'var(--green)':'var(--red)'}">${sg}${ch.toFixed(2)}%</div></div><div class="sb"><div class="sl">Period High</div><div class="sv">${fp(hi,sym)}</div></div><div class="sb"><div class="sl">Period Low</div><div class="sv">${fp(lo,sym)}</div></div>`;
   } catch(e) { cl.textContent=`Failed (${e.message})`; }
 }
 async function setTF(tf,btn){document.querySelectorAll('#chart-modal .tf').forEach(b=>b.classList.remove('on'));btn.classList.add('on');if(cSym)await loadChart(cSym,tf);}
