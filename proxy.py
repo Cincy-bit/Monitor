@@ -510,6 +510,24 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                                 gmtoffset = -14400  # seconds; assume ET (EDT) if Yahoo gives us nothing
                             bars = [(t, c) for t, c in zip(d_ts, d_closes) if t is not None and c is not None]
 
+                            # BUG FIX: Yahoo sometimes serves the SAME closing price for
+                            # consecutive daily bars of a thinly-traded mutual fund (a
+                            # forward-filled/placeholder "today" row before the next NAV
+                            # posts, or a stale duplicate), but with tiny float32-vs-float64
+                            # rounding noise between the two copies — e.g. 265.88 vs
+                            # 265.8800048828125. That's a ~4.9e-6 absolute difference, which
+                            # slipped past the old exact-equality checks (< 1e-6) below, so
+                            # the duplicate got used as a fake "distinct" previous close and
+                            # produced a silent, wrong -0.00% instead of yesterday's real
+                            # move. Use a relative tolerance instead of a near-zero absolute
+                            # one so near-duplicates are recognized as "the same price" too.
+                            _REL_EPS = 1e-4  # ~0.01% — comfortably wider than float32 noise,
+                                              # comfortably narrower than any real daily move
+                            def _same_price(a, b):
+                                if not a or not b:
+                                    return False
+                                return abs(a - b) <= max(abs(a), abs(b)) * _REL_EPS
+
                             d_prev_close = 0
                             if bars:
                                 from datetime import datetime as _dt3, timezone as _tz3
@@ -526,37 +544,25 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                                 # mutual funds reg_price VS bars[-1] are the same value, so
                                 # comparing them always yielded exactly 0% change. Detect that
                                 # case (reg_price matches the last bar almost exactly) and step
-                                # back one more bar for prevClose, same as the "dated today"
-                                # branch below — that gives the most recent actual day-over-day
-                                # move, which is what "today's return" should show until the
-                                # next NAV posts.
-                                _reg_is_last_bar = (d_reg_price and bars
-                                                     and abs(d_reg_price - bars[-1][1]) < 1e-6)
-                                if (last_bar_date == today_local or _reg_is_last_bar):
-                                    if len(bars) >= 2:
-                                        # Most recent bar IS today's close (or IS reg_price
-                                        # itself, for once-daily assets) — use the one before it.
-                                        d_prev_close = bars[-2][1]
-                                    # else: only one bar exists even with the wider lookback —
-                                    # leave d_prev_close at 0 (guard below) rather than comparing
-                                    # reg_price to itself, which would fabricate an exact 0%.
-                                else:
-                                    # Chart hasn't posted a bar for today yet, but reg_price is
-                                    # already fresh (confirmed live/current, and different from
-                                    # any daily bar we have) — so the LAST bar in the chart,
-                                    # whatever its date, is the correct "previous close" to
-                                    # compare that fresh price against.
-                                    d_prev_close = bars[-1][1]
-
-                            # Guard: never accept a derived prevClose that's identical to the
-                            # derived price — that's a degenerate comparison (not a real 0%
-                            # move), almost always meaning we didn't actually have a distinct
-                            # prior bar to compare against. Skip the override in that case and
-                            # fall through to whatever reg_price/prev_close we already had.
-                            if d_prev_close and d_reg_price and abs(d_reg_price - d_prev_close) < 1e-6:
-                                print(f"[v8] {sym}: derived prevClose == price ({d_prev_close}) — "
-                                      f"not enough distinct daily bars, skipping override")
-                                d_prev_close = 0
+                                # back for prevClose, same as the "dated today" branch below —
+                                # that gives the most recent actual day-over-day move, which is
+                                # what "today's return" should show until the next NAV posts.
+                                _reg_is_last_bar = _same_price(d_reg_price, bars[-1][1])
+                                # Start just before whichever bar represents "today"/"current",
+                                # then scan further back past any near-duplicate closes (the
+                                # placeholder/forward-filled rows described above) until we hit
+                                # a genuinely distinct price — that's the real previous close.
+                                start_idx = len(bars) - (2 if (last_bar_date == today_local or _reg_is_last_bar) else 1)
+                                idx = start_idx
+                                while idx >= 0:
+                                    candidate = bars[idx][1]
+                                    if candidate and not _same_price(candidate, d_reg_price):
+                                        d_prev_close = candidate
+                                        break
+                                    idx -= 1
+                                # else: every bar we have is a near-duplicate of the current
+                                # price (or there weren't enough bars) — leave d_prev_close at
+                                # 0 below rather than fabricate a 0% move from a duplicate.
 
                             if d_reg_price and d_prev_close:
                                 _reason = (f"only {_candle_count} intraday candles" if _candle_count < 5
