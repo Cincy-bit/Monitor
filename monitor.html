@@ -7285,9 +7285,21 @@ function openM(id){
   el.style.zIndex='1001';
   el.classList.add('vis');
 }
-function closeM(id){document.getElementById(id).classList.remove('vis');}
-document.addEventListener('keydown',e=>{if(e.key==='Escape')document.querySelectorAll('.mo.vis').forEach(m=>m.classList.remove('vis'));});
-document.querySelectorAll('.mo').forEach(o=>o.addEventListener('click',e=>{if(e.target===o)o.classList.remove('vis');}));
+function closeM(id){
+  document.getElementById(id).classList.remove('vis');
+  // BUG FIX: closing the Portfolio modal (✕, Escape, or click-outside) while an
+  // inline holding edit row was open used to leave _editingHoldingSafeId stuck
+  // set forever, since only Save/Cancel/Remove inside that row cleared it. With
+  // the flag stuck, renderPortfolioHoldings() would skip rebuilding the list on
+  // every future refresh — the holdings list froze permanently even though the
+  // user was no longer editing anything. Clear it here so any way of closing
+  // the modal ends the edit session too.
+  if (id === 'port-modal' && typeof _editingHoldingSafeId !== 'undefined' && _editingHoldingSafeId) {
+    _editingHoldingSafeId = null;
+  }
+}
+document.addEventListener('keydown',e=>{if(e.key==='Escape')document.querySelectorAll('.mo.vis').forEach(m=>closeM(m.id));});
+document.querySelectorAll('.mo').forEach(o=>o.addEventListener('click',e=>{if(e.target===o)closeM(o.id);}));
 
 // ═══════════════════════════════════════════════════════
 //  UTILS
