@@ -4547,6 +4547,8 @@ async function loadPortChart(tf) {
 }
 async function setPortTF(tf,btn){document.querySelectorAll('#pp-chart .tf').forEach(b=>b.classList.remove('on'));btn.classList.add('on');await loadPortChart(tf);}
 
+let _editingHoldingSafeId = null; // set while an inline holding edit row is open, so periodic refreshes don't clobber it
+
 function renderPortfolioHoldings() {
   const port = calcPortfolio();
   const displayPct = (window._port1DReturn != null) ? window._port1DReturn : port.totalPct;
@@ -4585,6 +4587,13 @@ function renderPortfolioHoldings() {
     document.getElementById('port-holdings-list').innerHTML = `<div style="padding:32px;text-align:center;color:var(--t2);font-family:var(--fm);font-size:12px;">No holdings yet. Go to Add/Edit tab.</div>`;
     return;
   }
+
+  // An inline edit row is currently open (e.g. user is mid-edit when a periodic
+  // refresh fires). Rebuilding the list here would blow away the edit inputs
+  // and whatever the user has typed, silently discarding it. Leave the list
+  // DOM untouched until the edit is saved or cancelled — totals above still
+  // update live, only the per-row list is skipped.
+  if (_editingHoldingSafeId) return;
 
   document.getElementById('port-holdings-list').innerHTML = port.holdings.map((h,i) => {
     const weight = port.totalValue ? (h.value / port.totalValue * 100) : 0;
@@ -4645,6 +4654,7 @@ function addHolding() {
 function removeHolding(i) {
   portfolio.splice(i,1);
   localStorage.setItem('mts_port', JSON.stringify(portfolio));
+  _editingHoldingSafeId = null;
   renderPortfolioHoldings(); renderPortEditList(); renderWL(); renderTicker();
 }
 
@@ -4653,6 +4663,7 @@ function inlineEditHolding(idx, safeId) {
   if (!h) return;
   const container = document.getElementById(`phi-${safeId}`);
   if (!container) return;
+  _editingHoldingSafeId = safeId;
   container.innerHTML = `
     <div style="flex:1;display:grid;grid-template-columns:1fr 1fr 1fr auto;gap:8px;align-items:end;">
       <div><label class="flbl">${h.sym} — Quantity</label>
@@ -4663,10 +4674,15 @@ function inlineEditHolding(idx, safeId) {
       </div>
       <div style="display:flex;gap:6px;align-items:flex-end;">
         <button class="btn-p" style="white-space:nowrap;" onclick="saveInlineEdit(${idx},'${safeId}')">Save</button>
-        <button class="btn" onclick="renderPortfolioHoldings()">Cancel</button>
+        <button class="btn" onclick="cancelInlineEdit()">Cancel</button>
         <button class="erm" style="padding:6px 8px;" onclick="removeHolding(${idx})" title="Remove">✕</button>
       </div>
     </div>`;
+}
+
+function cancelInlineEdit() {
+  _editingHoldingSafeId = null;
+  renderPortfolioHoldings();
 }
 
 function saveInlineEdit(idx, safeId) {
@@ -4676,6 +4692,7 @@ function saveInlineEdit(idx, safeId) {
   portfolio[idx].qty = qty;
   portfolio[idx].costBasis = cost;
   localStorage.setItem('mts_port', JSON.stringify(portfolio));
+  _editingHoldingSafeId = null;
   renderPortfolioHoldings(); renderPortEditList(); renderWL(); renderTicker();
 }
 
