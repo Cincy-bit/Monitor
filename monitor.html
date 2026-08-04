@@ -3750,6 +3750,35 @@ async function fetchMyFollowers(myPubkey) {
 }
 
 
+// Shared NIP-10 reply classification — used by both the profile posts/replies tabs
+// and the main timeline "Posts" filter, so quote-posts are treated consistently
+// everywhere instead of being miscounted as replies just for having an e-tag.
+// reply = explicit "reply"/"root" marker, OR 2+ unmarked e-tags (old threading style)
+// post  = no e-tags, single unmarked e-tag (quote ref), or q-tag (quote-repost)
+function isNostrReplyEvent(ev){
+  const eTags = ev.tags?.filter(t=>t[0]==='e')||[];
+  const hasQTag = ev.tags?.some(t=>t[0]==='q');
+  let isReply = false;
+  if (!hasQTag && eTags.length) {
+    // Strict NIP-10 reply classification:
+    // REPLY = e-tag with explicit 'reply' or 'root' marker
+    // OLD-STYLE REPLY = 2+ e-tags with NO marker (pre-NIP-10 threading)
+    // NOT a reply = single unmarked e-tag (embedded note/image ref) or q-tag
+    const hasExplicitMarker = eTags.some(t => t[3] === 'reply' || t[3] === 'root');
+    const unmarked = eTags.filter(t => !t[3]);
+    isReply = hasExplicitMarker || unmarked.length >= 2;
+  }
+  // Also treat posts starting with @npub1/nostr:npub as replies (old-style @-mention replies
+  // that don't use NIP-10 e-tags — common for accounts like TFTC that reply by @-mentioning)
+  if (!isReply && !hasQTag && !eTags.length) {
+    const trimmed = (ev.content||'').trimStart();
+    if (/^(nostr:|@)?(npub1|nprofile1)[a-zA-Z0-9]/.test(trimmed)) {
+      isReply = true;
+    }
+  }
+  return isReply;
+}
+
 async function fetchProfilePosts(pubkey, relays, targetContainerId, loadToken){
   // targetContainerId: container to render into. Defaults to 'np-posts' (profile modal).
   // Pass 'npp-posts' to render into the profile pane instead.
@@ -3939,30 +3968,7 @@ async function fetchProfilePosts(pubkey, relays, targetContainerId, loadToken){
   // that were actually fetched during this call — no pollution from other profiles or feeds.
   for(const ev of Object.values(localEvMap)){
     if(ev.pubkey!==pubkey||ev.kind!==1) continue;
-    // Proper NIP-10 reply classification:
-    // reply = explicit "reply"/"root" marker, OR 2+ unmarked e-tags (old threading style)
-    // post  = no e-tags, single unmarked e-tag (quote ref), or q-tag (quote-repost)
-    const eTags = ev.tags?.filter(t=>t[0]==='e')||[];
-    const hasQTag = ev.tags?.some(t=>t[0]==='q');
-    let isReply = false;
-    if (!hasQTag && eTags.length) {
-      // Strict NIP-10 reply classification:
-      // REPLY = e-tag with explicit 'reply' or 'root' marker
-      // OLD-STYLE REPLY = 2+ e-tags with NO marker (pre-NIP-10 threading)
-      // NOT a reply = single unmarked e-tag (embedded note/image ref) or q-tag
-      const hasExplicitMarker = eTags.some(t => t[3] === 'reply' || t[3] === 'root');
-      const unmarked = eTags.filter(t => !t[3]);
-      isReply = hasExplicitMarker || unmarked.length >= 2;
-    }
-    // Also treat posts starting with @npub1/nostr:npub as replies (old-style @-mention replies
-    // that don't use NIP-10 e-tags — common for accounts like TFTC that reply by @-mentioning)
-    if (!isReply && !hasQTag && !eTags.length) {
-      const trimmed = (ev.content||'').trimStart();
-      if (/^(nostr:|@)?(npub1|nprofile1)[a-zA-Z0-9]/.test(trimmed)) {
-        isReply = true;
-      }
-    }
-    if(isReply) replies.push(ev); else posts.push(ev);
+    if(isNostrReplyEvent(ev)) replies.push(ev); else posts.push(ev);
   }
   // Container may have been rebuilt - re-query it
   posts.sort((a,b)=>b.created_at-a.created_at);
@@ -6116,7 +6122,11 @@ function renderNFeed(){
   // Allow renders when: feed is empty, user is at top, or it's been >2s since last scroll.
   const userScrolledRecently = (Date.now() - (f._lastScrollAt||0)) < 2000;
   const filtered=nFeedFilter==='posts'
-    ?nEvents.filter(e=>(e.kind===6)||!e.tags.some(t=>t[0]==='e'))
+    // NOTE: previously this excluded ANY kind:1 event with an e-tag, which wrongly
+    // hid quote-posts (a quoted note is often referenced via a single unmarked e-tag
+    // or a q-tag alongside/instead of it). Use the shared NIP-10 classifier instead,
+    // so quote-posts show up as posts while true replies are still filtered out.
+    ?nEvents.filter(e=>(e.kind===6)||!isNostrReplyEvent(e))
     :nEvents;
   if(!filtered.length){
     f.innerHTML=`<div style="padding:20px;text-align:center;font-family:var(--fm);font-size:11px;color:var(--t2);">Loading timeline${nFollowing.length>1?' ('+nFollowing.length+' accounts)':''}...</div>`;
@@ -6414,7 +6424,11 @@ function resolveNostrMention(tok, pTags){
       // nevent/note — not a profile mention, return compact note link
       else if(dec.type==='note'||dec.type==='nevent'){
         const noteId=dec.type==='note'?dec.data:dec.data?.id;
-        return {pubkey:null, label:'📝 note', noteId};
+        // nevent (unlike bare note) can carry relay hints in its TLV data — these tell us
+        // *where* the quoted event actually lives, which matters because it was very likely
+        // posted by someone else and may not exist on the viewer's own relay list.
+        const noteRelays=dec.type==='nevent'?(dec.data?.relays||[]):[];
+        return {pubkey:null, label:'📝 note', noteId, noteRelays};
       }
       // naddr — long-form article (NIP-23); render as a quoted/linked article card
       else if(dec.type==='naddr'){
@@ -6459,7 +6473,7 @@ function buildNContent(raw, evId='', pTags=[]){
     } else if(/^nostr:/i.test(tok)||/^(?:npub|nprofile|nevent|note)1[a-zA-Z0-9]{20,}$/i.test(tok)){
       // Normalize bare nprofile1.../npub1... tokens to nostr: URI form
       const normTok=/^nostr:/i.test(tok)?tok:'nostr:'+tok;
-      const {pubkey, label, noteId, naddr, unresolved}=resolveNostrMention(normTok, pTags);
+      const {pubkey, label, noteId, noteRelays, naddr, unresolved}=resolveNostrMention(normTok, pTags);
       const mid=evId?`nm-${evId}-${mentionIdx++}`:'';
       if(naddr){
         // NIP-23 long-form article — render as clickable article card
@@ -6532,8 +6546,17 @@ function buildNContent(raw, evId='', pTags=[]){
             <div style="font-family:var(--fm);font-size:10px;color:var(--t3);">📝 Loading quoted note…</div>
           </div>`;
           if(cardId){
-            fetchEventById(noteId).then(qev=>{
-              if(!qev) return;
+            // Pass along any relay hints from the nevent so we can find the quoted
+            // note even when it isn't on the viewer's own relay list (the note was
+            // very likely posted by someone else, on different relays).
+            fetchEventById(noteId, noteRelays).then(qev=>{
+              if(!qev){
+                // Previously this left "Loading quoted note…" showing forever on
+                // failure. Show a clear end-state instead so it doesn't look stuck.
+                const failEl=document.getElementById(cardId);
+                if(failEl) failEl.innerHTML=`<div style="font-family:var(--fm);font-size:10px;color:var(--t3);">📝 Quoted note unavailable</div>`;
+                return;
+              }
               nvEventCache[qev.id]=qev;
               const el=document.getElementById(cardId);
               if(!el) return;
@@ -6755,11 +6778,8 @@ async function openNoteView(evId, evt){
   const body=document.getElementById('nv-body');
   body.innerHTML=`<div class="nv-loading"><div class="spin" style="margin:0 auto 12px;"></div>Loading...</div>`;
 
-  // Check if this note is a reply — get parent event ID from tags
-  // NIP-10: 'root' marker or last 'e' tag without marker is the reply target
-  const eTags=ev.tags.filter(t=>t[0]==='e');
-  const replyTag=eTags.find(t=>t[3]==='reply')||eTags.find(t=>t[3]==='root')||eTags[eTags.length-1];
-  const parentId=replyTag?.[1]||null;
+  // Check if this note is a reply — get direct parent event ID from tags (NIP-10)
+  const parentId=getNostrDirectParentId(ev);
 
   // Fetch parent event if needed
   let parentEv=null;
@@ -6839,9 +6859,14 @@ async function openNoteView(evId, evt){
   if(parentEv && !nProfiles[parentEv.pubkey]) fetchNProfiles([parentEv.pubkey]);
 }
 
-// Fetch a single event by ID from relays — used for loading parent notes
-async function fetchEventById(evId){
-  const relays=RELAYS.length?[...RELAYS]:['wss://relay.damus.io','wss://eden.nostr.land','wss://nos.lol','wss://relay.primal.net'];
+// Fetch a single event by ID from relays — used for loading parent notes and quoted notes.
+// extraRelays: optional relay hints (e.g. from a decoded nevent's TLV data) queried FIRST,
+// since a quoted/parent note is frequently authored by someone else and may simply not
+// exist on the viewer's own relay list. relay.nostr.band/nostr.wine are wide-coverage
+// indexers included as a last-resort fallback for the same reason.
+async function fetchEventById(evId, extraRelays){
+  const baseRelays=RELAYS.length?[...RELAYS]:['wss://relay.damus.io','wss://eden.nostr.land','wss://nos.lol','wss://relay.primal.net'];
+  const relays=[...new Set([...(extraRelays||[]), ...baseRelays, 'wss://relay.nostr.band', 'wss://nostr.wine'])].slice(0,8);
   return new Promise(res=>{
     let done=false;
     let tried=0;
@@ -7019,6 +7044,19 @@ function fmtSatsShort(n) {
 
 
 
+// NIP-10: figure out the direct parent (the note actually being replied to) from an
+// event's e-tags — explicit 'reply' marker wins, else 'root' (when there's no separate
+// reply marker, root IS the direct parent), else old-style: the last unmarked e-tag.
+function getNostrDirectParentId(ev){
+  const eTags=ev.tags?.filter(t=>t[0]==='e')||[];
+  if(!eTags.length) return null;
+  const replyTag=eTags.find(t=>t[3]==='reply');
+  if(replyTag) return replyTag[1];
+  const rootTag=eTags.find(t=>t[3]==='root');
+  if(rootTag) return rootTag[1];
+  return eTags[eTags.length-1][1];
+}
+
 function fetchNoteReactions(evId, authorPubkey){
   const relays=RELAYS.length?[...RELAYS]:['wss://relay.damus.io','wss://eden.nostr.land','wss://nos.lol','wss://relay.primal.net'];
   let likes=0, reposts=0, zaps=0, zapSats=0;
@@ -7064,7 +7102,13 @@ function fetchNoteReactions(evId, authorPubkey){
             } else if(ev.kind===1){
               const prof=nProfiles[ev.pubkey]||null;
               if(!prof) unknownPubkeys.add(ev.pubkey);
-              nvEventCache[ev.id]=ev; // cache so openNoteView can find it
+              // The relay query below matches ANY event that e-tags evId — but a
+              // reply-to-a-reply also e-tags the thread ROOT (per NIP-10), so without
+              // this check a grandchild reply would wrongly show up here under the
+              // OP instead of only under its actual direct parent (the reply it's
+              // answering). Only keep events whose *direct* parent is this note.
+              nvEventCache[ev.id]=ev; // cache regardless, so openNoteView can find it when nested one level in
+              if(getNostrDirectParentId(ev)!==evId) return;
               replies.push({ev,prof});
             }
             // Live-update stats as events stream in
