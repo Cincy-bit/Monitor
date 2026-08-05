@@ -188,7 +188,9 @@ a{color:inherit;text-decoration:none;}
 .nact.repost:hover{color:var(--green);}
 .nact.repost.done{color:var(--green);}
 .npost.replying{border-left:2px solid var(--accent);}
-#reply-banner{display:none;background:rgba(0,212,160,.08);border-bottom:1px solid rgba(0,212,160,.2);padding:5px 12px;font-family:var(--fm);font-size:10px;color:var(--accent);align-items:center;gap:8px;}
+#reply-banner{display:none;background:rgba(0,212,160,.08);border-bottom:1px solid rgba(0,212,160,.2);padding:5px 12px;font-family:var(--fm);font-size:10px;color:var(--accent);align-items:center;gap:8px;overflow:hidden;}
+#reply-banner .rb-text{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+#reply-banner .rb-close{flex-shrink:0;}
 #reply-banner.on{display:flex;}
 
 /* ── NOTE VIEW MODAL ── */
@@ -4594,25 +4596,43 @@ function renderPortfolioHoldings() {
     return;
   }
 
-  // BUG FIX: this used to bail out of rebuilding the ENTIRE list whenever any
-  // one row was mid-edit (to avoid blowing away that row's input fields). That
-  // meant editing a single holding froze every OTHER holding's price/value too
-  // — most visible with a 24/7 asset like BTC-USD, whose % looked "stuck" while
-  // stocks (already static after-hours) didn't look any different. Now we only
-  // preserve the DOM of the single row actually being edited; every other row
-  // is rebuilt fresh on every refresh, same as if nothing were being edited.
+  // BUG FIX (freeze): this used to bail out of rebuilding the ENTIRE list
+  // whenever any one row was mid-edit (to avoid blowing away that row's input
+  // fields). That meant editing a single holding froze every OTHER holding's
+  // price/value too. Now we only preserve the row actually being edited;
+  // every other row is rebuilt fresh on every refresh, same as if nothing
+  // were being edited.
+  //
+  // BUG FIX (wipe): "preserving" that row used to mean capturing its
+  // outerHTML as a text string and reinjecting it. outerHTML serializes an
+  // <input>'s `value` ATTRIBUTE, which never reflects what the user has
+  // actually typed (that's a separate live DOM property) — so the
+  // "preserved" row was really just a snapshot of the ORIGINAL qty/cost from
+  // when the row was opened. Reinjecting that string via innerHTML silently
+  // reset (wiped) any unsaved edit back to its starting value, and also
+  // destroyed/recreated the actual <input> node, dropping focus and cursor
+  // position. Fix: detach the real, live DOM node for the editing row before
+  // rebuilding the list, splice it back in afterward (untouched — same node,
+  // same live values, same everything), then restore focus/caret.
   const editingSafeId = _editingHoldingSafeId;
-  let preservedRowHTML = null;
+  let editingEl = null;
+  let editingFocus = null;
   if (editingSafeId) {
-    const editingEl = document.getElementById(`phi-${editingSafeId}`);
-    if (editingEl) preservedRowHTML = editingEl.outerHTML;
+    editingEl = document.getElementById(`phi-${editingSafeId}`);
+    if (editingEl) {
+      const active = document.activeElement;
+      if (active && editingEl.contains(active)) {
+        editingFocus = { id: active.id, start: active.selectionStart, end: active.selectionEnd };
+      }
+      editingEl.remove(); // detach (not destroy) — keeps whatever the user has typed intact
+    }
   }
 
   document.getElementById('port-holdings-list').innerHTML = port.holdings.map((h,i) => {
     const safeId = h.sym.replace(/[^a-zA-Z0-9]/g,'_');
-    // This is the row currently open for editing — leave its live DOM (with
-    // the input fields and whatever the user has typed) completely untouched.
-    if (editingSafeId && safeId === editingSafeId && preservedRowHTML) return preservedRowHTML;
+    // This is the row currently open for editing — leave a placeholder; the
+    // real live node (detached above) gets spliced back in below.
+    if (editingSafeId && safeId === editingSafeId && editingEl) return `<div id="phi-${safeId}-placeholder"></div>`;
 
     const weight = port.totalValue ? (h.value / port.totalValue * 100) : 0;
     const stale = isStaleAfterClose(PC[h.sym]?.asOf);
@@ -4640,6 +4660,25 @@ function renderPortfolioHoldings() {
       <button class="btn" style="margin-left:8px;font-size:10px;padding:3px 8px;" onclick="inlineEditHolding(${origIdx},'${safeId}')">Edit</button>
     </div>`;
   }).join('');
+
+  // Splice the real, untouched edit row back into its placeholder slot, then
+  // restore focus/caret (removing a node blurs it even when just detaching
+  // to move it).
+  if (editingEl) {
+    const placeholder = document.getElementById(`phi-${editingSafeId}-placeholder`);
+    if (placeholder) {
+      placeholder.replaceWith(editingEl);
+      if (editingFocus) {
+        const fEl = document.getElementById(editingFocus.id);
+        if (fEl) {
+          fEl.focus();
+          if (typeof fEl.setSelectionRange === 'function' && editingFocus.start != null) {
+            try { fEl.setSelectionRange(editingFocus.start, editingFocus.end); } catch {}
+          }
+        }
+      }
+    }
+  }
 }
 
 function renderPortEditList() {
@@ -5140,6 +5179,12 @@ async function onNC() {
   document.getElementById('ndot').classList.add('on');
   const hd=document.getElementById('nhd');hd.style.background='var(--green)';hd.style.boxShadow='0 0 5px var(--green)';
   await fetchNProfile(nPubkey);
+  // Start the notifications websocket immediately on connect, regardless of whether
+  // the Nostr panel is expanded. Previously this only happened inside buildNExp(),
+  // which only runs when the panel is open — so with the panel collapsed (the
+  // default), mentions/replies/zaps never arrived and the bar badge stayed stale
+  // until the user happened to expand the panel for some other reason.
+  connectNNotifs();
   if(nExp)buildNExp();
 }
 
@@ -5796,11 +5841,24 @@ function renderNNotifs(){
 }
 
 function connectNRelays(){
-  // Track user scroll activity so renderNFeed doesn't jump the feed mid-scroll
+  // Track user scroll activity so renderNFeed doesn't jump the feed mid-scroll.
+  // BUG FIX: renderNFeed's own corrective scrollTop writes (used to keep the
+  // reading position stable when new notes are inserted above the viewport)
+  // ALSO fire this 'scroll' event, which used to reset _lastScrollAt to "now"
+  // every time. That re-armed the 2s "user is scrolling, defer new notes"
+  // window on every single insert — so on any timeline busier than one note
+  // every 2s, new notes kept getting silently deferred (queued but never
+  // actually inserted) forever, only flushing in unpredictable bursts on the
+  // rare moment nothing scrolled (real or programmatic) for a full 2s.
+  // renderNFeed now sets feedEl._suppressScrollTrack while it's doing its own
+  // corrective scrolling; skip updating the timer for those.
   const feedEl = document.getElementById('nfeed');
   if (feedEl && !feedEl._scrollTracked) {
     feedEl._scrollTracked = true;
-    feedEl.addEventListener('scroll', () => { feedEl._lastScrollAt = Date.now(); }, {passive:true});
+    feedEl.addEventListener('scroll', () => {
+      if (feedEl._suppressScrollTrack) return;
+      feedEl._lastScrollAt = Date.now();
+    }, {passive:true});
   }
   nFeedWSList.forEach(ws=>{try{ws.close();}catch{}});
   nFeedWSList=[];
@@ -6118,14 +6176,25 @@ function openHashtagFeed(tag){
 function renderNFeed(){
   if(nHashtagMode) return; // hashtag feed is active — don't overwrite it
   const f=document.getElementById('nfeed');if(!f)return;
+  // BUG FIX: this function corrects scrollTop itself (to keep the reading
+  // position stable when notes are inserted above the viewport). Those
+  // corrective writes fire the feed's 'scroll' listener just like a real
+  // user scroll would, which used to reset the "user recently scrolled"
+  // timer on every single insert — perpetually re-arming the 2s deferral
+  // window below and silently swallowing new notes on any active timeline.
+  // Mark these as programmatic so the listener (see connectNRelays) ignores
+  // them; clear the flag shortly after via rAF, once the async scroll event
+  // from our own writes has had a chance to fire and be ignored.
+  f._suppressScrollTrack = true;
+  try {
   // Suppress disruptive re-renders while user is scrolling or recently stopped scrolling.
   // Allow renders when: feed is empty, user is at top, or it's been >2s since last scroll.
   const userScrolledRecently = (Date.now() - (f._lastScrollAt||0)) < 2000;
+  // NOTE: previously this excluded ANY kind:1 event with an e-tag, which wrongly
+  // hid quote-posts (a quoted note is often referenced via a single unmarked e-tag
+  // or a q-tag alongside/instead of it). Use the shared NIP-10 classifier instead,
+  // so quote-posts show up as posts while true replies are still filtered out.
   const filtered=nFeedFilter==='posts'
-    // NOTE: previously this excluded ANY kind:1 event with an e-tag, which wrongly
-    // hid quote-posts (a quoted note is often referenced via a single unmarked e-tag
-    // or a q-tag alongside/instead of it). Use the shared NIP-10 classifier instead,
-    // so quote-posts show up as posts while true replies are still filtered out.
     ?nEvents.filter(e=>(e.kind===6)||!isNostrReplyEvent(e))
     :nEvents;
   if(!filtered.length){
@@ -6214,22 +6283,40 @@ function renderNFeed(){
       ?`<img src="${esc(avSrc)}" alt="" loading="lazy" crossorigin="anonymous" referrerpolicy="no-referrer" onerror="this.onerror=null;this.src='${esc(av)}';this.onerror=function(){this.style.display='none';this.nextSibling&&(this.nextSibling.style.display='flex');}">` :``;
     const avFallback=`<div style="width:100%;height:100%;background:var(--bg-4);display:flex;align-items:center;justify-content:center;font-size:9px;color:var(--t3);${avSrc?'display:none':''}">${esc(name).slice(0,2).toUpperCase()}</div>`;
     const replyTo=e.tags.find(t=>t[0]==='e');
-    // Build "Replying to @username" header for replies (matches profile modal style)
+    const qTag=e.tags.find(t=>t[0]==='q');
+    // Build "Replying to @username" (true replies) or "Quoted @username" (quote-posts)
+    // header. isNostrReplyEvent() is the same NIP-10 classifier used by the Posts/Replies
+    // tabs elsewhere — without it, any single unmarked e-tag (which is actually just a
+    // quote reference, not a reply) was being shown as "↩ Replying to", mislabeling quotes.
     let feedReplyHeader = '';
-    if (replyTo) {
-      const pTag = e.tags.find(t=>t[0]==='p');
-      let parentPub = pTag?.[1] || null;
-      if (!parentPub && replyTo[1]) {
-        const parentEv = nvEventCache[replyTo[1]];
-        if (parentEv) parentPub = parentEv.pubkey;
+    if (isNostrReplyEvent(e)) {
+      if (replyTo) {
+        const pTag = e.tags.find(t=>t[0]==='p');
+        let parentPub = pTag?.[1] || null;
+        if (!parentPub && replyTo[1]) {
+          const parentEv = nvEventCache[replyTo[1]];
+          if (parentEv) parentPub = parentEv.pubkey;
+        }
+        if (parentPub) {
+          const rProf = nProfiles[parentPub];
+          const rName = rProf?.name || rProf?.display_name || trunc(parentPub);
+          const rPubEsc = esc(parentPub);
+          feedReplyHeader = `<div style="font-family:var(--fm);font-size:10px;color:var(--t3);margin-bottom:4px;">↩ Replying to <span style="color:var(--accent);cursor:pointer;" onclick="event.stopPropagation();openNostrProfile('${rPubEsc}')">@${esc(rName)}</span></div>`;
+        } else {
+          feedReplyHeader = `<div style="font-family:var(--fm);font-size:10px;color:var(--t3);margin-bottom:4px;">↩ reply</div>`;
+        }
       }
-      if (parentPub) {
-        const rProf = nProfiles[parentPub];
-        const rName = rProf?.name || rProf?.display_name || trunc(parentPub);
-        const rPubEsc = esc(parentPub);
-        feedReplyHeader = `<div style="font-family:var(--fm);font-size:10px;color:var(--t3);margin-bottom:4px;">↩ Replying to <span style="color:var(--accent);cursor:pointer;" onclick="event.stopPropagation();openNostrProfile('${rPubEsc}')">@${esc(rName)}</span></div>`;
+    } else if (replyTo || qTag) {
+      const refId = qTag?.[1] || replyTo?.[1];
+      const refEv = refId ? nvEventCache[refId] : null;
+      const refPub = refEv?.pubkey || null;
+      if (refPub) {
+        const qProf = nProfiles[refPub];
+        const qName = qProf?.name || qProf?.display_name || trunc(refPub);
+        const qPubEsc = esc(refPub);
+        feedReplyHeader = `<div style="font-family:var(--fm);font-size:10px;color:var(--t3);margin-bottom:4px;">❝ Quoted <span style="color:var(--accent);cursor:pointer;" onclick="event.stopPropagation();openNostrProfile('${qPubEsc}')">@${esc(qName)}</span></div>`;
       } else {
-        feedReplyHeader = `<div style="font-family:var(--fm);font-size:10px;color:var(--t3);margin-bottom:4px;">↩ reply</div>`;
+        feedReplyHeader = `<div style="font-family:var(--fm);font-size:10px;color:var(--t3);margin-bottom:4px;">❝ Quoted note</div>`;
       }
     }
     const ct=buildNContent(e.content||'', e.id, e.tags?.filter(t=>t[0]==='p')||[]);
@@ -6406,6 +6493,9 @@ function renderNFeed(){
       }
     });
   }
+  } finally {
+    requestAnimationFrame(() => { f._suppressScrollTrack = false; });
+  }
 }
 
 // ═══════════════════════════════════════════════════════
@@ -6422,11 +6512,11 @@ function resolveNostrMention(tok, pTags){
       if(dec.type==='npub') pubkey=dec.data;
       else if(dec.type==='nprofile') pubkey=dec.data?.pubkey;
       // nevent/note — not a profile mention, return compact note link
+      // nevent (unlike bare note) can carry relay hints in its TLV data — these tell us
+      // *where* the quoted event actually lives, which matters because it was very likely
+      // posted by someone else and may not exist on the viewer's own relay list.
       else if(dec.type==='note'||dec.type==='nevent'){
         const noteId=dec.type==='note'?dec.data:dec.data?.id;
-        // nevent (unlike bare note) can carry relay hints in its TLV data — these tell us
-        // *where* the quoted event actually lives, which matters because it was very likely
-        // posted by someone else and may not exist on the viewer's own relay list.
         const noteRelays=dec.type==='nevent'?(dec.data?.relays||[]):[];
         return {pubkey:null, label:'📝 note', noteId, noteRelays};
       }
@@ -7100,8 +7190,6 @@ function fetchNoteReactions(evId, authorPubkey){
                 if(desc){const req=JSON.parse(desc[1]);const amt=req.tags?.find(t=>t[0]==='amount');if(amt) zapSats+=Math.round(parseInt(amt[1])/1000);}
               }catch{}
             } else if(ev.kind===1){
-              const prof=nProfiles[ev.pubkey]||null;
-              if(!prof) unknownPubkeys.add(ev.pubkey);
               // The relay query below matches ANY event that e-tags evId — but a
               // reply-to-a-reply also e-tags the thread ROOT (per NIP-10), so without
               // this check a grandchild reply would wrongly show up here under the
@@ -7109,6 +7197,8 @@ function fetchNoteReactions(evId, authorPubkey){
               // answering). Only keep events whose *direct* parent is this note.
               nvEventCache[ev.id]=ev; // cache regardless, so openNoteView can find it when nested one level in
               if(getNostrDirectParentId(ev)!==evId) return;
+              const prof=nProfiles[ev.pubkey]||null;
+              if(!prof) unknownPubkeys.add(ev.pubkey);
               replies.push({ev,prof});
             }
             // Live-update stats as events stream in
@@ -7427,7 +7517,7 @@ function startReply(evId, evPubkey, preview){
   const banner=document.getElementById('reply-banner');
   if(banner){
     banner.classList.add('on');
-    banner.innerHTML=`↩ Replying to <strong style="color:var(--t1);margin:0 4px;">${esc(nProfiles[evPubkey]?.name||trunc(evPubkey))}</strong>: <span style="color:var(--t2);">${esc(preview.slice(0,60))}${preview.length>60?'…':''}</span><button onclick="cancelReply()" style="margin-left:auto;background:none;border:none;color:var(--t3);cursor:pointer;font-size:12px;padding:2px 6px;">✕</button>`;
+    banner.innerHTML=`<span class="rb-text">↩ Replying to <strong style="color:var(--t1);margin:0 4px;">${esc(nProfiles[evPubkey]?.name||trunc(evPubkey))}</strong>: <span style="color:var(--t2);">${esc(preview.slice(0,60))}${preview.length>60?'…':''}</span></span><button onclick="cancelReply()" class="rb-close" style="margin-left:auto;background:none;border:none;color:var(--t3);cursor:pointer;font-size:12px;padding:2px 6px;">✕</button>`;
   }
   const ta=document.getElementById('compose-ta');
   if(ta){ta.focus();}
