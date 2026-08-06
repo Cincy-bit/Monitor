@@ -1,6 +1,6 @@
 # Monitor
 
-A personal dashboard for tracking financial markets, news, your portfolio, weather, and Bitcoin miners on your local network — all in one customizable view. It also doubles as a lightweight Nostr client.
+A personal dashboard for tracking markets, news, your portfolio, weather, and Bitcoin miners on your local network — all in one customizable view. It also doubles as a lightweight Nostr client.
 
 > **Platform:** macOS only (for now)
 
