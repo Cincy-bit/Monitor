@@ -359,6 +359,7 @@ a{color:inherit;text-decoration:none;}
 .cc{position:relative;height:300px;background:var(--bg-1);border-radius:var(--r);border:1px solid var(--border);overflow:hidden;}
 .cl{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-family:var(--fm);font-size:12px;color:var(--t2);background:var(--bg-1);}
 .cstats{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:12px;}
+#hr-stats{grid-template-columns:repeat(5,1fr);}
 .sb{background:var(--bg-3);border:1px solid var(--border);border-radius:var(--r);padding:10px 12px;}
 .sl{font-family:var(--fm);font-size:9px;font-weight:600;letter-spacing:.1em;color:var(--t3);text-transform:uppercase;margin-bottom:4px;}
 .sv{font-family:var(--fm);font-size:13px;font-weight:500;color:var(--t0);}
@@ -4221,6 +4222,71 @@ async function openHashrateChart(type) {
   await loadHashrateChart('1d');
 }
 
+// Robust y-axis bounds: dropout points (miner offline, host off the home
+// network, etc.) can crash to zero or near-zero. Those points are kept in
+// the data as-is — the line will still plunge toward the chart floor so the
+// outage is visible — but they're excluded from the axis range calculation
+// so a handful of zero blips don't flatten the whole chart into a sliver.
+// Percentile-based: the bottom HR_Y_LOW_PCTL fraction of samples (by rank,
+// not by value) is ignored when picking the floor. Adjust this constant if
+// dropouts happen more/less often than ~5% of samples in a typical period.
+const HR_Y_LOW_PCTL = 0.05;
+function _percentile(sortedArr, p) {
+  const idx = (sortedArr.length - 1) * p;
+  const lo = Math.floor(idx), hi = Math.ceil(idx);
+  if (lo === hi) return sortedArr[lo];
+  return sortedArr[lo] + (sortedArr[hi] - sortedArr[lo]) * (idx - lo);
+}
+function computeYBounds(vals) {
+  const finite = vals.filter(v => Number.isFinite(v));
+  if (!finite.length) return { min: undefined, max: undefined };
+  const sorted = [...finite].sort((a,b)=>a-b);
+  const lo = _percentile(sorted, HR_Y_LOW_PCTL);
+  const hi = sorted[sorted.length - 1]; // true max — legitimate upward spikes stay visible
+  const pad = (hi - lo) * 0.15 || (hi * 0.1) || 1;
+  return { min: Math.max(0, lo - pad), max: hi + pad };
+}
+
+// Max points actually handed to Chart.js for drawing. A ~1250px-wide chart
+// panel can't visually distinguish more points than this anyway, so beyond
+// this budget we're just burning CPU on an old machine for no visible gain.
+const HR_MAX_PLOT_POINTS = 400;
+
+// Largest-Triangle-Three-Buckets downsampling: picks the most visually
+// significant point in each bucket (biggest triangle area vs. neighbors),
+// so sharp spikes and dropouts survive the downsampling instead of getting
+// smoothed away like a naive average would. Stats (current/avg/high/low)
+// are computed separately from the full-resolution data — this function
+// only affects what gets drawn.
+function lttbDownsample(data, threshold) {
+  const n = data.length;
+  if (threshold >= n || threshold <= 2) return data;
+  const sampled = [data[0]];
+  const bucketSize = (n - 2) / (threshold - 2);
+  let a = 0;
+  for (let i = 0; i < threshold - 2; i++) {
+    const rangeStart = Math.floor(i * bucketSize) + 1;
+    const rangeEnd = Math.min(Math.floor((i + 1) * bucketSize) + 1, n);
+    const nextStart = rangeEnd;
+    const nextEnd = Math.min(Math.floor((i + 2) * bucketSize) + 1, n);
+    let avgT = 0, avgV = 0;
+    const avgCount = Math.max(nextEnd - nextStart, 1);
+    for (let j = nextStart; j < nextEnd; j++) { avgT += data[j].t; avgV += data[j].v; }
+    avgT /= avgCount; avgV /= avgCount;
+
+    const pointA = data[a];
+    let maxArea = -1, maxIdx = rangeStart;
+    for (let j = rangeStart; j < rangeEnd; j++) {
+      const area = Math.abs((pointA.t - avgT) * (data[j].v - pointA.v) - (pointA.t - data[j].t) * (avgV - pointA.v)) * 0.5;
+      if (area > maxArea) { maxArea = area; maxIdx = j; }
+    }
+    sampled.push(data[maxIdx]);
+    a = maxIdx;
+  }
+  sampled.push(data[n - 1]);
+  return sampled;
+}
+
 async function loadHashrateChart(tf) {
   const cl = document.getElementById('hr-cl'), cv = document.getElementById('hr-mc');
   cl.style.display='flex'; cv.style.display='none';
@@ -4234,12 +4300,15 @@ async function loadHashrateChart(tf) {
     const cutoff = Date.now() - (tfMs[tf] || 86400e3);
     const pts = hist.filter(p=>p.t>=cutoff);
     if (!pts.length) { cl.textContent = 'Not enough history for this timeframe yet — data accumulates over time.'; cl.style.display='flex'; return; }
-    renderHRChart(cv, cl, pts.map(p=>({t:p.t, v:p.v})), 'GH/s', '#f7931a');
     const vals = pts.map(p=>p.v);
     const lo = Math.min(...vals), hi = Math.max(...vals), cur = vals[vals.length-1], chg = ((cur-vals[0])/vals[0]*100);
+    const avg = vals.reduce((s,v)=>s+v,0) / vals.length;
+    const plotPts = lttbDownsample(pts, HR_MAX_PLOT_POINTS);
+    renderHRChart(cv, cl, plotPts, 'GH/s', '#f7931a', avg, vals);
     document.getElementById('hr-stats').innerHTML=`
       <div class="sb"><div class="sl">Current</div><div class="sv">${fmtHashrate(cur)}</div></div>
       <div class="sb"><div class="sl">Period Change</div><div class="sv" style="color:${chg>=0?'var(--green)':'var(--red)'}">${chg>=0?'+':''}${chg.toFixed(2)}%</div></div>
+      <div class="sb"><div class="sl">Average</div><div class="sv">${fmtHashrate(avg)}</div></div>
       <div class="sb"><div class="sl">Period High</div><div class="sv">${fmtHashrate(hi)}</div></div>
       <div class="sb"><div class="sl">Period Low</div><div class="sv">${fmtHashrate(lo)}</div></div>`;
     return;
@@ -4267,27 +4336,59 @@ async function loadHashrateChart(tf) {
       // Only append if the live point is meaningfully newer than the last candle (>1h gap)
       pts.push({t: nowTs, v: liveVal});
     }
-    renderHRChart(cv, cl, pts, 'EH/s', '#ff9f43');
     const vals = pts.map(p=>p.v);
     const lo = Math.min(...vals), hi = Math.max(...vals), chg = ((liveVal-vals[0])/vals[0]*100);
+    const avg = vals.reduce((s,v)=>s+v,0) / vals.length;
+    const plotPts = lttbDownsample(pts, HR_MAX_PLOT_POINTS);
+    renderHRChart(cv, cl, plotPts, 'EH/s', '#ff9f43', avg, vals);
     document.getElementById('hr-stats').innerHTML=`
       <div class="sb"><div class="sl">Current</div><div class="sv">${liveVal.toFixed(2)} EH/s</div></div>
       <div class="sb"><div class="sl">Period Change</div><div class="sv" style="color:${chg>=0?'var(--green)':'var(--red)'}">${chg>=0?'+':''}${chg.toFixed(2)}%</div></div>
+      <div class="sb"><div class="sl">Average</div><div class="sv">${avg.toFixed(2)} EH/s</div></div>
       <div class="sb"><div class="sl">Period High</div><div class="sv">${hi.toFixed(2)} EH/s</div></div>
       <div class="sb"><div class="sl">Period Low</div><div class="sv">${lo.toFixed(2)} EH/s</div></div>`;
   } catch(e) { cl.textContent = `Failed: ${e.message}`; }
 }
 
-function renderHRChart(cv, cl, pts, unit, color) {
+// Draws a dashed horizontal reference line + label at the period average.
+// Registered once; each chart instance supplies its own value via
+// options.plugins.avgLine.
+const hrAvgLinePlugin = {
+  id: 'avgLine',
+  afterDatasetsDraw(chart, args, opts) {
+    if (opts?.value == null || !Number.isFinite(opts.value)) return;
+    const { ctx, chartArea, scales: { y } } = chart;
+    const yPos = y.getPixelForValue(opts.value);
+    if (yPos < chartArea.top || yPos > chartArea.bottom) return;
+    ctx.save();
+    ctx.setLineDash([5,4]);
+    ctx.strokeStyle = 'rgba(240,242,248,.4)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(chartArea.left, yPos);
+    ctx.lineTo(chartArea.right, yPos);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.font = '9px IBM Plex Mono';
+    ctx.fillStyle = 'rgba(240,242,248,.65)';
+    ctx.textBaseline = 'bottom';
+    ctx.fillText(`avg ${opts.value.toFixed(2)} ${opts.unit||''}`, chartArea.left+4, yPos-3);
+    ctx.restore();
+  }
+};
+if (typeof Chart !== 'undefined' && !Chart.registry.plugins.get('avgLine')) Chart.register(hrAvgLinePlugin);
+
+function renderHRChart(cv, cl, pts, unit, color, avg, boundsVals) {
   cl.style.display='none'; cv.style.display='block';
   if (hrInst) hrInst.destroy();
   const ctx = cv.getContext('2d');
   const g = ctx.createLinearGradient(0,0,0,280);
   g.addColorStop(0, color+'44'); g.addColorStop(1,'rgba(0,0,0,0)');
+  const { min: yMin, max: yMax } = computeYBounds(boundsVals || pts.map(p=>p.v));
   hrInst = new Chart(cv, {
     type:'line',
     data:{labels:pts.map(p=>new Date(p.t).toLocaleDateString()),datasets:[{data:pts.map(p=>p.v),borderColor:color,borderWidth:2,fill:true,backgroundColor:g,pointRadius:0,tension:.2}]},
-    options:{animation:{duration:400},responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{mode:'index',intersect:false,backgroundColor:'#1e2028',borderColor:'#2a2d38',borderWidth:1,titleColor:'#b8bccf',bodyColor:'#f0f2f8',titleFont:{family:'IBM Plex Mono',size:10},bodyFont:{family:'IBM Plex Mono',size:12},callbacks:{label:c=>` ${c.raw.toFixed(2)} ${unit}`}}},scales:{x:{grid:{color:'rgba(42,45,56,.6)'},ticks:{color:'#42465a',font:{family:'IBM Plex Mono',size:9},maxTicksLimit:8},border:{color:'#2a2d38'}},y:{grid:{color:'rgba(42,45,56,.6)'},ticks:{color:'#42465a',font:{family:'IBM Plex Mono',size:9},callback:v=>v.toFixed(1)+' '+unit},border:{color:'#2a2d38'},position:'right'}}}
+    options:{animation:false,responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},avgLine:{value:avg,unit},tooltip:{mode:'index',intersect:false,backgroundColor:'#1e2028',borderColor:'#2a2d38',borderWidth:1,titleColor:'#b8bccf',bodyColor:'#f0f2f8',titleFont:{family:'IBM Plex Mono',size:10},bodyFont:{family:'IBM Plex Mono',size:12},callbacks:{label:c=>` ${c.raw.toFixed(2)} ${unit}`}}},scales:{x:{grid:{color:'rgba(42,45,56,.6)'},ticks:{color:'#42465a',font:{family:'IBM Plex Mono',size:9},maxTicksLimit:8},border:{color:'#2a2d38'}},y:{min:yMin,max:yMax,grid:{color:'rgba(42,45,56,.6)'},ticks:{color:'#42465a',font:{family:'IBM Plex Mono',size:9},callback:v=>v.toFixed(1)+' '+unit},border:{color:'#2a2d38'},position:'right'}}}
   });
 }
 
