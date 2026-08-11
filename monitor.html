@@ -170,8 +170,8 @@ a{color:inherit;text-decoration:none;}
 #nfeed-wrap{display:flex;flex-direction:column;overflow:hidden;background:var(--bg-1);}
 #nfeed{background:var(--bg-1);overflow-y:auto;height:100%;overflow-anchor:none;}
 #ncompose{background:var(--bg-2);display:flex;flex-direction:column;padding:12px;gap:8px;height:100%;overflow-y:auto;}
-.npost{padding:11px 14px;border-bottom:1px solid var(--border);}
-.npost-meta{display:flex;align-items:center;gap:8px;margin-bottom:5px;}
+.npost{padding:11px 14px;border-bottom:1px solid var(--border);box-sizing:border-box;}
+.npost-meta{display:flex;align-items:center;gap:8px;margin-bottom:4px;}
 .nav{width:22px;height:22px;border-radius:50%;background:var(--bg-4);border:1px solid var(--border-l);overflow:hidden;flex-shrink:0;}
 .nav img{width:100%;height:100%;object-fit:cover;}
 #compose-ta{background:var(--bg-3);border:1px solid var(--border-l);border-radius:var(--r);color:var(--t0);font-family:var(--fs);font-size:12px;padding:9px;resize:none;flex:1;outline:none;transition:border-color .15s;min-height:70px;}
@@ -181,7 +181,7 @@ a{color:inherit;text-decoration:none;}
 #n-resize-handle:hover,#n-resize-handle.dragging{background:rgba(0,212,160,.15);border-top-color:var(--accent);}
 #n-resize-handle::after{content:'';display:block;width:32px;height:2px;background:var(--border-l);border-radius:1px;}
 .reply-btn{display:none;}
-.npost-actions{display:flex;align-items:center;gap:1px;margin-top:6px;}
+.npost-actions{display:flex;align-items:center;gap:1px;margin-top:5px;}
 .nact{background:none;border:none;font-family:var(--fm);font-size:10px;cursor:pointer;padding:3px 9px;border-radius:3px;transition:all .15s;display:inline-flex;align-items:center;gap:4px;color:var(--t3);line-height:1;}
 .nact:hover{background:var(--bg-3);}
 .nact.reply:hover{color:var(--accent);}
@@ -195,7 +195,7 @@ a{color:inherit;text-decoration:none;}
 
 /* ── NOTE VIEW MODAL ── */
 #nv-modal .md{width:580px;max-height:85vh;}
-#nv-body{overflow-y:auto;flex:1;padding:0;}
+#nv-body{overflow-y:auto;overflow-x:hidden;flex:1;padding:0;}
 .nv-post{padding:16px 18px;border-bottom:1px solid var(--border);}
 .nv-author{display:flex;align-items:center;gap:10px;margin-bottom:10px;}
 .nv-av{width:36px;height:36px;border-radius:50%;background:var(--bg-4);border:1px solid var(--border-l);overflow:hidden;flex-shrink:0;}
@@ -204,7 +204,8 @@ a{color:inherit;text-decoration:none;}
 .nv-time{font-family:var(--fm);font-size:10px;color:var(--t3);margin-top:2px;}
 .nv-content{font-size:13px;color:var(--t1);line-height:1.6;word-break:break-word;margin-bottom:12px;}
 .nv-stats{display:flex;gap:18px;padding:10px 0;border-top:1px solid var(--border);border-bottom:1px solid var(--border);margin-bottom:4px;}
-.nv-stat{display:flex;align-items:center;gap:5px;font-family:var(--fm);font-size:11px;color:var(--t2);}
+.nv-stat{display:flex;align-items:center;gap:5px;font-family:var(--fm);font-size:11px;color:var(--t2);cursor:pointer;border-radius:4px;padding:2px 4px;margin:-2px -4px;transition:background .12s;}
+.nv-stat:hover{background:var(--bg-3);color:var(--t1);}
 .nv-stat .val{font-size:13px;font-weight:600;color:var(--t0);}
 .nv-stat.likes .val{color:var(--red);}
 .nv-stat.reposts .val{color:var(--green);}
@@ -954,11 +955,35 @@ a{color:inherit;text-decoration:none;}
   </div>
 </div>
 
+<!-- ═══ REACTORS LIST MODAL (who liked/reposted/zapped) ═══ -->
+<div class="mo" id="reactors-modal">
+  <div class="md" style="width:400px;max-height:75vh;">
+    <div class="md-hdr">
+      <div><div class="md-title" id="reactors-title">Liked by</div></div>
+      <button class="md-close" onclick="closeM('reactors-modal')">✕</button>
+    </div>
+    <div id="reactors-body" style="overflow-y:auto;flex:1;"></div>
+  </div>
+</div>
+
 <script>
 // ═══════════════════════════════════════════════════════
 //  CONFIG
 // ═══════════════════════════════════════════════════════
 const PROXY    = 'http://127.0.0.1:8082';
+// Shared cap for post images/galleries — single images and multi-image carousels
+// both use this so a photo never looks smaller just for being part of a set.
+const MEDIA_MAX_W = 480, MEDIA_MAX_H = 420;
+// The note-detail modal (nv-modal) is a fixed-height popup with everything —
+// author, stats, actions, replies — competing for the same viewport. A full
+// MEDIA_MAX_H image there eats the whole modal and forces scrolling before
+// you can even see the like/reply buttons. Cap media shorter in that context
+// only; width stays the same so image quality doesn't take a hit.
+const MODAL_MEDIA_MAX_W = 480, MODAL_MEDIA_MAX_H = 280;
+// Thumbnail size for the expanded "Show all" filmstrip — was a squashed 130px,
+// which made split-out images feel like an afterthought. Bigger now so each
+// image is still genuinely viewable while scrolling the strip.
+const MEDIA_ROW_H = 220, MEDIA_ROW_MAX_W = 320;
 // Miner requests go through our proxy on 8082 using path-style routing
 
 let watchlist = JSON.parse(localStorage.getItem('mts_wl')||'null') || [
@@ -1108,37 +1133,49 @@ function loadFleetHistory() {
   return [];
 }
 function saveFleetHistory(hist) {
-  try {
-    // Downsample: keep at most 1 point per 10 minutes to stay efficient
-    // 10 years of 10-min samples = ~525,600 points; at ~30 bytes/point JSON ≈ 15MB
-    // To stay within localStorage limits (~5MB), use 30-min buckets for data >1 year old,
-    // and 10-min for the most recent year (fine-grained for shorter charts).
-    const TEN_MIN = 600000;
-    const THIRTY_MIN = 1800000;
-    const ONE_YEAR_AGO = Date.now() - 365 * 86400000;
-    const TEN_YEARS_AGO = Date.now() - 10 * 365 * 86400000;
+  // Downsample: keep fine-grained recent data, coarser buckets further back.
+  // This keeps both localStorage AND the in-memory array bounded, so the
+  // dashboard can accumulate up to 10 years of history without either
+  // blowing past storage limits or leaking memory in a long-running tab.
+  //   0–48h old:   every sample (~30s)   (~5,760 pts max)  — keeps 1D/1W smooth
+  //   48h–1yr old: 1 point per 10 min    (~52,560 pts max)
+  //   1yr–10yr:    1 point per 60 min    (~78,840 pts max)
+  //   Total worst case: ~137,000 points, ~4MB as JSON — comfortably under
+  //   typical per-origin localStorage limits (5–10MB).
+  const TEN_MIN = 600000;
+  const ONE_HOUR = 3600000;
+  const FORTY_EIGHT_H_AGO = Date.now() - 2 * 86400000;
+  const ONE_YEAR_AGO = Date.now() - 365 * 86400000;
+  const TEN_YEARS_AGO = Date.now() - 10 * 365 * 86400000;
 
-    const downsampled = [];
-    let lastT = -Infinity;
-    let lastBucket = -Infinity;
-    for (const pt of hist) {
-      if (pt.t < TEN_YEARS_AGO) continue; // drop data older than 10 years
-      const bucket = pt.t < ONE_YEAR_AGO ? THIRTY_MIN : TEN_MIN;
-      const threshold = pt.t < ONE_YEAR_AGO ? lastBucket : lastT;
-      const gap = pt.t < ONE_YEAR_AGO ? THIRTY_MIN : TEN_MIN;
-      if (pt.t - (pt.t < ONE_YEAR_AGO ? lastBucket : lastT) >= gap) {
-        downsampled.push(pt);
-        if (pt.t < ONE_YEAR_AGO) lastBucket = pt.t; else lastT = pt.t;
-      }
+  const downsampled = [];
+  let lastMidT = -Infinity;
+  let lastOldT = -Infinity;
+  for (const pt of hist) {
+    if (pt.t < TEN_YEARS_AGO) continue; // drop data older than 10 years
+    if (pt.t >= FORTY_EIGHT_H_AGO) {
+      downsampled.push(pt); // keep full resolution for the most recent 48h
+    } else if (pt.t >= ONE_YEAR_AGO) {
+      if (pt.t - lastMidT >= TEN_MIN) { downsampled.push(pt); lastMidT = pt.t; }
+    } else {
+      if (pt.t - lastOldT >= ONE_HOUR) { downsampled.push(pt); lastOldT = pt.t; }
     }
+  }
+
+  try {
     localStorage.setItem(FLEET_HR_STORE_KEY, JSON.stringify(downsampled));
+    return downsampled;
   } catch(e) {
-    // If storage is full, try saving just the last 2 years
+    // If storage is still full (unusually large history), fall back to
+    // saving just the last 2 years and return that as the in-memory copy too.
     try {
       const cutoff = Date.now() - 2 * 365 * 86400000;
-      const trimmed = hist.filter(p => p.t >= cutoff);
+      const trimmed = downsampled.filter(p => p.t >= cutoff);
       localStorage.setItem(FLEET_HR_STORE_KEY, JSON.stringify(trimmed));
-    } catch {}
+      return trimmed;
+    } catch {
+      return downsampled;
+    }
   }
 }
 const hashrateHistory = { network: loadNetworkHistory(), fleet: loadFleetHistory() }; // both persist across reloads
@@ -1562,8 +1599,11 @@ async function refreshMiningStats() {
   await Promise.allSettled(miners.map(m => fetchMinerStats(m)));
   const newFleet = getFleetStats().totalHashRate;
   hashrateHistory.fleet.push({t: Date.now(), v: newFleet});
-  if (hashrateHistory.fleet.length > 2880) hashrateHistory.fleet.shift();
-  saveFleetHistory(hashrateHistory.fleet);
+  // saveFleetHistory downsamples (10-min buckets <1yr, hourly beyond that) and
+  // persists to localStorage; feed the downsampled result back into memory too
+  // so the array stays bounded across a long-running session instead of
+  // growing forever or getting truncated to a fixed point count.
+  hashrateHistory.fleet = saveFleetHistory(hashrateHistory.fleet);
   // Use value from ~24h ago in history for fleet % change
   const target24h = Date.now() - 86400000;
   const hist24 = hashrateHistory.fleet;
@@ -2507,11 +2547,18 @@ async function loadAssetNews(sym){
     const r=await fetchT(`${PROXY}/asset-news?sym=${encodeURIComponent(sym)}`,8000);
     const d=await r.json();
     if(!d.items?.length){body.innerHTML='<div style="font-family:var(--fm);font-size:11px;color:var(--t3);">No news found.</div>';return;}
-    body.innerHTML=d.items.map(it=>`
-      <div class="cm-news-item" onclick="window.open(${JSON.stringify(it.link||'#')},'_blank')">
+    body.innerHTML=d.items.map(it=>{
+      const link=it.link||'#';
+      const srcHost=(()=>{try{return new URL(link).hostname.replace('www.','');}catch{return '';}})();
+      const titleEsc=esc(it.title).replace(/"/g,'&quot;');
+      const descEsc=esc(it.desc||'').replace(/"/g,'&quot;');
+      const linkEsc=link.replace(/"/g,'&quot;');
+      return `
+      <div class="cm-news-item" data-url="${linkEsc}" data-title="${titleEsc}" data-src="${srcHost}" data-desc="${descEsc}" onclick="openReader(this.dataset.url,this.dataset.title,this.dataset.src,this.dataset.desc)">
         <div class="cm-news-title">${esc(it.title)}</div>
         <div class="cm-news-meta">${it.pub?new Date(it.pub).toLocaleString():''}${it.desc?' · '+esc(it.desc.slice(0,80))+'…':''}</div>
-      </div>`).join('');
+      </div>`;
+    }).join('');
   }catch(e){body.innerHTML='<div style="font-family:var(--fm);font-size:11px;color:var(--t3);">News unavailable.</div>';}
 }
 
@@ -2984,11 +3031,18 @@ async function loadSrchNews(sym){
     const r=await fetchT(`${PROXY}/asset-news?sym=${encodeURIComponent(sym)}`,8000);
     const d=await r.json();
     if(!d.items?.length){body.innerHTML='<div style="font-family:var(--fm);font-size:11px;color:var(--t3);">No news found.</div>';return;}
-    body.innerHTML=d.items.map(it=>`
-      <div class="cm-news-item" onclick="window.open(${JSON.stringify(it.link||'#')},'_blank')">
+    body.innerHTML=d.items.map(it=>{
+      const link=it.link||'#';
+      const srcHost=(()=>{try{return new URL(link).hostname.replace('www.','');}catch{return '';}})();
+      const titleEsc=esc(it.title).replace(/"/g,'&quot;');
+      const descEsc=esc(it.desc||'').replace(/"/g,'&quot;');
+      const linkEsc=link.replace(/"/g,'&quot;');
+      return `
+      <div class="cm-news-item" data-url="${linkEsc}" data-title="${titleEsc}" data-src="${srcHost}" data-desc="${descEsc}" onclick="openReader(this.dataset.url,this.dataset.title,this.dataset.src,this.dataset.desc)">
         <div class="cm-news-title">${esc(it.title)}</div>
         <div class="cm-news-meta">${it.pub?new Date(it.pub).toLocaleString():''}${it.desc?' · '+esc(it.desc.slice(0,80))+'…':''}</div>
-      </div>`).join('');
+      </div>`;
+    }).join('');
   }catch(e){body.innerHTML='<div style="font-family:var(--fm);font-size:11px;color:var(--t3);">News unavailable.</div>';}
 }
 
@@ -5282,16 +5336,16 @@ function buildNExp(){
       </div>
       <div id="nfeed" style="flex:1;overflow-y:auto;display:${nActivePane==='feed'?'block':'none'};"></div>
       <div id="nnotifs" style="flex:1;overflow-y:auto;display:${nActivePane==='notifs'?'block':'none'};"></div>
-      <div id="narticles" style="flex:1;overflow-y:auto;display:${nActivePane==='articles'?'block':'none'};"></div>
+      <div id="narticles" onscroll="onArticlesScroll(this)" style="flex:1;overflow-y:auto;display:${nActivePane==='articles'?'block':'none'};"></div>
       <div id="nprofile-pane" style="flex:1;overflow-y:auto;display:${nActivePane==='profile'?'block':'none'};"></div>
     </div>
     <div id="ncompose" style="background:var(--bg-2);display:flex;flex-direction:column;gap:8px;overflow-y:auto;">
       <div id="reply-banner"></div>
       <div style="padding:12px;padding-top:10px;display:flex;flex-direction:column;gap:8px;flex:1;">
         <span style="font-family:var(--fm);font-size:10px;font-weight:600;letter-spacing:.1em;color:var(--t2);text-transform:uppercase;">New Note</span>
-        <textarea id="compose-ta" placeholder="What's happening?" maxlength="280" oninput="updCC(this)" style="background:var(--bg-3);border:1px solid var(--border-l);border-radius:var(--r);color:var(--t0);font-family:var(--fs);font-size:12px;padding:9px;resize:none;flex:1;outline:none;transition:border-color .15s;min-height:70px;"></textarea>
+        <textarea id="compose-ta" placeholder="What's happening?" oninput="updCC(this)" style="background:var(--bg-3);border:1px solid var(--border-l);border-radius:var(--r);color:var(--t0);font-family:var(--fs);font-size:12px;padding:9px;resize:none;flex:1;outline:none;transition:border-color .15s;min-height:70px;"></textarea>
         <div style="display:flex;align-items:center;justify-content:space-between;">
-          <span style="font-family:var(--fm);font-size:10px;color:var(--t3);" id="c-char">280</span>
+          <span style="font-family:var(--fm);font-size:10px;color:var(--t3);" id="c-char">0</span>
           <button class="btn-post" onclick="pubNote()">Publish</button>
         </div>
       </div>
@@ -5490,59 +5544,128 @@ function renderNppTab(tab) {
 }
 
 
-let nArticlesConn = null;
+let nArticlesConns = []; // live subscription sockets (initial load + new-article polling)
+let nArticlesLoadingMore = false; // true while a "load older" round is in flight
+let nArticlesExhausted = false; // true once a "load older" round returns nothing new
+
+// Query the user's own relays plus a few well-known relays that carry a lot of
+// long-form (kind:30023) content, so Articles isn't limited to a single relay's view.
+function articleRelays(){
+  const extra=['wss://relay.primal.net','wss://nos.lol','wss://relay.damus.io','wss://nostr.wine'];
+  return [...new Set([...RELAYS, ...extra])];
+}
 
 function connectNArticles(){
   if(!nPubkey||!nFollowing.length) return;
-  clearTimeout(connectNArticles._reconnect);
   clearTimeout(connectNArticles._poll);
-  if(nArticlesConn){try{nArticlesConn.close();}catch{} nArticlesConn=null;}
-  const relay='wss://relay.primal.net';
-  const since=nArticles.length>0?nArticles[0].created_at-60:Math.floor(Date.now()/1000)-60*60*24*30;
+  nArticlesConns.forEach(ws=>{try{ws.close();}catch{}});
+  nArticlesConns=[];
+  nArticlesExhausted=false; // fresh connect — re-allow pagination
   const isInitial=nArticles.length===0;
-  try{
-    const ws=new WebSocket(relay);
-    nArticlesConn=ws;
-    const sid='art-'+Math.random().toString(36).slice(2,8);
-    const authors=[...new Set([...nFollowing,nPubkey])];
-    const filter=isInitial
-      ?{kinds:[30023],authors,limit:100}
-      :{kinds:[30023],authors,since,limit:50};
-    ws.onopen=()=>ws.send(JSON.stringify(['REQ',sid,filter]));
-    ws.onmessage=(e)=>{
-      try{
-        const m=JSON.parse(e.data);
-        if(m[0]==='EVENT'&&m[2]?.kind===30023){
-          const ev=m[2];
-          const dTag=ev.tags.find(t=>t[0]==='d')?.[1]||'';
-          const key=ev.pubkey+':'+dTag;
-          const existing=nArticles.findIndex(a=>a.pubkey+':'+(a.tags?.find(t=>t[0]==='d')?.[1]||'')===key);
-          if(existing>=0){
-            if(ev.created_at>nArticles[existing].created_at) nArticles[existing]=ev;
-          } else {
-            nArticles.push(ev);
+  const since=nArticles.length>0?nArticles[0].created_at-60:Math.floor(Date.now()/1000)-60*60*24*30;
+  const authors=[...new Set([...nFollowing,nPubkey])];
+  const relays=articleRelays();
+  let eoseCount=0;
+  relays.forEach(relayUrl=>{
+    try{
+      const ws=new WebSocket(relayUrl);
+      nArticlesConns.push(ws);
+      const sid='art-'+Math.random().toString(36).slice(2,8);
+      const filter=isInitial
+        ?{kinds:[30023],authors,limit:60}
+        :{kinds:[30023],authors,since,limit:30};
+      ws.onopen=()=>ws.send(JSON.stringify(['REQ',sid,filter]));
+      ws.onmessage=(e)=>{
+        try{
+          const m=JSON.parse(e.data);
+          if(m[0]==='EVENT'&&m[2]?.kind===30023){
+            const ev=m[2];
+            const dTag=ev.tags.find(t=>t[0]==='d')?.[1]||'';
+            const key=ev.pubkey+':'+dTag;
+            const existing=nArticles.findIndex(a=>a.pubkey+':'+(a.tags?.find(t=>t[0]==='d')?.[1]||'')===key);
+            if(existing>=0){
+              if(ev.created_at>nArticles[existing].created_at) nArticles[existing]=ev;
+            } else {
+              nArticles.push(ev);
+            }
+            nArticles.sort((a,b)=>b.created_at-a.created_at);
+            if(nActivePane==='articles'){clearTimeout(connectNArticles._t);connectNArticles._t=setTimeout(renderNArticles,200);}
+          } else if(m[0]==='EOSE'){
+            try{ws.close();}catch{}
+            eoseCount++;
+            if(eoseCount>=relays.length){
+              // After the initial batch from every relay, poll every 5 minutes for new articles
+              clearTimeout(connectNArticles._poll);
+              connectNArticles._poll=setTimeout(()=>connectNArticles(),5*60*1000);
+            }
           }
-          nArticles.sort((a,b)=>b.created_at-a.created_at);
-          if(nActivePane==='articles'){clearTimeout(connectNArticles._t);connectNArticles._t=setTimeout(renderNArticles,200);}
-        } else if(m[0]==='EOSE'){
-          // After initial batch, poll every 5 minutes for new articles
-          clearTimeout(connectNArticles._poll);
-          connectNArticles._poll=setTimeout(()=>connectNArticles(),5*60*1000);
-        }
-      }catch{}
-    };
-    ws.onerror=()=>{
-      clearTimeout(connectNArticles._reconnect);
-      connectNArticles._reconnect=setTimeout(()=>connectNArticles(),30000);
-    };
-    ws.onclose=()=>{
-      if(nArticlesConn===ws){
-        nArticlesConn=null;
-        clearTimeout(connectNArticles._reconnect);
-        connectNArticles._reconnect=setTimeout(()=>connectNArticles(),30000);
-      }
-    };
-  }catch{}
+        }catch{}
+      };
+      ws.onerror=()=>{try{ws.close();}catch{}};
+      ws.onclose=()=>{nArticlesConns=nArticlesConns.filter(c=>c!==ws);};
+    }catch{}
+  });
+}
+
+// Fetches older articles (created before the oldest one currently loaded) across
+// all article relays, so the Articles tab can be scrolled like a normal timeline.
+function loadMoreArticles(){
+  if(!nPubkey||!nFollowing.length||nArticlesLoadingMore||nArticlesExhausted||!nArticles.length) return;
+  nArticlesLoadingMore=true;
+  renderArticlesFooter();
+  const until=nArticles[nArticles.length-1].created_at-1;
+  const authors=[...new Set([...nFollowing,nPubkey])];
+  const relays=articleRelays();
+  const beforeCount=nArticles.length;
+  let pending=relays.length;
+  const finish=()=>{
+    pending--;
+    if(pending<=0){
+      nArticlesLoadingMore=false;
+      if(nArticles.length===beforeCount) nArticlesExhausted=true;
+      renderNArticles();
+    }
+  };
+  relays.forEach(relayUrl=>{
+    let gotEose=false;
+    let ws;
+    const timeout=setTimeout(()=>{if(!gotEose){gotEose=true;try{ws.close();}catch{}finish();}},8000);
+    try{
+      ws=new WebSocket(relayUrl);
+      const sid='artm-'+Math.random().toString(36).slice(2,8);
+      ws.onopen=()=>ws.send(JSON.stringify(['REQ',sid,{kinds:[30023],authors,until,limit:30}]));
+      ws.onmessage=(e)=>{
+        try{
+          const m=JSON.parse(e.data);
+          if(m[0]==='EVENT'&&m[2]?.kind===30023){
+            const ev=m[2];
+            const dTag=ev.tags.find(t=>t[0]==='d')?.[1]||'';
+            const key=ev.pubkey+':'+dTag;
+            if(!nArticles.find(a=>a.pubkey+':'+(a.tags?.find(t=>t[0]==='d')?.[1]||'')===key)){
+              nArticles.push(ev);
+            }
+          } else if(m[0]==='EOSE'){
+            if(!gotEose){gotEose=true;clearTimeout(timeout);try{ws.close();}catch{}finish();}
+          }
+        }catch{}
+      };
+      ws.onerror=()=>{if(!gotEose){gotEose=true;clearTimeout(timeout);finish();}};
+    }catch{if(!gotEose){gotEose=true;clearTimeout(timeout);finish();}}
+  });
+}
+
+// Triggers loadMoreArticles() once the user scrolls near the bottom of the pane.
+function onArticlesScroll(el){
+  if(nActivePane!=='articles') return;
+  if(el.scrollTop+el.clientHeight >= el.scrollHeight-300) loadMoreArticles();
+}
+
+function renderArticlesFooter(){
+  const foot=document.getElementById('narticles-foot');
+  if(!foot) return;
+  foot.innerHTML=nArticlesLoadingMore
+    ?'<div class="spin" style="margin:0 auto;"></div>'
+    :(nArticlesExhausted?'No more articles':'');
 }
 
 function renderNArticles(){
@@ -5551,12 +5674,11 @@ function renderNArticles(){
   if(!nPubkey){el.innerHTML='<div style="padding:20px;text-align:center;font-family:var(--fm);font-size:11px;color:var(--t2);">Connect Nostr to see articles.</div>';return;}
   if(!nArticles.length){
     el.innerHTML='<div style="padding:20px;text-align:center;font-family:var(--fm);font-size:11px;color:var(--t2);">Loading articles from people you follow…</div>';
-    if(!nArticlesConn||nArticlesConn.readyState>1) connectNArticles();
+    if(!nArticlesConns.length) connectNArticles();
     return;
   }
-  const items=nArticles.slice(0,50);
   let html='';
-  items.forEach(ev=>{
+  nArticles.forEach(ev=>{
     const title=ev.tags.find(t=>t[0]==='title')?.[1]||ev.tags.find(t=>t[0]==='d')?.[1]?.replace(/-/g,' ')||'Untitled';
     const image=ev.tags.find(t=>t[0]==='image')?.[1]||ev.tags.find(t=>t[0]==='banner')?.[1]||'';
     const summary=ev.tags.find(t=>t[0]==='summary')?.[1]||(ev.content||'').slice(0,180).replace(/[#*`]/g,'');
@@ -5569,15 +5691,15 @@ function renderNArticles(){
     const evEsc=esc(ev.id);
     const pubEsc=esc(ev.pubkey);
     const dTag=ev.tags.find(t=>t[0]==='d')?.[1]||'';
-    html+=`<div class="npost" style="cursor:pointer;" onclick="openNostrArticle('${evEsc}')">
-      ${image?`<img src="${esc(proxyImg(image))}" alt="" loading="lazy" crossorigin="anonymous" referrerpolicy="no-referrer" style="width:100%;height:140px;object-fit:cover;border-radius:6px;margin-bottom:8px;" onerror="this.style.display='none'">`:''}
-      <div class="npost-meta">
+    html+=`<div class="npost" style="cursor:pointer;padding:9px 12px;" onclick="openNostrArticle('${evEsc}')">
+      ${image?`<img src="${esc(proxyImg(image))}" alt="" loading="lazy" crossorigin="anonymous" referrerpolicy="no-referrer" style="width:100%;height:92px;object-fit:cover;border-radius:6px;margin-bottom:6px;" onerror="this.style.display='none'">`:''}
+      <div class="npost-meta" style="margin-bottom:3px;">
         <div class="nav">${avH}</div>
         <span style="font-family:var(--fm);font-size:11px;font-weight:500;color:var(--t0);">${esc(name)}</span>
         <span style="font-family:var(--fm);font-size:10px;color:var(--t3);margin-left:auto;">${ago}</span>
       </div>
-      <div style="font-size:13px;font-weight:600;color:var(--t0);line-height:1.4;margin-bottom:4px;">${esc(title)}</div>
-      ${summary?`<div style="font-size:11px;color:var(--t2);line-height:1.5;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;">${esc(summary)}</div>`:''}
+      <div style="font-size:12.5px;font-weight:600;color:var(--t0);line-height:1.35;margin-bottom:3px;">${esc(title)}</div>
+      ${summary?`<div style="font-size:11px;color:var(--t2);line-height:1.45;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;">${esc(summary)}</div>`:''}
       <div class="npost-actions" onclick="event.stopPropagation()">
         <button class="nact reply" onclick='startReply("${evEsc}","${pubEsc}","${esc(title.slice(0,60))}")'>↩ reply</button>
         <button class="nact repost" onclick='nRepost("${evEsc}","${pubEsc}",this)'>⇄ repost</button>
@@ -5585,7 +5707,9 @@ function renderNArticles(){
       </div>
     </div>`;
   });
+  html+=`<div id="narticles-foot" style="padding:14px;text-align:center;font-family:var(--fm);font-size:10px;color:var(--t3);"></div>`;
   el.innerHTML=html;
+  renderArticlesFooter();
 }
 
 async function openNostrArticle(evId){
@@ -6057,7 +6181,7 @@ function fetchNProfiles(pubkeys){
                 const hasUnpatchedPosts=document.querySelectorAll(`[data-evid][data-author="${pk}"]:not([data-v="2"]),[data-evid][data-origauthor="${pk}"]:not([data-v="2"])`).length>0;
                 if(hasUnpatchedPosts||inNotifs){
                   clearTimeout(fetchNProfiles._t);
-                  fetchNProfiles._t=setTimeout(()=>{renderNFeed();renderNVReplies();renderNNotifs();},300);
+                  fetchNProfiles._t=setTimeout(()=>{renderNFeed();renderNVReplies();renderNNotifs();renderReactorsList();},300);
                 }
               }
             }else if(m[0]==='EOSE'){try{ws.close();}catch{}}
@@ -6544,19 +6668,184 @@ function resolveNostrMention(tok, pTags){
   return {pubkey, label:name?'@'+name:null, unresolved:name?null:tok};
 }
 
+// Renders 2+ images from one note as a stacked "deck": the current image sits at
+// full size (never cropped — object-fit:contain, sized to its own aspect ratio),
+// with the next 1-2 images peeking out from behind it toward the bottom-right.
+// Left/right arrows sit outside the stack itself. A "Show all" toggle below
+// expands every image into a horizontal, uncropped, scrollable strip in order.
+function nCarouselSlideVars(rel, compact){
+  // Deck-of-photos look: each card behind the front one steps out further
+  // (offset + rotation + shrink) so the stack reads clearly at a glance,
+  // while a light border gives every card a visible edge against whatever's
+  // behind it. Front card is untouched — full size, no tilt, no dimming.
+  // "compact" is used in the note-detail modal, which has much less spare
+  // width to the side of the image than the timeline does — a smaller peek
+  // offset keeps the stack from spilling past the modal's edge.
+  if(rel===0) return {tf:'translate(0,0) rotate(0deg) scale(1)',op:'1',fl:'none',z:30,pe:'auto',fit:'contain',bd:'none'};
+  if(rel===1) return compact
+    ? {tf:'translate(8px,6px) rotate(1.5deg) scale(.97)',op:'1',fl:'brightness(.82)',z:20,pe:'none',fit:'cover',bd:'2px solid var(--bg-2)'}
+    : {tf:'translate(16px,12px) rotate(3deg) scale(.95)',op:'1',fl:'brightness(.82)',z:20,pe:'none',fit:'cover',bd:'2px solid var(--bg-2)'};
+  if(rel===2) return compact
+    ? {tf:'translate(14px,10px) rotate(3deg) scale(.94)',op:'1',fl:'brightness(.62)',z:10,pe:'none',fit:'cover',bd:'2px solid var(--bg-2)'}
+    : {tf:'translate(28px,22px) rotate(6deg) scale(.90)',op:'1',fl:'brightness(.62)',z:10,pe:'none',fit:'cover',bd:'2px solid var(--bg-2)'};
+  return compact
+    ? {tf:'translate(14px,10px) rotate(3deg) scale(.94)',op:'0',fl:'brightness(.62)',z:0,pe:'none',fit:'cover',bd:'2px solid var(--bg-2)'}
+    : {tf:'translate(28px,22px) rotate(6deg) scale(.90)',op:'0',fl:'brightness(.62)',z:0,pe:'none',fit:'cover',bd:'2px solid var(--bg-2)'};
+}
+function buildImageCarousel(urls, keyId, maxW, maxH, compact){
+  maxW=maxW||MEDIA_MAX_W; maxH=maxH||MEDIA_MAX_H;
+  const cid='ic-'+esc(keyId).replace(/[^a-zA-Z0-9_-]/g,'');
+  const slides=urls.map((u,i)=>{
+    const sv=nCarouselSlideVars(i, compact); // idx starts at 0, so rel===pos on first render
+    return `<img class="n-car-img" data-full="${esc(u)}" data-pos="${i}" src="${esc(proxyImg(u))}" loading="lazy" crossorigin="anonymous" referrerpolicy="no-referrer" draggable="false" style="position:absolute;top:0;left:0;width:100%;height:100%;object-fit:${sv.fit};border-radius:8px;background:var(--bg-3);box-shadow:0 4px 14px rgba(0,0,0,.4);border:${sv.bd};box-sizing:border-box;-webkit-user-drag:none;user-select:none;transition:transform .22s ease,opacity .22s ease,filter .22s ease,width .18s ease,height .18s ease;transform:${sv.tf};opacity:${sv.op};filter:${sv.fl};z-index:${sv.z};pointer-events:${sv.pe};" onerror="this.onerror=null;this.src=this.dataset.full;" onload="nCarouselResize('${cid}')" onclick="event.stopPropagation();nCarouselImgClick('${cid}',${i})">`;
+  }).join('');
+  // Filmstrip thumbnails for "Show all" — sized well above a postage stamp so
+  // splitting the gallery out doesn't make every photo suddenly hard to see.
+  const rowImgs=urls.map(u=>`<img src="${esc(proxyImg(u))}" data-full="${esc(u)}" loading="lazy" crossorigin="anonymous" referrerpolicy="no-referrer" draggable="false" style="height:${MEDIA_ROW_H}px;width:auto;max-width:${MEDIA_ROW_MAX_W}px;object-fit:contain;border-radius:6px;background:var(--bg-3);flex:0 0 auto;cursor:pointer;-webkit-user-drag:none;user-select:none;" onclick="event.stopPropagation();window.open(this.dataset.full,'_blank')" onerror="this.onerror=null;this.src=this.dataset.full;">`).join('');
+  // Reserve a little breathing room on the right for the peeking cards' offset
+  // (they overflow their own box via transform, not layout) so they don't
+  // get clipped by a tight parent — matters most in the modal, where there's
+  // much less spare width beside the image than on the timeline.
+  const peekPad=compact?28:60;
+  return `<div class="n-carousel-outer" style="margin-top:6px;width:fit-content;max-width:100%;overflow:hidden;padding-right:${peekPad}px;box-sizing:content-box;">
+    <div id="${cid}-stackrow" style="display:flex;align-items:center;justify-content:flex-start;gap:8px;margin:0;width:fit-content;user-select:none;">
+      <button type="button" onclick="event.stopPropagation();nCarouselNav('${cid}',-1)" style="flex:0 0 auto;width:22px;height:22px;border-radius:50%;background:rgba(0,0,0,.5);border:none;color:#fff;font-size:12px;line-height:1;cursor:pointer;display:flex;align-items:center;justify-content:center;opacity:.5;transition:opacity .15s;" onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=.5">‹</button>
+      <div class="n-carousel" id="${cid}" data-idx="0" data-maxw="${maxW}" data-maxh="${maxH}" data-compact="${compact?1:0}" style="position:relative;width:340px;max-width:100%;height:340px;flex:0 0 auto;transition:width .18s ease,height .18s ease;margin:6px;">
+        ${slides}
+        <div style="position:absolute;bottom:7px;left:9px;background:rgba(0,0,0,.55);color:#fff;font-family:var(--fm);font-size:9px;padding:2px 7px;border-radius:9px;pointer-events:none;z-index:40;" id="${cid}-count">1 / ${urls.length}</div>
+      </div>
+      <button type="button" onclick="event.stopPropagation();nCarouselNav('${cid}',1)" style="flex:0 0 auto;width:22px;height:22px;border-radius:50%;background:rgba(0,0,0,.5);border:none;color:#fff;font-size:12px;line-height:1;cursor:pointer;display:flex;align-items:center;justify-content:center;opacity:.5;transition:opacity .15s;" onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=.5">›</button>
+    </div>
+    <div id="${cid}-row" style="display:none;overflow-x:auto;gap:8px;margin-top:8px;padding-bottom:2px;">${rowImgs}</div>
+    <div id="${cid}-toggle" data-total="${urls.length}" onclick="event.stopPropagation();nCarouselToggleAll('${cid}')" style="cursor:pointer;font-family:var(--fm);font-size:10px;color:var(--t3);margin-top:6px;display:inline-block;">Show all ${urls.length} ▸</div>
+  </div>`;
+}
+function nCarouselResize(cid){
+  const wrap=document.getElementById(cid);
+  if(!wrap) return;
+  const idx=parseInt(wrap.dataset.idx||'0',10);
+  const front=wrap.querySelector(`.n-car-img[data-pos="${idx}"]`);
+  if(!front||!front.naturalWidth) return;
+  // Same cap a single (non-grouped) image gets — being part of a multi-image
+  // gallery shouldn't shrink it any further. Only ever scales DOWN to fit,
+  // never up past its natural size (matches plain <img> with max-width/max-height).
+  // Caps are per-carousel (data-maxw/data-maxh) so the note-detail modal can
+  // use a shorter cap than the timeline without a separate code path.
+  const maxW=parseInt(wrap.dataset.maxw,10)||MEDIA_MAX_W, maxH=parseInt(wrap.dataset.maxh,10)||MEDIA_MAX_H;
+  let w=front.naturalWidth, h=front.naturalHeight;
+  const shrink=Math.min(maxW/w,maxH/h,1);
+  w*=shrink; h*=shrink;
+  wrap.style.width=Math.round(w)+'px';
+  wrap.style.height=Math.round(h)+'px';
+}
+function nCarouselLayout(cid){
+  const wrap=document.getElementById(cid);
+  if(!wrap) return;
+  const imgs=[...wrap.querySelectorAll('.n-car-img')];
+  const total=imgs.length;
+  const idx=parseInt(wrap.dataset.idx||'0',10);
+  const compact=wrap.dataset.compact==='1';
+  imgs.forEach(img=>{
+    const pos=parseInt(img.dataset.pos,10);
+    const rel=(pos-idx+total)%total; // 0=front, 1=next peek, 2=further peek, etc.
+    const sv=nCarouselSlideVars(rel, compact);
+    img.style.transform=sv.tf;
+    img.style.opacity=sv.op;
+    img.style.filter=sv.fl;
+    img.style.zIndex=sv.z;
+    img.style.pointerEvents=sv.pe;
+    img.style.objectFit=sv.fit;
+    img.style.border=sv.bd;
+  });
+}
+function nCarouselImgClick(cid, pos){
+  const wrap=document.getElementById(cid);
+  if(!wrap) return;
+  const idx=parseInt(wrap.dataset.idx||'0',10);
+  if(pos===idx){
+    const img=wrap.querySelector(`.n-car-img[data-pos="${pos}"]`);
+    if(img) window.open(img.dataset.full,'_blank');
+  } else {
+    nCarouselNav(cid,1);
+  }
+}
+function nCarouselNav(cid, dir){
+  const wrap=document.getElementById(cid);
+  if(!wrap) return;
+  const total=wrap.querySelectorAll('.n-car-img').length;
+  let idx=parseInt(wrap.dataset.idx||'0',10);
+  idx=(idx+dir+total)%total;
+  wrap.dataset.idx=idx;
+  nCarouselLayout(cid);
+  nCarouselResize(cid);
+  const cnt=document.getElementById(cid+'-count');
+  if(cnt) cnt.textContent=(idx+1)+' / '+total;
+}
+function nCarouselToggleAll(cid){
+  const stackRow=document.getElementById(cid+'-stackrow');
+  const allRow=document.getElementById(cid+'-row');
+  const toggle=document.getElementById(cid+'-toggle');
+  if(!stackRow||!allRow||!toggle) return;
+  const total=toggle.dataset.total||'';
+  const showingAll=allRow.style.display!=='none';
+  if(showingAll){
+    allRow.style.display='none';
+    stackRow.style.display='flex';
+    toggle.textContent='Show all '+total+' ▸';
+  } else {
+    allRow.style.display='flex';
+    stackRow.style.display='none';
+    toggle.textContent='Collapse ▾';
+  }
+}
+
 function buildNContent(raw, evId='', pTags=[]){
   // Tokenize raw content — image/video URLs, plain URLs, nostr: refs
   const TOKEN_RE=/(https?:\/\/\S+?\.(?:jpg|jpeg|png|gif|webp)(?:\?\S*)?(?=\s|$)|https?:\/\/\S+?\.(?:mp4|mov|webm)(?:\?\S*)?(?=\s|$)|https?:\/\/\S+|nostr:(?:npub|nprofile|nevent|note|naddr)[a-zA-Z0-9]+|\b(?:npub|nprofile|nevent|note|naddr)1[a-zA-Z0-9]{20,}\b|#[a-zA-Z][a-zA-Z0-9_]+|@[A-Za-z0-9_\-.]+)/gi;
   let ct='',last=0,tm,linkUrl=null;
   const pendingMentions=[]; // {domId, pubkey, tok} to resolve after render
   let mentionIdx=0;
+  // Pre-scan for image URLs so 2+ images in one note render as a single swipeable
+  // carousel instead of stacking full-height, one after another.
+  const IMG_RE=/https?:\/\/\S+?\.(?:jpg|jpeg|png|gif|webp)(?:\?\S*)?(?=\s|$)/gi;
+  const imgUrls=[...raw.matchAll(IMG_RE)].map(m=>m[0]);
+  const multiImage=imgUrls.length>1;
+  let carouselDone=false;
+  // The note-detail modal (evId prefixed 'nv-') is a fixed-height popup where
+  // stats/actions/replies all compete with the image for room — cap media
+  // shorter there so opening a note doesn't force a scroll just to reach the
+  // like button. The timeline keeps the full-size cap.
+  const isModalCtx=/^nv-/.test(evId);
+  const imgMaxW=isModalCtx?MODAL_MEDIA_MAX_W:MEDIA_MAX_W, imgMaxH=isModalCtx?MODAL_MEDIA_MAX_H:MEDIA_MAX_H;
 
   while((tm=TOKEN_RE.exec(raw))!==null){
-    ct+=esc(raw.slice(last,tm.index));
     const tok=tm[0];
-    if(/\.(jpg|jpeg|png|gif|webp)(\?|$)/i.test(tok)){
-      const proxied=proxyImg(tok);
-      ct+=`<br><img src="${esc(proxied)}" style="max-width:100%;max-height:220px;min-height:80px;border-radius:6px;margin-top:6px;cursor:pointer;display:block;aspect-ratio:16/9;object-fit:cover;background:var(--bg-3);" loading="lazy" crossorigin="anonymous" referrerpolicy="no-referrer" onerror="this.onerror=null;this.style.aspectRatio='auto';this.src='${esc(tok)}'" onclick="window.open('${esc(tok)}','_blank')">`;
+    const preText=raw.slice(last,tm.index);
+    const isImgTok=/\.(jpg|jpeg|png|gif|webp)(\?|$)/i.test(tok);
+    // When 2+ images get grouped into a single carousel, the blank lines that
+    // separated each image URL in the raw note (very common — one URL per line,
+    // often with a blank line between) would otherwise survive as a stack of
+    // empty <br> tags once the individual image tokens are dropped from the
+    // text stream, leaving a tall empty gap under the gallery. Keep that
+    // whitespace only ahead of the FIRST image (real lead-in text) or if it
+    // contains actual non-whitespace content; blank-line-only gaps between the
+    // images being folded into the carousel are dropped.
+    if(multiImage && isImgTok && carouselDone){
+      if(preText.trim()) ct+=esc(preText);
+    } else {
+      ct+=esc(preText);
+    }
+    if(isImgTok){
+      if(multiImage){
+        // Emit the carousel once, at the position of the first image; drop the rest.
+        if(!carouselDone){
+          carouselDone=true;
+          ct+='<br>'+buildImageCarousel(imgUrls, (evId||'r')+'-'+Math.random().toString(36).slice(2,8), imgMaxW, imgMaxH, isModalCtx);
+        }
+      } else {
+        const proxied=proxyImg(tok);
+        ct+=`<br><img src="${esc(proxied)}" style="max-width:min(${imgMaxW}px,100%);width:auto;height:auto;max-height:${imgMaxH}px;border-radius:6px;margin-top:6px;cursor:pointer;display:block;object-fit:contain;background:var(--bg-3);" loading="lazy" crossorigin="anonymous" referrerpolicy="no-referrer" onerror="this.onerror=null;this.src='${esc(tok)}'" onclick="event.stopPropagation();window.open('${esc(tok)}','_blank')">`;
+      }
     } else if(/\.(mp4|mov|webm)(\?|$)/i.test(tok)){
       const proxiedVid=`${PROXY}/proxy/${tok}`;
       ct+=`<br><video class="nv-video" src="${esc(proxiedVid)}" controls preload="none" style="max-width:100%;border-radius:6px;margin-top:6px;" onerror="this.src=${JSON.stringify(tok)}"></video>`;
@@ -6859,11 +7148,19 @@ setInterval(() => {
   }
 }, 15000);
 
+let _nvOpeningId=null, _nvOpeningAt=0;
 async function openNoteView(evId, evt){
   // Don't open if clicking a button/link inside the post
   if(evt && evt.target.closest('button,a,video')) return;
+  // Guard against rapid repeat clicks (e.g. mashing a dead-space/misclick area)
+  // re-opening the same note and stacking up duplicate relay connections for
+  // reactions/replies on top of the ones already in flight.
+  const now=Date.now();
+  if(_nvOpeningId===evId && (now-_nvOpeningAt)<800) return;
+  _nvOpeningId=evId; _nvOpeningAt=now;
   const ev=nEvents.find(e=>e.id===evId)||nvEventCache[evId];
   if(!ev) return;
+  _reactorsCtx=null; // opening a (possibly different) note invalidates any open reactors list
   openM('nv-modal');
   const body=document.getElementById('nv-body');
   body.innerHTML=`<div class="nv-loading"><div class="spin" style="margin:0 auto 12px;"></div>Loading...</div>`;
@@ -6927,11 +7224,11 @@ async function openNoteView(evId, evt){
       </div>
       <div class="nv-content">${ct}</div>
       <div class="nv-stats" id="nv-stats-${evIdEsc}">
-        <div class="nv-stat likes"><span class="val" id="nvs-likes">${cached.likes||'—'}</span> likes</div>
-        <div class="nv-stat reposts"><span class="val" id="nvs-reposts">${cached.reposts||'0'}</span> reposts</div>
-        <div class="nv-stat zaps"><span class="val" id="nvs-zaps">${cached.zaps||'—'}</span> zaps<span id="nvs-zap-sats" style="font-size:10px;color:var(--t3);margin-left:2px;">${cached.zapSats?'('+fmtSats(cached.zapSats)+')':''}  </span>
+        <div class="nv-stat likes" onclick="openReactorsList('${evIdEsc}','likes')"><span class="val" id="nvs-likes">${cached.likes||'—'}</span> likes</div>
+        <div class="nv-stat reposts" onclick="openReactorsList('${evIdEsc}','reposts')"><span class="val" id="nvs-reposts">${cached.reposts||'0'}</span> reposts</div>
+        <div class="nv-stat zaps" onclick="openReactorsList('${evIdEsc}','zaps')"><span class="val" id="nvs-zaps">${cached.zaps||'—'}</span> zaps<span id="nvs-zap-sats" style="font-size:10px;color:var(--t3);margin-left:2px;">${cached.zapSats?'('+fmtSats(cached.zapSats)+')':''}  </span>
         </div>
-        <div class="nv-stat" style="color:var(--t3);"><span class="val" style="color:var(--t2);" id="nvs-replies">${cached.replies||'—'}</span> replies</div>
+        <div class="nv-stat replies" style="color:var(--t3);" onclick="openReactorsList('${evIdEsc}','replies')"><span class="val" style="color:var(--t2);" id="nvs-replies">${cached.replies||'—'}</span> replies</div>
       </div>
       <div class="nv-actions">
         <button class="nv-act reply" onclick='startReply("${evIdEsc}","${evPubEsc}",${JSON.stringify(ev.content.slice(0,80))});closeM("nv-modal")'>↩ reply</button>
@@ -7150,7 +7447,9 @@ function getNostrDirectParentId(ev){
 function fetchNoteReactions(evId, authorPubkey){
   const relays=RELAYS.length?[...RELAYS]:['wss://relay.damus.io','wss://eden.nostr.land','wss://nos.lol','wss://relay.primal.net'];
   let likes=0, reposts=0, zaps=0, zapSats=0;
-  const replies=[], seenIds=new Set();
+  const replies=[], quotes=[], seenIds=new Set();
+  // Who did each reaction — populated so the reactor-list modal has someone to show.
+  const likers=[], reposters=[], zappers=[]; // {pubkey, sats?}
   const uid=evId.slice(0,8); // unique prefix per note to avoid sub ID collisions
   let closedCount=0;
   const unknownPubkeys=new Set();
@@ -7159,9 +7458,9 @@ function fetchNoteReactions(evId, authorPubkey){
     closedCount++;
     // Once all relays are done (closed or timed out), do a final render
     if(closedCount>=relays.length){
-      // Fetch profiles for reply authors we don't have yet
+      // Fetch profiles for reply authors + reactors we don't have yet
       if(unknownPubkeys.size) fetchNProfiles([...unknownPubkeys]);
-      updateNVStats(evId,likes,reposts,zaps,zapSats,replies);
+      updateNVStats(evId,likes,reposts,zaps,zapSats,replies,likers,reposters,zappers,quotes);
     }
   }
 
@@ -7173,7 +7472,11 @@ function fetchNoteReactions(evId, authorPubkey){
 
       ws.onopen=()=>{
         ws.send(JSON.stringify(['REQ',`nvr-${uid}`,{kinds:[6,7,9735],['#e']:[evId],limit:200}]));
-        ws.send(JSON.stringify(['REQ',`nvp-${uid}`,{kinds:[1],['#e']:[evId],limit:50}]));
+        // Two filters, same subscription: relays OR filters together within one REQ,
+        // so this catches both NIP-10 replies (e-tag) and NIP-18 quote-posts (q-tag)
+        // in a single round trip. Quote-posts don't always carry an e-tag at all, so
+        // querying #e alone (as before) silently missed q-tag-only quotes.
+        ws.send(JSON.stringify(['REQ',`nvp-${uid}`,{kinds:[1],['#e']:[evId],limit:50},{kinds:[1],['#q']:[evId],limit:50}]));
       };
       ws.onmessage=(msg)=>{
         try{
@@ -7181,28 +7484,59 @@ function fetchNoteReactions(evId, authorPubkey){
           if(m[0]==='EVENT'){
             const ev=m[2]; if(!ev||seenIds.has(ev.id)) return;
             seenIds.add(ev.id);
-            if(ev.kind===7) likes++;
-            else if(ev.kind===6) reposts++;
+            if(ev.kind===7){
+              likes++;
+              if(ev.pubkey){ likers.push({pubkey:ev.pubkey}); if(!nProfiles[ev.pubkey]) unknownPubkeys.add(ev.pubkey); }
+            }
+            else if(ev.kind===6){
+              reposts++;
+              if(ev.pubkey){ reposters.push({pubkey:ev.pubkey}); if(!nProfiles[ev.pubkey]) unknownPubkeys.add(ev.pubkey); }
+            }
             else if(ev.kind===9735){
               zaps++;
+              let sats=0, zapperPk=null;
               try{
                 const desc=ev.tags.find(t=>t[0]==='description');
-                if(desc){const req=JSON.parse(desc[1]);const amt=req.tags?.find(t=>t[0]==='amount');if(amt) zapSats+=Math.round(parseInt(amt[1])/1000);}
+                if(desc){
+                  const req=JSON.parse(desc[1]);
+                  const amt=req.tags?.find(t=>t[0]==='amount');
+                  if(amt) sats=Math.round(parseInt(amt[1])/1000);
+                  // The zap RECEIPT (kind 9735) is signed by the LN service, not the
+                  // sender — the actual zapper's pubkey lives on the embedded zap
+                  // REQUEST (kind 9734, NIP-57) inside the 'description' tag.
+                  if(req.pubkey) zapperPk=req.pubkey;
+                }
               }catch{}
+              // Some implementations also add an uppercase 'P' convenience tag on the
+              // receipt itself with the sender's pubkey — prefer it when present.
+              const pTag=ev.tags?.find(t=>t[0]==='P');
+              if(pTag?.[1]) zapperPk=pTag[1];
+              if(sats) zapSats+=sats;
+              zappers.push({pubkey:zapperPk,sats});
+              if(zapperPk && !nProfiles[zapperPk]) unknownPubkeys.add(zapperPk);
             } else if(ev.kind===1){
-              // The relay query below matches ANY event that e-tags evId — but a
-              // reply-to-a-reply also e-tags the thread ROOT (per NIP-10), so without
-              // this check a grandchild reply would wrongly show up here under the
-              // OP instead of only under its actual direct parent (the reply it's
-              // answering). Only keep events whose *direct* parent is this note.
               nvEventCache[ev.id]=ev; // cache regardless, so openNoteView can find it when nested one level in
-              if(getNostrDirectParentId(ev)!==evId) return;
-              const prof=nProfiles[ev.pubkey]||null;
-              if(!prof) unknownPubkeys.add(ev.pubkey);
-              replies.push({ev,prof});
+              // A q-tag pointing at evId is an explicit NIP-18 quote-post of this note —
+              // check that first since some clients dual-tag a quote with BOTH a q-tag
+              // and a plain/mention e-tag, which would otherwise get misread as a reply.
+              const isQuoteOfThis=ev.tags?.some(t=>t[0]==='q'&&t[1]===evId);
+              if(isQuoteOfThis){
+                if(!nProfiles[ev.pubkey]) unknownPubkeys.add(ev.pubkey);
+                quotes.push(ev);
+              } else {
+                // The relay query below matches ANY event that e-tags evId — but a
+                // reply-to-a-reply also e-tags the thread ROOT (per NIP-10), so without
+                // this check a grandchild reply would wrongly show up here under the
+                // OP instead of only under its actual direct parent (the reply it's
+                // answering). Only keep events whose *direct* parent is this note.
+                if(getNostrDirectParentId(ev)!==evId) return;
+                const prof=nProfiles[ev.pubkey]||null;
+                if(!prof) unknownPubkeys.add(ev.pubkey);
+                replies.push({ev,prof});
+              }
             }
             // Live-update stats as events stream in
-            updateNVStats(evId,likes,reposts,zaps,zapSats,replies);
+            updateNVStats(evId,likes,reposts,zaps,zapSats,replies,likers,reposters,zappers,quotes);
           } else if(m[0]==='EOSE'){
             if(m[1]===`nvr-${uid}`) eoseReact=true;
             if(m[1]===`nvp-${uid}`) eoseReplies=true;
@@ -7220,8 +7554,8 @@ function fetchNoteReactions(evId, authorPubkey){
   });
 }
 
-function updateNVStats(evId,likes,reposts,zaps,zapSats,replies){
-  nvReactions[evId]={likes,reposts,zaps,zapSats,replies:replies.length};
+function updateNVStats(evId,likes,reposts,zaps,zapSats,replies,likers,reposters,zappers,quotes){
+  nvReactions[evId]={likes,reposts,zaps,zapSats,replies:replies.length,likers:likers||[],reposters:reposters||[],zappers:zappers||[],quotes:quotes||[]};
   const el=id=>document.getElementById(id);
   if(el('nvs-likes')) el('nvs-likes').textContent=likes||'0';
   if(el('nvs-reposts')) el('nvs-reposts').textContent=reposts||'0';
@@ -7231,6 +7565,8 @@ function updateNVStats(evId,likes,reposts,zaps,zapSats,replies){
     if(satsEl) satsEl.textContent=zapSats?'('+fmtSats(zapSats)+')':'';
   }
   if(el('nvs-replies')) el('nvs-replies').textContent=replies.length||'0';
+  // Live-update the reactors modal if it's currently open for this note
+  renderReactorsList();
   const rb=document.getElementById('nv-replies-body');
   if(!rb) return;
   if(!replies.length){
@@ -7263,6 +7599,127 @@ function updateNVStats(evId,likes,reposts,zaps,zapSats,replies){
     </div>`;
   }).join('');
 }
+
+// ═══════════════════════════════════════════════════════
+//  REACTORS LIST — who liked / reposted / zapped a note
+// ═══════════════════════════════════════════════════════
+let _reactorsCtx=null; // {evId,type} for whichever reactors list is currently open, so live updates can re-render it
+let _reactorsSubTab='reposts'; // which sub-tab is active when type==='reposts': 'reposts' or 'quotes'
+
+function openReactorsList(evId, type){
+  if(type==='replies'){
+    // Replies already show full content + author right below in the note view —
+    // no need for a duplicate list, just jump down to it.
+    document.querySelector('#nv-modal .nv-replies-hdr')?.scrollIntoView({behavior:'smooth',block:'start'});
+    return;
+  }
+  _reactorsCtx={evId,type};
+  if(type==='reposts') _reactorsSubTab='reposts'; // always land on Reposts, not wherever it was left last time
+  const titles={likes:'Liked by',reposts:'Reposted by',zaps:'Zapped by'};
+  document.getElementById('reactors-title').textContent=titles[type]||'Reactions';
+  openM('reactors-modal');
+  renderReactorsList();
+}
+
+// One avatar+name(+sats) row — shared by the likes/zaps flat lists and the
+// Reposts sub-tab of the reposts view.
+function renderReactorRow(item){
+  const pk=item.pubkey;
+  const satsBadge = item.sats ? `<span style="margin-left:auto;font-family:var(--fm);font-size:11px;color:var(--gold);white-space:nowrap;">⚡ ${fmtSats(item.sats)}</span>` : '';
+  if(!pk){
+    // Anonymous zap — the receipt didn't carry a recoverable sender pubkey
+    return `<div class="nv-reply" style="display:flex;align-items:center;gap:8px;">
+      <div class="nv-reply-av" style="display:flex;align-items:center;justify-content:center;font-size:10px;color:var(--t3);">?</div>
+      <span style="font-family:var(--fm);font-size:12px;color:var(--t2);">Anonymous</span>
+      ${satsBadge}
+    </div>`;
+  }
+  const prof=nProfiles[pk]||null;
+  const n=prof?.name||trunc(pk);
+  const av=prof?.picture||'';
+  const avSrc=av?proxyImg(av):'';
+  const avH=avSrc?`<img src="${esc(avSrc)}" loading="lazy" crossorigin="anonymous" referrerpolicy="no-referrer" onerror="this.onerror=null;this.src='${esc(av)}'" style="width:100%;height:100%;object-fit:cover;">`
+    :`<div style="width:100%;height:100%;background:var(--bg-4);display:flex;align-items:center;justify-content:center;font-size:8px;color:var(--t3);">${esc(n).slice(0,2).toUpperCase()}</div>`;
+  const pkEsc=esc(pk);
+  return `<div class="nv-reply" style="display:flex;align-items:center;gap:8px;cursor:pointer;" onclick="closeM('reactors-modal');openNostrProfile('${pkEsc}')">
+    <div class="nv-reply-av">${avH}</div>
+    <span style="font-family:var(--fm);font-size:12px;font-weight:500;color:var(--t0);">${esc(n)}</span>
+    ${satsBadge}
+  </div>`;
+}
+
+// A quote-post row — mini note card (avatar, name, time, text preview), the
+// way Twitter's Quotes tab shows the actual quote rather than just who quoted.
+function renderQuoteRow(ev){
+  const pk=ev.pubkey;
+  const prof=nProfiles[pk]||null;
+  const n=prof?.name||trunc(pk);
+  const av=prof?.picture||'';
+  const avSrc=av?proxyImg(av):'';
+  const avH=avSrc?`<img src="${esc(avSrc)}" loading="lazy" crossorigin="anonymous" referrerpolicy="no-referrer" onerror="this.onerror=null;this.src='${esc(av)}'" style="width:100%;height:100%;object-fit:cover;">`
+    :`<div style="width:100%;height:100%;background:var(--bg-4);display:flex;align-items:center;justify-content:center;font-size:8px;color:var(--t3);">${esc(n).slice(0,2).toUpperCase()}</div>`;
+  const evIdEsc=esc(ev.id);
+  const rawPreview=(ev.content||'').replace(/\s+/g,' ').trim();
+  const preview=esc(rawPreview.slice(0,140));
+  return `<div class="nv-reply" style="cursor:pointer;" onclick="closeM('reactors-modal');openNoteView('${evIdEsc}',event)">
+    <div class="nv-reply-meta">
+      <div class="nv-reply-av">${avH}</div>
+      <span style="font-family:var(--fm);font-size:11px;font-weight:500;color:var(--t0);">${esc(n)}</span>
+      <span style="font-family:var(--fm);font-size:10px;color:var(--t3);margin-left:auto;">${timeAgo(new Date(ev.created_at*1000))}</span>
+    </div>
+    <div style="font-size:12px;color:var(--t1);line-height:1.5;word-break:break-word;">${preview}${rawPreview.length>140?'…':''}</div>
+  </div>`;
+}
+
+function renderReactorsList(){
+  if(!_reactorsCtx) return;
+  const {evId,type}=_reactorsCtx;
+  const modalEl=document.getElementById('reactors-modal');
+  if(!modalEl||!modalEl.classList.contains('vis')) return; // not open — skip the work
+  const body=document.getElementById('reactors-body');
+  if(!body) return;
+  const data=nvReactions[evId];
+
+  if(type==='reposts'){
+    // Twitter-style split: native reposts (kind:6, no comment) vs quote-posts
+    // (kind:1 with a q-tag on this note, shown as mini note cards).
+    const reposters=Array.from(new Map((data?.reposters||[]).map(x=>[x.pubkey,x])).values());
+    const quotes=[...(data?.quotes||[])].sort((a,b)=>b.created_at-a.created_at);
+    const sub=_reactorsSubTab;
+    const tab=(key,label,count)=>`<button type="button" onclick="_reactorsSubTab='${key}';renderReactorsList()"
+      style="flex:1;padding:8px 0;background:none;border:none;cursor:pointer;font-family:var(--fm);font-size:11px;font-weight:600;
+      border-bottom:2px solid ${sub===key?'var(--accent)':'transparent'};color:${sub===key?'var(--t0)':'var(--t3)'};transition:color .12s,border-color .12s;">
+      ${label}${data?` (${count})`:''}</button>`;
+    const tabsHtml=`<div style="display:flex;border-bottom:1px solid var(--border);position:sticky;top:0;background:var(--bg-2);z-index:1;">
+      ${tab('reposts','Reposts',reposters.length)}${tab('quotes','Quotes',quotes.length)}</div>`;
+
+    let listHtml;
+    if(sub==='quotes'){
+      listHtml = quotes.length
+        ? quotes.map(renderQuoteRow).join('')
+        : `<div class="nv-loading" style="color:var(--t3);padding:16px 0;">${data?'No quotes yet':'Loading...'}</div>`;
+    } else {
+      listHtml = reposters.length
+        ? reposters.map(renderReactorRow).join('')
+        : `<div class="nv-loading" style="color:var(--t3);padding:16px 0;">${data?'No one yet':'Loading...'}</div>`;
+    }
+    body.innerHTML = tabsHtml + listHtml;
+    return;
+  }
+
+  const listKey={likes:'likers',zaps:'zappers'}[type];
+  const list=data?.[listKey]||[];
+  if(!list.length){
+    body.innerHTML=`<div class="nv-loading" style="color:var(--t3);padding:16px 0;">${data?'No one yet':'Loading...'}</div>`;
+    return;
+  }
+  // Zaps aren't deduped by person — someone can zap the same note multiple times
+  // and each is a separate amount worth showing. Likes collapse to one row per person.
+  const rows = type==='zaps' ? [...list].sort((a,b)=>(b.sats||0)-(a.sats||0))
+                              : Array.from(new Map(list.map(x=>[x.pubkey,x])).values());
+  body.innerHTML = rows.map(renderReactorRow).join('');
+}
+
 function renderNVReplies(){
   // Re-render replies panel if it's open, to pick up newly loaded profiles
   const rb=document.getElementById('nv-replies-body');
@@ -7349,7 +7806,7 @@ async function pubNote(){
     ta.value='';updCC(ta);cancelReply();nEvents.unshift(signed);renderNFeed();
   }catch(e){alert(`Publish failed: ${e.message}`);}
 }
-function updCC(ta){const r=280-ta.value.length;const el=document.getElementById('c-char');if(el){el.textContent=r;el.style.color=r<20?'var(--red)':'var(--t3)';}}
+function updCC(ta){const n=ta.value.length;const el=document.getElementById('c-char');if(el){el.textContent=n;el.style.color='var(--t3)';}}
 
 // helper: sign + broadcast any event
 async function nPublish(ev){
@@ -7442,6 +7899,18 @@ function closeM(id){
   // the modal ends the edit session too.
   if (id === 'port-modal' && typeof _editingHoldingSafeId !== 'undefined' && _editingHoldingSafeId) {
     _editingHoldingSafeId = null;
+  }
+  if (id === 'reactors-modal') { _reactorsCtx = null; _reactorsSubTab = 'reposts'; }
+  // BUG FIX: the note-detail modal's image carousel gives its front slide an
+  // explicit pointer-events:auto (so it's clickable while the carousel itself
+  // is active). That's an inline style on the <img>, which overrides the
+  // modal overlay's pointer-events:none once closed — the modal fades out but
+  // #nv-body's old content (including that still-clickable image) stays in
+  // the DOM, sitting invisibly in the same spot and intercepting clicks.
+  // Clearing the body on close removes it outright instead of just hiding it.
+  if (id === 'nv-modal') {
+    const nvBody = document.getElementById('nv-body');
+    if (nvBody) nvBody.innerHTML = '';
   }
 }
 document.addEventListener('keydown',e=>{if(e.key==='Escape')document.querySelectorAll('.mo.vis').forEach(m=>closeM(m.id));});

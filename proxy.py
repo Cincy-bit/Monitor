@@ -193,7 +193,13 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
         except FileNotFoundError:
-            self.send_error(404, "monitor.html not found — make sure it's in the same folder as proxy.py")
+            # NOTE: http.server's send_error() encodes the message as Latin-1.
+            # Non-Latin-1 characters (em dashes, curly quotes, etc.) make
+            # send_error() itself raise UnicodeEncodeError mid-response,
+            # which kills the connection and shows the browser an empty
+            # response instead of a real 404 page. Keep this message
+            # plain-ASCII only.
+            self.send_error(404, "monitor.html not found - make sure it's in the same folder as proxy.py")
 
     def handle_miners_get(self):
         try:
