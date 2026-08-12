@@ -99,6 +99,9 @@
 .np-stat{text-align:center;}
 .np-stat-n{font-family:var(--fm);font-size:15px;font-weight:700;color:var(--t0);}
 .np-stat-l{font-family:var(--fm);font-size:9px;color:var(--t3);text-transform:uppercase;letter-spacing:.08em;margin-top:2px;}
+.np-stat.zap-stat{cursor:pointer;border-radius:6px;padding:2px 4px;margin:-2px -4px;transition:background .12s;}
+.np-stat.zap-stat:hover{background:rgba(247,183,49,.1);}
+.np-stat.zap-stat:hover .np-stat-n,.np-stat.zap-stat:hover .np-stat-l{color:var(--gold);}
 .np-post-item{padding:10px 0;border-bottom:1px solid var(--border);cursor:pointer;}
 .np-post-item:hover{background:var(--bg-3);margin:0 -18px;padding:10px 18px;}
 .np-post-item:last-child{border-bottom:none;}
@@ -668,6 +671,8 @@ a{color:inherit;text-decoration:none;}
       <div class="srch-tabs">
         <div class="srch-tab on" id="srch-tab-asset" onclick="switchSrchTab('asset')">📈 Assets</div>
         <div class="srch-tab" id="srch-tab-nostr" onclick="switchSrchTab('nostr')">⚡ Nostr</div>
+        <div class="srch-tab" id="srch-tab-ln" onclick="switchSrchTab('ln')">⚡ Lightning</div>
+        <div class="srch-tab" id="srch-tab-invoice" onclick="switchSrchTab('invoice')">🧾 Invoice</div>
       </div>
 
       <!-- ASSET TAB -->
@@ -741,6 +746,26 @@ a{color:inherit;text-decoration:none;}
         <div id="nsrch-status" style="font-family:var(--fm);font-size:11px;color:var(--t2);min-height:16px;margin-bottom:8px;"></div>
         <div id="nsrch-results" style="max-height:380px;overflow-y:auto;"></div>
       </div>
+
+      <!-- LIGHTNING TAB -->
+      <div id="srch-pane-ln" style="display:none;">
+        <div style="display:flex;gap:8px;margin-bottom:10px;">
+          <input class="fin" id="lnsrch-in" placeholder="lightning address — name@wallet.com" style="flex:1;font-size:13px;font-family:var(--fm);" onkeydown="if(event.key==='Enter')doLnAddrSearch()">
+          <button class="btn-p" onclick="doLnAddrSearch()" style="white-space:nowrap;padding:0 18px;">Search</button>
+        </div>
+        <div id="lnsrch-status" style="font-family:var(--fm);font-size:11px;color:var(--t2);min-height:16px;margin-bottom:8px;"></div>
+        <div id="lnsrch-result"></div>
+      </div>
+
+      <!-- INVOICE TAB -->
+      <div id="srch-pane-invoice" style="display:none;">
+        <div class="fgrp" style="margin-bottom:10px;">
+          <label class="flbl">Lightning Invoice</label>
+          <textarea class="fin" id="inv-in" rows="3" placeholder="lnbc1..." style="font-family:var(--fm);font-size:11px;resize:vertical;width:100%;" oninput="onInvoiceInput()"></textarea>
+        </div>
+        <div id="inv-status" style="font-family:var(--fm);font-size:11px;color:var(--t2);min-height:16px;margin-bottom:8px;"></div>
+        <div id="inv-result"></div>
+      </div>
     </div>
   </div>
 </div>
@@ -772,6 +797,7 @@ a{color:inherit;text-decoration:none;}
       <div class="stab on" id="stab-ticker" onclick="switchStab('ticker')">Ticker Bar</div>
       <div class="stab" id="stab-watchlist" onclick="switchStab('watchlist')">Watchlist</div>
       <div class="stab" id="stab-mining" onclick="switchStab('mining')">Mining</div>
+      <div class="stab" id="stab-lightning" onclick="switchStab('lightning')">Lightning</div>
       <div class="stab" id="stab-nostr" onclick="switchStab('nostr')">Nostr</div>
       <div class="stab" id="stab-weather" onclick="switchStab('weather')">Weather</div>
     </div>
@@ -822,6 +848,12 @@ a{color:inherit;text-decoration:none;}
           <button class="btn-p" style="white-space:nowrap;" onclick="addMiner()">+ Add</button>
         </div>
         <div id="mining-status" style="font-family:var(--fm);font-size:11px;color:var(--t2);"></div>
+      </div>
+      <!-- LIGHTNING -->
+      <div class="spane" id="sp-lightning">
+        <div class="ssec">Lightning Wallet (for Zaps)</div>
+        <div style="font-size:11px;color:var(--t2);margin-bottom:12px;">Connect a wallet here to send Lightning zaps on posts from anywhere in the dashboard.</div>
+        <div id="lightning-settings-body"></div>
       </div>
       <!-- NOSTR -->
       <div class="spane" id="sp-nostr">
@@ -1128,6 +1160,12 @@ let cInst=null, cSym=null;
 let btcNetworkHashrate = null; // EH/s
 let btcNetworkHashratePrev = null; // for % change
 let fleetHashratePrev = null; // for fleet % change
+// Watchlist sparkline data: NETWORK row shows the weekly mempool.space series,
+// MINING-fleet row shows the last 24h of our own fleet history. Kept separate
+// from hashrateHistory.network (which accumulates local samples for the
+// modal's longer timeframes) since mempool.space already gives us a clean
+// pre-aggregated week of points without waiting for local history to fill in.
+let networkWeeklySpark = [];
 // Fleet + Network hashrate history: load from localStorage on startup for persistence
 // We store downsampled history (max 1 point per 10min) to keep storage small
 const FLEET_HR_STORE_KEY = 'mts_fleet_hr_history';
@@ -1287,6 +1325,138 @@ function staleAsOfLabel(asOfSec) {
   if (!asOfSec) return '';
   const d = new Date(asOfSec * 1000);
   return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+}
+
+// ═══════════════════════════════════════════════════════
+//  SESSION BADGE (holiday-aware PRE / POST, never dropped)
+// ═══════════════════════════════════════════════════════
+// Yahoo's own `marketState` field reports "CLOSED" overnight and on any
+// non-trading day, which is why the PRE/POST badge used to vanish outside
+// the ~30 minutes Yahoo actively flags PRE/POST. Instead we compute the
+// badge purely from ET wall-clock time + an NYSE trading-day calendar:
+//
+//   09:30–16:00 ET, actual trading day → null   (regular session, live price)
+//   16:00–23:59 ET, actual trading day → 'POST' (today's session just closed)
+//   00:00–01:00 ET, if YESTERDAY traded → 'POST' (same close, carries past midnight)
+//   everything else                    → 'PRE'  (counting down to next open —
+//                                                 this covers 1am-9:30am every day,
+//                                                 AND all of any weekend/holiday)
+//
+// Net effect: the badge is ALWAYS either PRE, POST, or absent-because-live —
+// it never silently disappears over a weekend or bank holiday, and it flips
+// from POST to PRE at 1am ET the night after the close, then stays PRE
+// (through however many non-trading days follow) until the next real open.
+function _easterSundayUTC(year) {
+  // Anonymous Gregorian / Meeus algorithm
+  const a = year % 19, b = Math.floor(year / 100), c = year % 100;
+  const d = Math.floor(b / 4), e = b % 4, f = Math.floor((b + 8) / 25);
+  const g = Math.floor((b - f + 1) / 3), h = (19 * a + b - d - g + 15) % 30;
+  const i = Math.floor(c / 4), k = c % 4;
+  const l = (32 + 2 * e + 2 * i - h - k) % 7;
+  const m = Math.floor((a + 11 * h + 22 * l) / 451);
+  const month = Math.floor((h + l - 7 * m + 114) / 31);
+  const day = ((h + l - 7 * m + 114) % 31) + 1;
+  return new Date(Date.UTC(year, month - 1, day));
+}
+function _nthWeekdayUTC(year, month, weekday, n) {
+  const d = new Date(Date.UTC(year, month, 1));
+  let count = 0;
+  while (true) {
+    if (d.getUTCDay() === weekday) { count++; if (count === n) return new Date(d); }
+    d.setUTCDate(d.getUTCDate() + 1);
+  }
+}
+function _lastWeekdayUTC(year, month, weekday) {
+  const d = new Date(Date.UTC(year, month + 1, 0)); // last calendar day of month
+  while (d.getUTCDay() !== weekday) d.setUTCDate(d.getUTCDate() - 1);
+  return d;
+}
+function _observedHolidayUTC(year, month, day) {
+  // NYSE observance: Saturday → preceding Friday, Sunday → following Monday
+  const d = new Date(Date.UTC(year, month, day));
+  const dow = d.getUTCDay();
+  if (dow === 6) d.setUTCDate(d.getUTCDate() - 1);
+  else if (dow === 0) d.setUTCDate(d.getUTCDate() + 1);
+  return d;
+}
+function _ymdKey(d) { return d.getUTCFullYear() * 10000 + (d.getUTCMonth() + 1) * 100 + d.getUTCDate(); }
+const _nyseHolidayCache = {};
+function _nyseHolidaysForYear(year) {
+  if (_nyseHolidayCache[year]) return _nyseHolidayCache[year];
+  const set = new Set();
+  set.add(_ymdKey(_observedHolidayUTC(year, 0, 1)));      // New Year's Day
+  set.add(_ymdKey(_nthWeekdayUTC(year, 0, 1, 3)));         // MLK Day (3rd Mon Jan)
+  set.add(_ymdKey(_nthWeekdayUTC(year, 1, 1, 3)));         // Presidents Day (3rd Mon Feb)
+  const easter = _easterSundayUTC(year);
+  const goodFriday = new Date(easter); goodFriday.setUTCDate(easter.getUTCDate() - 2);
+  set.add(_ymdKey(goodFriday));                             // Good Friday
+  set.add(_ymdKey(_lastWeekdayUTC(year, 4, 1)));           // Memorial Day (last Mon May)
+  set.add(_ymdKey(_observedHolidayUTC(year, 5, 19)));      // Juneteenth
+  set.add(_ymdKey(_observedHolidayUTC(year, 6, 4)));       // Independence Day
+  set.add(_ymdKey(_nthWeekdayUTC(year, 8, 1, 1)));         // Labor Day (1st Mon Sept)
+  set.add(_ymdKey(_nthWeekdayUTC(year, 10, 4, 4)));        // Thanksgiving (4th Thu Nov)
+  set.add(_ymdKey(_observedHolidayUTC(year, 11, 25)));     // Christmas
+  _nyseHolidayCache[year] = set;
+  return set;
+}
+// NOTE: this does not account for NYSE half-days (1pm early close on the day
+// before July 4th, the day after Thanksgiving, and Christmas Eve) — on those
+// three days the badge will show live/no-badge until 4pm even though the
+// exchange actually closed at 1pm. Low-impact enough to leave as a known gap.
+function isNyseTradingDay(etDate) {
+  const dow = etDate.getUTCDay(); // etDate is ET wall-clock, using UTC getters (see _nowET)
+  if (dow === 0 || dow === 6) return false;
+  return !_nyseHolidaysForYear(etDate.getUTCFullYear()).has(_ymdKey(etDate));
+}
+// Returns 'PRE', 'POST', or null (regular/live session — no badge).
+function getSessionBadge() {
+  const et = _nowET();
+  const hm = et.getUTCHours() * 60 + et.getUTCMinutes();
+  const todayTrades = isNyseTradingDay(et);
+  if (hm >= 570 && hm < 960) return todayTrades ? null : 'PRE';   // 9:30am–4:00pm ET
+  if (hm >= 960) return todayTrades ? 'POST' : 'PRE';              // 4:00pm–midnight ET
+  if (hm < 60) {                                                    // midnight–1:00am ET
+    const yesterdayEt = new Date(et.getTime() - 86400000);
+    return isNyseTradingDay(yesterdayEt) ? 'POST' : 'PRE';
+  }
+  return 'PRE';                                                     // 1:00am–9:30am ET
+}
+function sessionBadgeTitle(state, hasExtendedData, asOfSec) {
+  const label = state === 'PRE' ? 'Pre-market' : state === 'POST' ? 'After-hours' : '';
+  if (!label) return '';
+  if (!hasExtendedData) {
+    return state === 'PRE'
+      ? 'Pre-market — showing last available close, no live extended-hours quote yet'
+      : 'After-hours — showing the regular-session close';
+  }
+  // BUG FIX: this used to always say "live extended-hours price" whenever we
+  // had ANY extended-hours print, even one from hours ago that Yahoo's public
+  // feed simply hasn't updated since (e.g. a frozen 8pm post-market close
+  // being carried all the way through the overnight session). Now that the
+  // server sends the print's REAL timestamp (asOf), show how old it actually
+  // is instead of implying it's continuously live.
+  if (!asOfSec) return `${label} — live extended-hours price`;
+  const ageMin = (Date.now() / 1000 - asOfSec) / 60;
+  if (ageMin < 20) return `${label} — live extended-hours price`;
+  const asOfStr = new Date(asOfSec * 1000).toLocaleString('en-US', {
+    timeZone: 'America/New_York', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit'
+  });
+  return `${label} — last print ${asOfStr} ET (no newer extended-hours data available yet)`;
+}
+// Only genuine equities/ETFs/mutual funds have a traditional pre/post-market
+// session worth labeling. These should NEVER get a PRE/POST badge:
+//  - Indices & yields (^VIX, ^TNX, ^TYX, ^GSPC, ^DJI...) — not a tradable
+//    pre/post session; the major index futures already get their own 'FUT'
+//    badge via isFutures, handled separately.
+//  - Commodity/index futures (GC=F, SI=F, CL=F, ES=F...) — CME futures trade
+//    nearly continuously, so "PRE"/"POST" is meaningless for them.
+//  - Crypto pairs (BTC-USD, ETH-USD...) — trade 24/7, no market hours at all.
+function hasExtendedHoursSession(sym) {
+  if (!sym) return false;
+  if (sym.startsWith('^')) return false;
+  if (sym.endsWith('=F')) return false;
+  if (sym.includes('-')) return false;
+  return true;
 }
 
 async function fetchQ(sym) {
@@ -1598,6 +1768,23 @@ async function fetchBtcNetworkHashrate() {
   renderTicker(); renderWL();
 }
 
+// Weekly network hashrate spark — powers the small inline chart on the
+// BTC Network Hashrate watchlist row. Same mempool.space endpoint the
+// hashrate modal uses for its 1W tab, just downsampled for a sparkline.
+async function fetchNetworkWeeklySpark() {
+  try {
+    const r = await fetchT(`${PROXY}/proxy/https://mempool.space/api/v1/mining/hashrate/1w`, 12000);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const d = await r.json();
+    if (!d?.hashrates?.length) throw new Error('No data');
+    const pts = d.hashrates.map(p => ({t: p.timestamp * 1000, v: p.avgHashrate / 1e18}));
+    networkWeeklySpark = lttbDownsample(pts, 60);
+    _drawWLSparklines(calcPortfolio());
+  } catch(e) {
+    console.warn('[hashrate] weekly spark failed:', e.message);
+  }
+}
+
 // ═══════════════════════════════════════════════════════
 //  MINING DATA
 // ═══════════════════════════════════════════════════════
@@ -1699,7 +1886,17 @@ function calcPortfolio() {
     const prevVal = prev * h.qty;
     totalValue    += value;
     totalPrevValue += prevVal;
-    return { ...h, price, prev, value, pct: prev ? (price-prev)/prev*100 : 0, change: value - prevVal };
+    // BUG FIX: this used to always recompute pct as (price-prev)/prev, using
+    // the true previous-day close as baseline. That's correct for REGULAR/PRE
+    // sessions, but for POST/overnight q.pct is deliberately computed against
+    // the regular session's own close instead (matches Yahoo's convention —
+    // see proxy.py post_pct_vs_close). Recomputing it here from scratch threw
+    // that away and silently reverted to the old prev-close baseline, so the
+    // SAME holding showed +0.44% in the ticker/watchlist (reading q.pct
+    // directly) and -0.84% in the holdings list (recomputed here) at the same
+    // moment. Use q.pct directly so every part of the UI agrees.
+    const pct = (q && typeof q.pct === 'number') ? q.pct : (prev ? (price-prev)/prev*100 : 0);
+    return { ...h, price, prev, value, pct, change: value - prevVal };
   });
   holdings.sort((a,b) => b.value - a.value);
   const totalChange = totalValue - totalPrevValue;
@@ -1739,8 +1936,7 @@ function renderTicker() {
     const cls = q.pct>0?'pos':q.pct<0?'neg':'neu', sg = q.pct>0?'+':'';
     let tickerBadge = '';
     if (q.isFutures) tickerBadge = `<span style="font-family:var(--fm);font-size:8px;color:var(--gold);background:rgba(247,183,49,.13);border:1px solid rgba(247,183,49,.3);border-radius:2px;padding:1px 4px;margin-left:5px;letter-spacing:.04em;vertical-align:middle;">FUT</span>`;
-    else if (q.marketState === 'PRE') tickerBadge = `<span style="font-family:var(--fm);font-size:8px;color:var(--gold);background:rgba(247,183,49,.13);border:1px solid rgba(247,183,49,.3);border-radius:2px;padding:1px 4px;margin-left:5px;letter-spacing:.04em;vertical-align:middle;">PRE</span>`;
-    else if (q.marketState === 'POST' || q.marketState === 'POSTPOST') tickerBadge = `<span style="font-family:var(--fm);font-size:8px;color:var(--gold);background:rgba(247,183,49,.13);border:1px solid rgba(247,183,49,.3);border-radius:2px;padding:1px 4px;margin-left:5px;letter-spacing:.04em;vertical-align:middle;">POST</span>`;
+    else if (hasExtendedHoursSession(t.sym)) { const _sb = getSessionBadge(); if (_sb) tickerBadge = `<span title="${esc(sessionBadgeTitle(_sb, q.hasExtendedData, q.asOf))}" style="font-family:var(--fm);font-size:8px;color:var(--gold);background:rgba(247,183,49,.13);border:1px solid rgba(247,183,49,.3);border-radius:2px;padding:1px 4px;margin-left:5px;letter-spacing:.04em;vertical-align:middle;cursor:help;">${_sb}</span>`; }
     items.push(`<div class="ti" onclick="openChart('${t.sym}')">
       <span class="sym">${t.label}${tickerBadge ? ' ' + tickerBadge : ''}</span>
       <span class="prc">${fp(q.price,t.sym)}</span>
@@ -1832,8 +2028,7 @@ function renderWL() {
       if(nameEl){
         let badge = '';
         if (q.isFutures) badge = ` <span style="font-family:var(--fm);font-size:8px;color:var(--gold);background:rgba(247,183,49,.13);border:1px solid rgba(247,183,49,.3);border-radius:2px;padding:1px 3px;letter-spacing:.04em;vertical-align:middle;">FUT</span>`;
-        else if (q.marketState === 'PRE') badge = ` <span style="font-family:var(--fm);font-size:8px;color:var(--gold);background:rgba(247,183,49,.13);border:1px solid rgba(247,183,49,.3);border-radius:2px;padding:1px 3px;letter-spacing:.04em;vertical-align:middle;">PRE</span>`;
-        else if (q.marketState === 'POST' || q.marketState === 'POSTPOST') badge = ` <span style="font-family:var(--fm);font-size:8px;color:var(--gold);background:rgba(247,183,49,.13);border:1px solid rgba(247,183,49,.3);border-radius:2px;padding:1px 3px;letter-spacing:.04em;vertical-align:middle;">POST</span>`;
+        else if (hasExtendedHoursSession(a.sym)) { const _sb = getSessionBadge(); if (_sb) badge = ` <span title="${esc(sessionBadgeTitle(_sb, q.hasExtendedData, q.asOf))}" style="font-family:var(--fm);font-size:8px;color:var(--gold);background:rgba(247,183,49,.13);border:1px solid rgba(247,183,49,.3);border-radius:2px;padding:1px 3px;letter-spacing:.04em;vertical-align:middle;cursor:help;">${_sb}</span>`; }
         nameEl.innerHTML = esc(a.name) + badge;
       }
       // Remove stale text label row if any (replaced by inline badge)
@@ -1880,8 +2075,7 @@ function renderWL() {
     const ch  = q ? `${q.pct>=0?'+':''}${q.pct.toFixed(2)}%` : '—';
     let extBadge = '';
     if (q?.isFutures) extBadge = ` <span style="font-family:var(--fm);font-size:8px;color:var(--gold);background:rgba(247,183,49,.13);border:1px solid rgba(247,183,49,.3);border-radius:2px;padding:1px 3px;letter-spacing:.04em;vertical-align:middle;">FUT</span>`;
-    else if (q?.marketState === 'PRE') extBadge = ` <span style="font-family:var(--fm);font-size:8px;color:var(--gold);background:rgba(247,183,49,.13);border:1px solid rgba(247,183,49,.3);border-radius:2px;padding:1px 3px;letter-spacing:.04em;vertical-align:middle;">PRE</span>`;
-    else if (q?.marketState === 'POST' || q?.marketState === 'POSTPOST') extBadge = ` <span style="font-family:var(--fm);font-size:8px;color:var(--gold);background:rgba(247,183,49,.13);border:1px solid rgba(247,183,49,.3);border-radius:2px;padding:1px 3px;letter-spacing:.04em;vertical-align:middle;">POST</span>`;
+    else if (q && hasExtendedHoursSession(a.sym)) { const _sb = getSessionBadge(); if (_sb) extBadge = ` <span title="${esc(sessionBadgeTitle(_sb, q.hasExtendedData, q.asOf))}" style="font-family:var(--fm);font-size:8px;color:var(--gold);background:rgba(247,183,49,.13);border:1px solid rgba(247,183,49,.3);border-radius:2px;padding:1px 3px;letter-spacing:.04em;vertical-align:middle;cursor:help;">${_sb}</span>`; }
     rows.push(`<div class="wli" data-wlkey="wl-${a.sym}" onclick="openChart('${a.sym}')">
       <div><div class="wli-name">${a.name}${extBadge}</div><div class="wli-sym">${a.sym}</div></div>
       <div class="wli-spark"><canvas id="sp-${a.sym.replace(/[^a-zA-Z0-9]/g,'_')}"></canvas></div>
@@ -1897,7 +2091,7 @@ function renderWL() {
     const chg = pct !== null ? `${pct>=0?'+':''}${pct.toFixed(2)}%` : '—';
     rows.push(`<div class="wli hashrate-row" data-wlkey="NETWORK" onclick="openHashrateChart('network')">
       <div><div class="wli-name">BTC Network Hashrate</div><div class="wli-sym">NETWORK</div></div>
-      <div class="wli-spark"></div>
+      <div class="wli-spark"><canvas id="sp-NETWORK"></canvas></div>
       <div class="wli-prc" style="font-size:11px;">${btcNetworkHashrate.toFixed(2)} EH/s</div>
       <div class="wli-chg ${cls}">${chg}</div>
     </div>`);
@@ -1910,7 +2104,7 @@ function renderWL() {
     const fChg = fleetPct !== null ? `${fleetPct>=0?'+':''}${fleetPct.toFixed(2)}%` : '—';
     rows.push(`<div class="wli mining-row" data-wlkey="MINING-fleet" onclick="openHashrateChart('fleet')">
       <div><div class="wli-name">Fleet Hashrate</div><div class="wli-sym">MINING</div></div>
-      <div class="wli-spark"></div>
+      <div class="wli-spark"><canvas id="sp-MINING_fleet"></canvas></div>
       <div class="wli-prc" style="font-size:11px;">${fmtHashrate(fleet.totalHashRate)}</div>
       <div class="wli-chg ${fCls}">${fChg}</div>
     </div>`);
@@ -1933,6 +2127,41 @@ function renderWL() {
   Object.keys(sparks).forEach(k => { try { sparks[k].destroy(); } catch {} delete sparks[k]; });
   body.innerHTML = rows.join('');
   _drawWLSparklines(port);
+}
+
+// Draws/updates a simple sparkline canvas from a plain [{t,v}] series in the
+// hashrate orange used elsewhere for these rows (no green/red — hashrate
+// trend isn't a gain/loss the way a price move is). Mirrors the hashrate
+// modal's rendering rules so the sparkline reads consistently with the full
+// chart: same curve tension, and the same percentile-based y-axis bounds
+// (computeYBounds) so a handful of dropout/zero samples don't crush the rest
+// of the line into a flat sliver. boundsVals should be the full-resolution
+// values (before downsampling) so the bounds calc sees the real dropout
+// rate — pass the downsampled pts twice if there's nothing else to use.
+function _drawSimpleSpark(cid, pts, boundsVals) {
+  const cv = document.getElementById(cid);
+  if (!cv || !pts?.length) return;
+  const color = '#ff9f43';
+  const sparkData = pts.map(p=>p.v);
+  const sparkLabels = pts.map(p=>p.t);
+  const { min: yMin, max: yMax } = computeYBounds(boundsVals || sparkData);
+  if (!sparks[cid]) {
+    const ctx = cv.getContext('2d');
+    const g = ctx.createLinearGradient(0,0,0,30);
+    g.addColorStop(0, 'rgba(255,159,67,.3)'); g.addColorStop(1,'rgba(0,0,0,0)');
+    sparks[cid] = new Chart(cv, {
+      type:'line',
+      data:{labels:sparkLabels,datasets:[{data:sparkData,borderColor:color,borderWidth:1.5,fill:true,backgroundColor:g,pointRadius:0,tension:.2}]},
+      options:{animation:false,responsive:false,plugins:{legend:{display:false},tooltip:{enabled:false}},scales:{x:{display:false},y:{display:false,min:yMin,max:yMax}}}
+    });
+  } else {
+    const ds = sparks[cid].data.datasets[0];
+    ds.data = sparkData;
+    sparks[cid].data.labels = sparkLabels;
+    sparks[cid].options.scales.y.min = yMin;
+    sparks[cid].options.scales.y.max = yMax;
+    sparks[cid].update('none');
+  }
 }
 
 function _drawWLSparklines(port) {
@@ -1968,6 +2197,20 @@ function _drawWLSparklines(port) {
       sparks[cid].update('none');
     }
   });
+
+  // Draw BTC network hashrate sparkline (weekly, from mempool.space) — bounds
+  // computed from the same full-resolution series since it's already small.
+  _drawSimpleSpark('sp-NETWORK', networkWeeklySpark, networkWeeklySpark.map(p=>p.v));
+
+  // Draw fleet hashrate sparkline (last 24h of local history). Bounds come
+  // from the full-resolution 24h window (matches the modal's 1D tab), not
+  // the downsampled plot points, so occasional zero/dropout samples get
+  // excluded from the axis range the same way the modal excludes them.
+  if (miners.length > 0) {
+    const cutoff = Date.now() - 86400000;
+    const fleetDay = hashrateHistory.fleet.filter(p => p.t >= cutoff);
+    _drawSimpleSpark('sp-MINING_fleet', lttbDownsample(fleetDay, 60), fleetDay.map(p=>p.v));
+  }
 
   // Draw portfolio composite sparkline
   // If a 1D chart has been loaded, use its exact weighted series (guaranteed to match)
@@ -3098,7 +3341,209 @@ function switchSrchTab(tab){
   document.getElementById('srch-tab-'+tab)?.classList.add('on');
   document.getElementById('srch-pane-asset').style.display=tab==='asset'?'block':'none';
   document.getElementById('srch-pane-nostr').style.display=tab==='nostr'?'block':'none';
+  document.getElementById('srch-pane-ln').style.display=tab==='ln'?'block':'none';
+  document.getElementById('srch-pane-invoice').style.display=tab==='invoice'?'block':'none';
   if(tab==='nostr') setTimeout(()=>document.getElementById('nsrch-in')?.focus(),60);
+  if(tab==='ln') setTimeout(()=>document.getElementById('lnsrch-in')?.focus(),60);
+  if(tab==='invoice') setTimeout(()=>document.getElementById('inv-in')?.focus(),60);
+}
+
+// ── Lightning address lookup — resolve an LNURL-pay address and offer to pay it ──
+async function doLnAddrSearch(){
+  const raw=(document.getElementById('lnsrch-in')?.value||'').trim();
+  if(!raw) return;
+  const statusEl=document.getElementById('lnsrch-status');
+  const resultEl=document.getElementById('lnsrch-result');
+  resultEl.innerHTML='';
+  if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(raw)){
+    statusEl.textContent='Enter a valid lightning address, like name@wallet.com';
+    statusEl.style.color='var(--red)';
+    return;
+  }
+  statusEl.textContent='Looking up address…'; statusEl.style.color='var(--t2)';
+  try{
+    const [name,domain]=raw.split('@');
+    const lnurlPayUrl=`https://${domain}/.well-known/lnurlp/${name}`;
+    const res=await fetch(`${PROXY}/proxy/${lnurlPayUrl}`).then(r=>r.json());
+    if(res.status==='ERROR') throw new Error(res.reason||'Address not found');
+    statusEl.textContent='✓ Address found'; statusEl.style.color='var(--green)';
+    const min = res.minSendable?Math.ceil(res.minSendable/1000):1;
+    const max = res.maxSendable?Math.floor(res.maxSendable/1000):null;
+    const addrEsc = esc(raw);
+    resultEl.innerHTML = `
+      <div style="background:var(--bg-3);border:1px solid var(--border);border-radius:8px;padding:12px 14px;display:flex;align-items:center;gap:12px;">
+        <div style="font-size:20px;">⚡</div>
+        <div style="flex:1;min-width:0;">
+          <div style="font-size:13px;font-weight:600;color:var(--t0);font-family:var(--fm);">${addrEsc}</div>
+          <div style="font-size:10px;color:var(--t2);margin-top:2px;">${esc((res.description||'Ready to receive payments').slice(0,120))}${max?` · ${min}–${max>=1000?(max/1000)+'k':max} sats`:''}</div>
+        </div>
+        <button class="btn-p" style="white-space:nowrap;" onclick="openLnAddrZapModal('${addrEsc.replace(/'/g,"\\'")}')">⚡ Pay</button>
+      </div>`;
+  }catch(e){
+    statusEl.textContent='❌ '+e.message; statusEl.style.color='var(--red)';
+  }
+}
+
+// ═══════════════════════════════════════════════════════
+//  BOLT11 INVOICE DECODING + PAYING (Invoice search tab)
+// ═══════════════════════════════════════════════════════
+const BECH32_CHARSET='qpzry9x8gf2tvdw0s3jn54khce6mua7l';
+const BECH32_GEN=[0x3b6a57b2,0x26508e6d,0x1ea119fa,0x3d4233dd,0x2a1462b3];
+
+function bech32Polymod(values){
+  let chk=1;
+  for(const v of values){
+    const b=chk>>>25;
+    chk=((chk&0x1ffffff)<<5)^v;
+    for(let i=0;i<5;i++){ if((b>>i)&1) chk^=BECH32_GEN[i]; }
+  }
+  return chk>>>0;
+}
+function bech32HrpExpand(hrp){
+  const ret=[];
+  for(let p=0;p<hrp.length;p++) ret.push(hrp.charCodeAt(p)>>5);
+  ret.push(0);
+  for(let p=0;p<hrp.length;p++) ret.push(hrp.charCodeAt(p)&31);
+  return ret;
+}
+function bech32VerifyChecksum(hrp,data){
+  return bech32Polymod(bech32HrpExpand(hrp).concat(data))===1;
+}
+function bech32DecodeRaw(str){
+  if(str.toLowerCase()!==str && str.toUpperCase()!==str) throw new Error('Mixed-case invoice — check for a copy/paste error');
+  str=str.toLowerCase();
+  const pos=str.lastIndexOf('1');
+  if(pos<1||pos+7>str.length) throw new Error('Not a valid Lightning invoice');
+  const hrp=str.slice(0,pos);
+  const dataPart=str.slice(pos+1);
+  const data=[];
+  for(const c of dataPart){
+    const d=BECH32_CHARSET.indexOf(c);
+    if(d===-1) throw new Error('Invoice contains an invalid character');
+    data.push(d);
+  }
+  if(!bech32VerifyChecksum(hrp,data)) throw new Error('Invoice checksum is invalid — check for a copy/paste error');
+  return {hrp,data:data.slice(0,-6)};
+}
+function convertBits(data,fromBits,toBits,pad){
+  let acc=0,bits=0;
+  const ret=[];
+  const maxv=(1<<toBits)-1;
+  for(const value of data){
+    acc=((acc<<fromBits)|value)>>>0;
+    bits+=fromBits;
+    while(bits>=toBits){ bits-=toBits; ret.push((acc>>bits)&maxv); }
+  }
+  if(pad){ if(bits>0) ret.push((acc<<(toBits-bits))&maxv); }
+  return ret;
+}
+function bolt11WordsToInt(words){
+  let v=0;
+  for(const w of words) v=v*32+w;
+  return v;
+}
+function decodeBolt11(invoiceStr){
+  const s=invoiceStr.trim().replace(/^lightning:/i,'');
+  const {hrp,data}=bech32DecodeRaw(s);
+  const m=hrp.match(/^ln(bc|tb|bcrt|sb)(\d+)?([munp])?$/i);
+  if(!m) throw new Error('Not a recognized Lightning invoice');
+  const network=m[1];
+  let amountSats=null;
+  if(m[2]){
+    const n=parseInt(m[2],10);
+    const mult=(m[3]||'').toLowerCase();
+    const sats=mult==='m'?n*100000:mult==='u'?n*100:mult==='n'?n/10:mult==='p'?n/10000:n*1e8;
+    amountSats=Math.round(sats);
+  }
+  let words=data.slice();
+  const timestamp=bolt11WordsToInt(words.slice(0,7));
+  words=words.slice(7);
+
+  let description=null, descriptionHash=null, paymentHash=null, expirySeconds=3600;
+  while(words.length>=3){
+    const type=words[0];
+    const length=words[1]*32+words[2];
+    const fieldWords=words.slice(3,3+length);
+    words=words.slice(3+length);
+    if(fieldWords.length<length) break;
+    try{
+      if(type===13){ description=new TextDecoder().decode(new Uint8Array(convertBits(fieldWords,5,8,false))); }
+      else if(type===23){ descriptionHash=convertBits(fieldWords,5,8,false).map(b=>b.toString(16).padStart(2,'0')).join(''); }
+      else if(type===1){ paymentHash=convertBits(fieldWords,5,8,false).map(b=>b.toString(16).padStart(2,'0')).join(''); }
+      else if(type===6){ expirySeconds=bolt11WordsToInt(fieldWords); }
+    }catch{}
+  }
+  return {network,amountSats,timestamp,expirySeconds,description,descriptionHash,paymentHash,expiresAt:timestamp+expirySeconds};
+}
+
+let decodedInvoice=null;
+let invDecodeTimer=null;
+function onInvoiceInput(){
+  clearTimeout(invDecodeTimer);
+  invDecodeTimer=setTimeout(decodeAndShowInvoice,250);
+}
+function decodeAndShowInvoice(){
+  const raw=(document.getElementById('inv-in')?.value||'').trim();
+  const statusEl=document.getElementById('inv-status');
+  const resultEl=document.getElementById('inv-result');
+  decodedInvoice=null;
+  resultEl.innerHTML='';
+  if(!raw){ statusEl.textContent=''; return; }
+  let inv;
+  try{
+    inv=decodeBolt11(raw);
+  }catch(e){
+    statusEl.textContent='❌ '+e.message; statusEl.style.color='var(--red)';
+    return;
+  }
+  statusEl.textContent='✓ Invoice decoded'; statusEl.style.color='var(--green)';
+  decodedInvoice={raw:raw.trim().replace(/^lightning:/i,''), ...inv};
+
+  const netLbl={bc:'',tb:' (testnet)',bcrt:' (regtest)',sb:' (signet)'}[inv.network]||'';
+  const expired = (Date.now()/1000) > inv.expiresAt;
+  const expiryDate = new Date(inv.expiresAt*1000);
+  const expiryStr = expired ? 'Expired' : 'Expires '+expiryDate.toLocaleString();
+
+  if(!nwcWallet){
+    resultEl.innerHTML = `<div class="warn">Connect a Lightning wallet first so you can pay invoices.</div><div style="display:flex;justify-content:flex-end;margin-top:8px;"><button class="btn-p" onclick="openNwcModal()">Connect Wallet</button></div>`;
+    return;
+  }
+
+  resultEl.innerHTML=`
+    <div style="background:var(--bg-3);border:1px solid var(--border);border-radius:8px;padding:14px;">
+      <div style="display:flex;justify-content:space-between;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:8px;">
+        <div style="font-size:16px;font-weight:700;color:var(--t0);">${inv.amountSats!=null?fmtSats(inv.amountSats)+' sats':'Any amount'}${netLbl?`<span style="font-size:10px;color:var(--t3);font-family:var(--fm);margin-left:6px;">${netLbl}</span>`:''}</div>
+        <span style="font-family:var(--fm);font-size:10px;color:${expired?'var(--red)':'var(--t3)'};">${expiryStr}</span>
+      </div>
+      ${inv.description?`<div style="font-size:12px;color:var(--t1);margin-bottom:8px;">${esc(inv.description)}</div>`:inv.descriptionHash?`<div style="font-family:var(--fm);font-size:10px;color:var(--t2);margin-bottom:8px;">Description hash: ${inv.descriptionHash.slice(0,16)}…</div>`:''}
+      ${inv.paymentHash?`<div style="font-family:var(--fm);font-size:9px;color:var(--t3);margin-bottom:10px;">Payment hash: ${inv.paymentHash.slice(0,16)}…</div>`:''}
+      ${inv.amountSats==null?`<div class="fgrp" style="margin-bottom:10px;"><label class="flbl">Amount (sats)</label><input class="fin" id="inv-amt-in" type="number" min="1" value="21" style="font-family:var(--fm);"></div>`:''}
+      <div style="display:flex;justify-content:flex-end;">
+        <button class="btn-p" id="inv-pay-btn" onclick="payDecodedInvoice()" ${expired?'disabled':''}>⚡ Pay Invoice</button>
+      </div>
+      <div id="inv-pay-status" style="margin-top:8px;font-family:var(--fm);font-size:11px;color:var(--t2);"></div>
+    </div>`;
+}
+async function payDecodedInvoice(){
+  if(!decodedInvoice) return;
+  if(!nwcWallet){ openNwcModal(); return; }
+  const st=document.getElementById('inv-pay-status');
+  const btn=document.getElementById('inv-pay-btn');
+  let amountMsat=null;
+  if(decodedInvoice.amountSats==null){
+    const amtSats=Math.max(1,Math.floor(Number(document.getElementById('inv-amt-in')?.value)||0));
+    if(!amtSats){ if(st) st.textContent='Enter a valid amount.'; return; }
+    amountMsat=amtSats*1000;
+  }
+  if(btn) btn.disabled=true;
+  if(st){ st.textContent='⏳ Paying via wallet...'; st.style.color='var(--t2)'; }
+  try{
+    await nwcPayInvoice(decodedInvoice.raw, amountMsat);
+    if(st){ st.textContent='✓ Invoice paid!'; st.style.color='var(--green)'; }
+  }catch(e){
+    if(st){ st.textContent='❌ '+e.message; st.style.color='var(--red)'; }
+    if(btn) btn.disabled=false;
+  }
 }
 
 function setNSrchType(type,btn){
@@ -3386,7 +3831,7 @@ async function openNostrProfile(pubkey){
       <div style="display:flex;gap:20px;padding:10px 0;border-top:1px solid var(--border);border-bottom:1px solid var(--border);margin-bottom:14px;">
         <div class="np-stat"><div class="np-stat-n" id="np-following-val">${typeof followingCount==='number'?fmtFollowerCount(followingCount):followingCount}</div><div class="np-stat-l">Following</div></div>
         <div class="np-stat"><div class="np-stat-n" id="np-followers-val"><span style="color:var(--t3);font-size:10px;">…</span></div><div class="np-stat-l">Followers</div></div>
-        ${meta.lud16||meta.lud06?`<div class="np-stat"><div class="np-stat-n">⚡</div><div class="np-stat-l">${esc(meta.lud16||'Lightning')}</div></div>`:''}
+        ${meta.lud16||meta.lud06?`<div class="np-stat zap-stat" onclick="openZapModal(null,'${pubEsc}')" title="Zap ${esc(meta.lud16||name)}"><div class="np-stat-n">⚡</div><div class="np-stat-l">${esc(meta.lud16||'Lightning')}</div></div>`:''}
       </div>
       <div style="font-family:var(--fm);font-size:9px;font-weight:600;letter-spacing:.12em;color:var(--t3);text-transform:uppercase;margin-bottom:8px;">Recent Posts</div>
       <div style="display:flex;gap:8px;margin-bottom:10px;">
@@ -4987,6 +5432,7 @@ function switchStab(tab) {
   if(tab==='ticker') renderTE(true);
   if(tab==='watchlist') { weList = JSON.parse(JSON.stringify(watchlist)); renderWE(); }
   if(tab==='mining') renderMinerList();
+  if(tab==='lightning') renderLightningSettings();
   if(tab==='nostr') renderNS();
   if(tab==='weather'){const wxInp=document.getElementById('wx-zip-in');if(wxInp&&wxZip)wxInp.value=wxZip;}
 }
@@ -5199,9 +5645,7 @@ function renderNS() {
       <div id="relay-add-err" style="font-family:var(--fm);font-size:10px;color:var(--red);min-height:14px;"></div>
       <div style="display:flex;gap:6px;margin-top:6px;">
         <button class="btn" onclick="resetRelays()" style="font-size:10px;">Reset to defaults</button>
-      </div>
-      <div class="ssec" style="margin-top:20px;">Lightning Wallet (for Zaps)</div>
-      ${buildNwcSettingsHTML()}`;
+      </div>`;
   } else {
     el.innerHTML = `
       <div class="ssec">Connect Nostr Account</div>
@@ -5487,10 +5931,15 @@ function buildNExp(){
       <div id="reply-banner"></div>
       <div style="padding:12px;padding-top:10px;display:flex;flex-direction:column;gap:8px;flex:1;">
         <span style="font-family:var(--fm);font-size:10px;font-weight:600;letter-spacing:.1em;color:var(--t2);text-transform:uppercase;">New Note</span>
-        <textarea id="compose-ta" placeholder="What's happening?" oninput="updCC(this)" style="background:var(--bg-3);border:1px solid var(--border-l);border-radius:var(--r);color:var(--t0);font-family:var(--fs);font-size:12px;padding:9px;resize:none;flex:1;outline:none;transition:border-color .15s;min-height:70px;"></textarea>
+        <textarea id="compose-ta" placeholder="What's happening?" oninput="updCC(this)" onpaste="handleComposePaste(event)" style="background:var(--bg-3);border:1px solid var(--border-l);border-radius:var(--r);color:var(--t0);font-family:var(--fs);font-size:12px;padding:9px;resize:none;flex:1;outline:none;transition:border-color .15s;min-height:70px;"></textarea>
+        <div id="compose-media-preview" style="display:none;flex-wrap:wrap;gap:6px;"></div>
+        <input type="file" id="compose-media-input" accept="image/*,video/*" multiple style="display:none" onchange="handleComposeMediaFiles(this.files);this.value='';">
         <div style="display:flex;align-items:center;justify-content:space-between;">
-          <span style="font-family:var(--fm);font-size:10px;color:var(--t3);" id="c-char">0</span>
-          <button class="btn-post" onclick="pubNote()">Publish</button>
+          <div style="display:flex;align-items:center;gap:10px;">
+            <button type="button" title="Attach photo or video" onclick="document.getElementById('compose-media-input').click()" style="background:none;border:1px solid var(--border-l);border-radius:var(--r);color:var(--t2);cursor:pointer;width:26px;height:26px;display:flex;align-items:center;justify-content:center;font-size:13px;transition:all .15s;">🖼️</button>
+            <span style="font-family:var(--fm);font-size:10px;color:var(--t3);" id="c-char">0</span>
+          </div>
+          <button class="btn-post" id="compose-publish-btn" onclick="pubNote()">Publish</button>
         </div>
       </div>
     </div>`;
@@ -7964,19 +8413,140 @@ function updNUI(){
 }
 function trunc(pk){return pk?pk.slice(0,8)+'...'+pk.slice(-4):'';}
 
+// ── Note composer media attachments ──────────────────────────────────────
+// Nostr notes are plain text; there's no binary-attachment field on the
+// event itself. The convention every client (Damus, Amethyst, Primal,
+// Snort...) follows is: upload the file to a public media host first, then
+// drop the resulting URL into the note's content. buildNContent() above
+// already detects image/video URLs in note content and renders them inline
+// (see IMG_RE/video branch), so appending the uploaded URL is all that's
+// needed for it to show up as a real attachment for every viewer, not just
+// a link.
+let composeMedia=[]; // [{id, file, objectUrl, url, mime, status:'uploading'|'done'|'error', isVideo}]
+let composeMediaSeq=0;
+
+function handleComposeMediaFiles(fileList){
+  const files=Array.from(fileList||[]).filter(f=>/^image\/|^video\//.test(f.type));
+  if(!files.length)return;
+  files.forEach(file=>{
+    const id=++composeMediaSeq;
+    const item={id,file,objectUrl:URL.createObjectURL(file),url:null,mime:file.type,status:'uploading',isVideo:file.type.startsWith('video/')};
+    composeMedia.push(item);
+    uploadComposeMedia(item);
+  });
+  renderComposeMediaPreview();
+}
+
+function handleComposePaste(event){
+  const items=event.clipboardData?.items;
+  if(!items)return;
+  const files=[];
+  for(const it of items){
+    if(/^image\/|^video\//.test(it.type)){
+      const f=it.getAsFile();
+      if(f)files.push(f);
+    }
+  }
+  if(files.length){
+    event.preventDefault();
+    handleComposeMediaFiles(files);
+  }
+}
+
+async function uploadComposeMedia(item){
+  try{
+    const fd=new FormData();
+    fd.append('file[]',item.file,item.file.name||'upload');
+    const res=await fetch('https://nostr.build/api/v2/upload/files',{method:'POST',body:fd});
+    if(!res.ok)throw new Error('HTTP '+res.status);
+    const data=await res.json();
+    // Response shape has shifted before across nostr.build API versions —
+    // walk the JSON looking for the first plausible media URL rather than
+    // hard-coding one exact path, so a minor server-side shape change
+    // doesn't silently break attachments.
+    const url=findFirstUrl(data);
+    if(!url)throw new Error('no url in response');
+    item.url=url;item.status='done';
+  }catch(e){
+    console.error('[compose media] upload failed:',e);
+    item.status='error';
+  }
+  renderComposeMediaPreview();
+}
+
+function findFirstUrl(obj,depth=0){
+  if(depth>6||obj==null)return null;
+  if(typeof obj==='string')return /^https?:\/\//i.test(obj)?obj:null;
+  if(Array.isArray(obj)){
+    for(const v of obj){const r=findFirstUrl(v,depth+1);if(r)return r;}
+    return null;
+  }
+  if(typeof obj==='object'){
+    // Prefer a key literally named 'url' at this level first.
+    if(typeof obj.url==='string'&&/^https?:\/\//i.test(obj.url))return obj.url;
+    for(const k in obj){const r=findFirstUrl(obj[k],depth+1);if(r)return r;}
+  }
+  return null;
+}
+
+function removeComposeMedia(id){
+  const idx=composeMedia.findIndex(m=>m.id===id);
+  if(idx>=0){URL.revokeObjectURL(composeMedia[idx].objectUrl);composeMedia.splice(idx,1);}
+  renderComposeMediaPreview();
+}
+
+function renderComposeMediaPreview(){
+  const el=document.getElementById('compose-media-preview');
+  if(!el)return;
+  if(!composeMedia.length){el.style.display='none';el.innerHTML='';return;}
+  el.style.display='flex';
+  el.innerHTML=composeMedia.map(m=>{
+    const thumb=m.isVideo
+      ? `<video src="${esc(m.objectUrl)}" style="width:100%;height:100%;object-fit:cover;"></video>`
+      : `<img src="${esc(m.objectUrl)}" style="width:100%;height:100%;object-fit:cover;">`;
+    const overlay=m.status==='uploading'
+      ? `<div style="position:absolute;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;"><div class="spin" style="width:14px;height:14px;"></div></div>`
+      : m.status==='error'
+      ? `<div style="position:absolute;inset:0;background:rgba(220,50,50,.55);display:flex;align-items:center;justify-content:center;font-size:9px;color:#fff;font-family:var(--fm);text-align:center;padding:2px;">failed</div>`
+      : '';
+    return `<div style="position:relative;width:56px;height:56px;border-radius:6px;overflow:hidden;background:var(--bg-3);flex-shrink:0;">
+      ${thumb}${overlay}
+      <button type="button" onclick="removeComposeMedia(${m.id})" title="Remove" style="position:absolute;top:2px;right:2px;width:16px;height:16px;border-radius:50%;background:rgba(0,0,0,.65);border:none;color:#fff;font-size:10px;line-height:16px;cursor:pointer;padding:0;">✕</button>
+    </div>`;
+  }).join('');
+}
+
+function resetComposeMedia(){
+  composeMedia.forEach(m=>URL.revokeObjectURL(m.objectUrl));
+  composeMedia=[];
+  renderComposeMediaPreview();
+}
+
 async function pubNote(){
-  const ta=document.getElementById('compose-ta');const ct=ta.value.trim();if(!ct||!nPubkey)return;
+  const ta=document.getElementById('compose-ta');const ct=ta.value.trim();
+  const btn=document.getElementById('compose-publish-btn');
+  if((!ct&&!composeMedia.length)||!nPubkey)return;
+  if(composeMedia.some(m=>m.status==='uploading')){
+    if(btn){const orig=btn.textContent;btn.textContent='Uploading…';btn.disabled=true;setTimeout(()=>{btn.textContent=orig;btn.disabled=false;},50);}
+    alert('Still uploading attachment(s) — try again in a moment.');
+    return;
+  }
+  const mediaOk=composeMedia.filter(m=>m.status==='done'&&m.url);
+  const failedCount=composeMedia.filter(m=>m.status==='error').length;
+  if(failedCount&&!confirm(`${failedCount} attachment(s) failed to upload. Publish without ${failedCount>1?'them':'it'}?`))return;
+  const fullContent=[ct,...mediaOk.map(m=>m.url)].filter(Boolean).join('\n\n');
   try{
     await loadNT();
     const tags=[];
   if(nReplyTo){tags.push(['e',nReplyTo.id,'','reply']);tags.push(['p',nReplyTo.pubkey]);}
-  const ev={kind:1,created_at:Math.floor(Date.now()/1000),tags,content:ct,pubkey:nPubkey};
+  mediaOk.forEach(m=>{tags.push(['imeta',`url ${m.url}`,`m ${m.mime}`]);});
+  const ev={kind:1,created_at:Math.floor(Date.now()/1000),tags,content:fullContent,pubkey:nPubkey};
     let signed;
     if(nSigner==='extension'&&window.nostr)signed=await window.nostr.signEvent(ev);
     else if(nSigner==='nsec'&&window._nPriv)signed=window.NostrTools.finalizeEvent(ev,window._nPriv);
     else{alert('No signer. Reconnect.');return;}
     RELAYS.forEach(u=>{try{const ws=new WebSocket(u);ws.onopen=()=>{ws.send(JSON.stringify(['EVENT',signed]));setTimeout(()=>ws.close(),2000);};}catch{}});
-    ta.value='';updCC(ta);cancelReply();nEvents.unshift(signed);renderNFeed();
+    ta.value='';updCC(ta);cancelReply();resetComposeMedia();nEvents.unshift(signed);renderNFeed();
   }catch(e){alert(`Publish failed: ${e.message}`);}
 }
 function updCC(ta){const n=ta.value.length;const el=document.getElementById('c-char');if(el){el.textContent=n;el.style.color='var(--t3)';}}
@@ -8091,7 +8661,7 @@ async function nwcSaveConnection(uri, statusEl){
   }catch(e){
     if(statusEl) statusEl.textContent = '⚠️ Saved, but could not verify: '+e.message;
   }
-  renderNS(); _refreshWalletBtn();
+  renderNS(); renderLightningSettings(); _refreshWalletBtn();
 }
 
 function nwcDisconnect(){
@@ -8099,7 +8669,7 @@ function nwcDisconnect(){
   nwcUri=null; nwcWallet=null; nwcBalanceSats=null;
   localStorage.removeItem('mts_nwc_uri');
   if(nwcWS){ try{nwcWS.close();}catch{} nwcWS=null; }
-  renderNS(); _refreshWalletBtn();
+  renderNS(); renderLightningSettings(); _refreshWalletBtn();
   const b=document.getElementById('nwc-body'); if(b) renderNwcModalBody();
 }
 
@@ -8157,8 +8727,11 @@ function nwcRequest(method, params, timeoutMs){
   });
 }
 
-async function nwcPayInvoice(bolt11){
-  return nwcRequest('pay_invoice', {invoice: bolt11}, 45000);
+async function nwcPayInvoice(bolt11, amountMsat){
+  const params = {invoice: bolt11};
+  // amount override — required by zero-amount invoices, ignored by wallets otherwise
+  if(amountMsat) params.amount = Math.round(amountMsat);
+  return nwcRequest('pay_invoice', params, 45000);
 }
 
 // ── Wallet Connect modal (setup / manage) ─────────────────────────────────
@@ -8173,6 +8746,15 @@ function buildNwcSettingsHTML(){
     </div>`;
   }
   return `<div class="nm-card" onclick="openNwcModal()"><span style="font-size:18px;">⚡</span><div style="flex:1;"><div style="font-size:12px;font-weight:600;color:var(--t0);margin-bottom:2px;">Connect a Lightning Wallet</div><div style="font-size:11px;color:var(--t2);">Send zaps straight from this dashboard.</div></div><span class="nbadge bs">SET UP</span></div>`;
+}
+
+// Settings → Lightning tab. Own home for wallet connect/manage — pulled out
+// of the Nostr tab since it's really a separate concern (funding zaps, not
+// identity/relays) and deserves its own spot in the tab bar.
+function renderLightningSettings(){
+  const el = document.getElementById('lightning-settings-body');
+  if(!el) return;
+  el.innerHTML = buildNwcSettingsHTML();
 }
 
 function renderNwcModalBody(){
@@ -8245,12 +8827,14 @@ async function nwcCheckBalance(){
       nwcBalanceSats = Math.floor(bal.balance/1000);
       const lbl=document.getElementById('nwc-balance-lbl'); if(lbl) lbl.textContent = fmtSats(nwcBalanceSats)+' available';
       if(st) st.textContent = '✓ Updated';
-      renderNS();
+      renderNS(); renderLightningSettings();
     }
   }catch(e){ if(st) st.textContent='❌ '+e.message; }
 }
 
 // ── Sending a zap (NIP-57) ─────────────────────────────────────────────────
+// evId: note id (omit for a profile-level zap with no specific note)
+// evPub: recipient pubkey (omit when zapping a raw lightning address with no Nostr identity)
 async function openZapModal(evId, evPub, btn){
   nwcZapTarget = {evId, evPub, btn};
   const prof = nProfiles[evPub] || (evPub===nPubkey?nProfile:null);
@@ -8275,7 +8859,30 @@ async function openZapModal(evId, evPub, btn){
     openM('zap-modal'); return;
   }
 
-  body.innerHTML = `
+  body.innerHTML = zapFormHTML('Comment', 'Nice post!', '⚡ Send Zap');
+  openM('zap-modal');
+}
+
+// Zap/pay a raw lightning address directly (e.g. from the Lightning search tab).
+// Not tied to a Nostr note or profile, so no NIP-57 zap request is signed —
+// this is a plain LNURL-pay, just routed through the same amount/message UI.
+function openLnAddrZapModal(addr){
+  nwcZapTarget = {lnAddr: addr};
+  document.getElementById('zap-target-sub').textContent = 'to '+addr;
+  const body = document.getElementById('zap-body');
+
+  if(!nwcWallet){
+    body.innerHTML = `<div class="warn">Connect a Lightning wallet first so payments have somewhere to send sats from.</div><div style="display:flex;justify-content:flex-end;"><button class="btn-p" onclick="closeM('zap-modal');openNwcModal()">Connect Wallet</button></div>`;
+    openM('zap-modal'); return;
+  }
+
+  body.innerHTML = zapFormHTML('Message', 'Thanks!', '⚡ Send Payment');
+  openM('zap-modal');
+}
+
+// Shared amount + message form used by both note/profile zaps and plain address payments
+function zapFormHTML(msgLabel, msgPlaceholder, sendLabel){
+  return `
     <div class="fgrp">
       <label class="flbl">Amount (sats)</label>
       <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;" id="zap-preset-row">
@@ -8284,15 +8891,14 @@ async function openZapModal(evId, evPub, btn){
       <input class="fin" id="zap-amt-in" type="number" min="1" value="21" style="font-family:var(--fm);">
     </div>
     <div class="fgrp">
-      <label class="flbl">Comment (optional)</label>
-      <input class="fin" id="zap-comment-in" placeholder="Nice post!" maxlength="200">
+      <label class="flbl">${msgLabel} (optional)</label>
+      <input class="fin" id="zap-comment-in" placeholder="${msgPlaceholder}" maxlength="200">
     </div>
     <div style="display:flex;gap:8px;justify-content:flex-end;">
       <button class="btn" onclick="closeM('zap-modal')">Cancel</button>
-      <button class="btn-p" id="zap-send-btn" onclick="sendZap()">⚡ Send Zap</button>
+      <button class="btn-p" id="zap-send-btn" onclick="sendZap()">${sendLabel}</button>
     </div>
     <div id="zap-status" style="margin-top:10px;font-family:var(--fm);font-size:11px;color:var(--t2);"></div>`;
-  openM('zap-modal');
 }
 
 function pickZapAmt(a){
@@ -8301,8 +8907,8 @@ function pickZapAmt(a){
 }
 
 async function sendZap(){
-  const {evId, evPub, btn} = nwcZapTarget||{};
-  if(!evId) return;
+  const {evId, evPub, btn, lnAddr} = nwcZapTarget||{};
+  if(!evId && !evPub && !lnAddr) return;
   const amtSats = Math.max(1, Math.floor(Number(document.getElementById('zap-amt-in')?.value)||0));
   const comment = document.getElementById('zap-comment-in')?.value.trim()||'';
   const st = document.getElementById('zap-status');
@@ -8312,16 +8918,22 @@ async function sendZap(){
   if(sendBtn) sendBtn.disabled=true;
   if(st){ st.textContent='⏳ Fetching invoice...'; st.style.color='var(--t2)'; }
   try{
-    const prof = nProfiles[evPub];
-    const lnAddr = prof.lud16 || null;
-    let lnurlPayUrl;
+    let lnAddrToUse=null, lud06ToUse=null;
     if(lnAddr){
-      const [name, domain] = lnAddr.split('@');
-      if(!name || !domain) throw new Error('Invalid lightning address on profile');
+      lnAddrToUse = lnAddr;
+    } else {
+      const prof = nProfiles[evPub];
+      lnAddrToUse = prof?.lud16 || null;
+      lud06ToUse = prof?.lud06 || null;
+    }
+    let lnurlPayUrl;
+    if(lnAddrToUse){
+      const [name, domain] = lnAddrToUse.split('@');
+      if(!name || !domain) throw new Error('Invalid lightning address');
       lnurlPayUrl = `https://${domain}/.well-known/lnurlp/${name}`;
     } else {
       await loadNT();
-      const dec = window.NostrTools.nip19.decode(prof.lud06);
+      const dec = window.NostrTools.nip19.decode(lud06ToUse);
       lnurlPayUrl = new TextDecoder().decode(dec.data);
     }
 
@@ -8334,12 +8946,15 @@ async function sendZap(){
     let callbackUrl = lnurlRes.callback;
     const qs = new URLSearchParams({amount:String(amountMsat)});
 
-    // NIP-57: attach a signed zap request so the receipt links back to this note/author
-    if(lnurlRes.allowsNostr && lnurlRes.nostrPubkey){
+    // NIP-57: only attach a signed zap request when this payment is tied to a Nostr
+    // identity (a note or profile zap). A plain lightning-address payment isn't a
+    // "zap" in the NIP-57 sense, so it just goes through as a normal LNURL-pay.
+    if(evPub && nPubkey && lnurlRes.allowsNostr && lnurlRes.nostrPubkey){
+      const zapTags=[['relays',...RELAYS.slice(0,4)],['amount',String(amountMsat)],['p',evPub]];
+      if(evId) zapTags.push(['e',evId]);
       const zapReq = {
         kind:9734, created_at:Math.floor(Date.now()/1000), pubkey:nPubkey,
-        tags:[['relays',...RELAYS.slice(0,4)],['amount',String(amountMsat)],['p',evPub],['e',evId]],
-        content:comment
+        tags:zapTags, content:comment
       };
       let signedZap;
       if(nSigner==='extension'&&window.nostr) signedZap=await window.nostr.signEvent(zapReq);
@@ -8357,7 +8972,7 @@ async function sendZap(){
     if(st) st.textContent='⏳ Paying via wallet...';
     await nwcPayInvoice(invRes.pr);
 
-    if(st){ st.textContent='✓ Zap sent!'; st.style.color='var(--green)'; }
+    if(st){ st.textContent= lnAddr?'✓ Payment sent!':'✓ Zap sent!'; st.style.color='var(--green)'; }
     if(btn && btn.classList) btn.classList.add('zap-sent');
     setTimeout(()=>closeM('zap-modal'), 1200);
   }catch(e){
@@ -8604,7 +9219,7 @@ function startRefreshWorker(){
       switch(e.data?.type){
         case 'prices':   refreshAll(); break;
         case 'mining':   if(miners.length) refreshMiningStats(); pollMinersFile(); break;
-        case 'hashrate': fetchBtcNetworkHashrate(); break;
+        case 'hashrate': fetchBtcNetworkHashrate(); fetchNetworkWeeklySpark(); break;
         case 'news':     loadNews(); break;
         case 'weather':  if(wxZip) fetchWeather(wxZip).then(d=>{if(d&&!d.error){wxData=d;updateWxWidget();}}); break;
         case 'portchart':
@@ -8624,6 +9239,7 @@ function startFallbackIntervals(){
   setInterval(refreshAll, 15000);
   setInterval(loadNews, 300000);
   setInterval(fetchBtcNetworkHashrate, 600000);
+  setInterval(fetchNetworkWeeklySpark, 600000);
   setInterval(refreshMiningStats, 30000);
   setInterval(pollMinersFile, 30000);
   setInterval(()=>{
@@ -8664,6 +9280,7 @@ async function init(){
   renderTicker(); renderWL();
   refreshAll();
   fetchBtcNetworkHashrate();
+  fetchNetworkWeeklySpark();
   initWeather();
   if(wxZip){const wxInp=document.getElementById('wx-zip-in');if(wxInp)wxInp.value=wxZip;}
   loadNews();

@@ -373,20 +373,44 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             dst_e = _dt(y, 11, 1, 6, 0, tzinfo=_tz.utc) + _td(days=(6 - _dt(y, 11, 1).weekday()) % 7)
             et_off = _td(hours=-4) if dst_s <= now_utc < dst_e else _td(hours=-5)
             now_et = now_utc + et_off
-            # On weekends roll back to Friday so post-market candle windows cover
-            # Friday 4–8 PM ET instead of a meaningless Saturday/Sunday window.
+            # BUG FIX: midnight–4:00 AM ET on a normal weekday is still the
+            # OVERNIGHT CARRY of LAST NIGHT's session, not the start of today's
+            # own pre-market window. The old logic only rolled ref_et back on
+            # Sat/Sun, so e.g. at Tuesday 1:00 AM it left ref_et = Tuesday,
+            # making 'regular_close'/'post_close' Tuesday 4–8 PM ET — both still
+            # ~15-19 hours in the FUTURE relative to "now". The candle-window
+            # loop below then searches for post-market candles in a window that
+            # hasn't happened yet, finds nothing, and the price silently falls
+            # back to the plain regular-session close instead of last night's
+            # real post-market print. Roll back to the prior trading day first
+            # whenever we're in that dead zone, THEN apply the existing
+            # Sat/Sun→Friday rollback on the result.
             ref_et = now_et
-            if ref_et.weekday() == 5:   # Saturday → back 1 day to Friday
+            if ref_et.hour < 4:          # 12:00am–3:59am ET → still last night
                 ref_et = ref_et - _td(days=1)
-            elif ref_et.weekday() == 6: # Sunday → back 2 days to Friday
+            if ref_et.weekday() == 5:    # Saturday → back 1 day to Friday
+                ref_et = ref_et - _td(days=1)
+            elif ref_et.weekday() == 6:  # Sunday → back 2 days to Friday
                 ref_et = ref_et - _td(days=2)
             # Midnight of the reference trading day in ET, expressed as UTC
             midnight_et = _dt(ref_et.year, ref_et.month, ref_et.day, tzinfo=_tz.utc) - et_off
+            # Next trading day after ref_et (skips the weekend), used to widen
+            # the "post-market" candle window all the way to the next
+            # pre-market open instead of a hard 8:00 PM cutoff. If Yahoo's
+            # public chart feed does carry any later overnight prints (e.g.
+            # Blue Ocean ATS ticks folded into the same 1m candle stream),
+            # this lets them be picked up as live extended-hours data instead
+            # of being discarded; if it doesn't, this window simply stays
+            # empty past 8 PM and behavior is unchanged.
+            next_day = ref_et + _td(days=1)
+            while next_day.weekday() >= 5:
+                next_day = next_day + _td(days=1)
+            next_midnight_et = _dt(next_day.year, next_day.month, next_day.day, tzinfo=_tz.utc) - et_off
             return {
                 'pre_open':      (midnight_et + _td(hours=4,  minutes=0)).timestamp(),
                 'regular_open':  (midnight_et + _td(hours=9,  minutes=30)).timestamp(),
                 'regular_close': (midnight_et + _td(hours=16, minutes=0)).timestamp(),
-                'post_close':    (midnight_et + _td(hours=20, minutes=0)).timestamp(),
+                'post_close':    (next_midnight_et + _td(hours=4, minutes=0)).timestamp(),
                 'now_et_str':    now_et.strftime('%H:%M'),
             }
 
@@ -588,6 +612,8 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                     candle_post_price = 0
                     candle_pre_pct    = 0
                     candle_post_pct   = 0
+                    candle_pre_ts     = 0   # unix ts of the candle that produced candle_pre_price
+                    candle_post_ts    = 0   # unix ts of the candle that produced candle_post_price
 
                     if include_pre_post:
                         try:
@@ -612,8 +638,10 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                                     last_cl = cl
                                     if pre_open_utc <= ts < regular_open_utc:
                                         candle_pre_price = cl
+                                        candle_pre_ts    = ts
                                     elif regular_close_utc <= ts < post_close_utc:
                                         candle_post_price = cl
+                                        candle_post_ts    = ts
 
                                 # KEY FIX: for ETFs/preferred stocks (VXUS, STRK) Yahoo's
                                 # range=2d response often covers only YESTERDAY — today's
@@ -635,9 +663,11 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                                 #     yesterday's close (e.g. STRK with light pre-market volume).
                                 if candle_pre_price == 0 and clock_in_pre and reg_price and prev_close and (reg_price != prev_close or mkt_state == 'PRE'):
                                     candle_pre_price = reg_price
+                                    candle_pre_ts    = mkt_time or now_ts
                                     print(f"[v8-candles] {sym}: using meta.regularMarketPrice={reg_price:.4f} as PRE price (no today candles yet, mkt_state={mkt_state})")
                                 if candle_post_price == 0 and clock_in_post and reg_price and prev_close and reg_price != prev_close:
                                     candle_post_price = reg_price
+                                    candle_post_ts    = mkt_time or now_ts
                                     print(f"[v8-candles] {sym}: using meta.regularMarketPrice={reg_price:.4f} as POST price (no today candles yet)")
 
                                 if candle_pre_price and prev_close:
@@ -647,13 +677,19 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
 
                                 print(f"[v8-candles] {sym}: ET={win['now_et_str']} state={mkt_state} "
                                       f"candles={len(timestamps)} last={last_ts}({last_cl:.4f}) "
-                                      f"pre={candle_pre_price:.4f} post={candle_post_price:.4f}")
+                                      f"pre={candle_pre_price:.4f}@{candle_pre_ts} post={candle_post_price:.4f}@{candle_post_ts}")
                         except Exception as ex:
                             print(f"[futures-price] candle extraction failed for {sym}: {ex}")
 
-                    # Candle-derived prices beat meta fields (candles are tick-accurate)
+                    # Candle-derived prices beat meta fields (candles are tick-accurate).
+                    # NOTE: meta.preMarketPrice/postMarketPrice carry no timestamp of their
+                    # own from Yahoo, so when we fall back to them (candle_*_ts is 0) we use
+                    # mkt_time (regularMarketTime) as the best available estimate — better
+                    # than claiming "right now" when we don't actually know.
                     final_pre_price  = candle_pre_price  or meta.get('preMarketPrice')  or 0
+                    final_pre_ts     = candle_pre_ts if candle_pre_price else (mkt_time or 0)
                     final_post_price = candle_post_price or meta.get('postMarketPrice') or 0
+                    final_post_ts    = candle_post_ts if candle_post_price else (mkt_time or 0)
 
                     # BUG FIX: never trust Yahoo's raw meta.preMarketChangePercent /
                     # meta.postMarketChangePercent fields. Yahoo computes those against
@@ -677,8 +713,10 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                         'regularMarketPrice':         reg_price,
                         'postMarketPrice':            final_post_price,
                         'postMarketChangePercent':    final_post_pct,
+                        'postMarketTime':              final_post_ts,
                         'preMarketPrice':             final_pre_price,
                         'preMarketChangePercent':     final_pre_pct,
+                        'preMarketTime':               final_pre_ts,
                         'regularMarketPreviousClose': prev_close,
                         'regularMarketChangePercent': reg_pct,
                         'marketState':                mkt_state,
@@ -922,6 +960,15 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                     if not base.get(field) and src.get(field):
                         base[field] = src[field]
                         print(f"[fetch_base] {symbol}: filled {field}={src[field]:.4f} from {src_label}")
+                # quoteSummary/v7 don't give us a genuine tick timestamp for their
+                # pre/post prices — if we just borrowed one of those fields above,
+                # make sure we don't leave a stale/zero *Time value claiming it's
+                # from v8's candle extraction. Best honest estimate is this
+                # source's own regularMarketTime.
+                if base.get('preMarketPrice') and not base.get('preMarketTime') and src.get('regularMarketTime'):
+                    base['preMarketTime'] = src['regularMarketTime']
+                if base.get('postMarketPrice') and not base.get('postMarketTime') and src.get('regularMarketTime'):
+                    base['postMarketTime'] = src['regularMarketTime']
                 # NOTE: quoteSummary's own regularMarketChangePercent/PreviousClose is
                 # deliberately NOT trusted here anymore. It was tried as the authoritative
                 # source, but for mutual funds it returns the SAME stale previousClose as the
@@ -949,6 +996,7 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                     prev  = src['regularMarketPreviousClose']
                     base['preMarketPrice'] = synth
                     base['preMarketChangePercent'] = (synth - prev) / prev * 100
+                    base['preMarketTime'] = src.get('regularMarketTime') or 0
                     base['marketState'] = 'PRE'
                     print(f"[fetch_base] {symbol}: synthesised preMarketPrice={synth:.4f} "                          f"from {src_label}.regularMarketPrice (state=PRE, prev={prev:.4f})")
 
@@ -975,7 +1023,9 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             ((base_price - base_prev) / base_prev * 100) if base_prev else 0
         )
         post_price = base.get('postMarketPrice') or 0
+        post_time  = base.get('postMarketTime') or 0    # unix ts price was actually struck (0 = unknown)
         pre_price  = base.get('preMarketPrice') or 0
+        pre_time   = base.get('preMarketTime') or 0
         # BUG FIX: don't trust base.get('postMarketChangePercent')/('preMarketChangePercent')
         # here. Those can originate from Yahoo's raw quoteSummary/v7 fields (computed vs
         # today's regularMarketPrice, not vs prev_close) via the field-by-field fill-in
@@ -986,6 +1036,20 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         # close" baseline as everything else in the app.
         post_pct = ((post_price - base_prev) / base_prev * 100) if (post_price and base_prev) else 0
         pre_pct  = ((pre_price  - base_prev) / base_prev * 100) if (pre_price  and base_prev) else 0
+        # POST-MARKET/OVERNIGHT DISPLAY PCT: the PRE/POST badge is meant to show
+        # "how has the price moved THIS session" — for post-market/overnight that
+        # means since the regular session's own close, not since the previous
+        # day's close. (Yahoo's own "Overnight" quote does the same: it shows
+        # +0.54% measured off today's 4pm close, not off yesterday's close.)
+        # Using base_prev here instead — as post_pct above still does — produces
+        # a technically-correct "since yesterday" number that visually looks like
+        # the opposite sign/magnitude of what every other source shows next to a
+        # POST/overnight quote, which reads as "wrong" even though the math is
+        # sound. Kept as a SEPARATE variable (not touching post_pct/base_prev)
+        # because 'prev' is still sent as base_prev to the client for portfolio
+        # day-change and chart-baseline math elsewhere, which correctly wants
+        # the true previous-trading-day close, not today's close.
+        post_pct_vs_close = ((post_price - base_price) / base_price * 100) if (post_price and base_price) else 0
         # When this regularMarketPrice/PreviousClose pair was actually struck.
         # For once-a-day-priced assets (mutual funds) this can lag well behind
         # "now" even after the market has closed for the day — see asOf usage below.
@@ -1069,12 +1133,37 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                 _send_futures('POST')
                 return
             if post_price > 0:
-                pct = post_pct or _pct(post_price, base_prev)
+                # PRIMARY pct: current LIVE price vs YESTERDAY's close — the
+                # same baseline as REGULAR/PRE, just with the freshest price
+                # plugged in. Confirmed against Yahoo's own After Hours quote:
+                # price 96.51 vs prev close 97.33 = -0.84%, matching Yahoo's
+                # headline exactly. This is NOT frozen at the 4pm print
+                # (that undercounts any post-market move) and NOT measured
+                # vs the 4pm close either (that answers "how far since the
+                # bell", a different question — +0.44% here, not -0.84%).
+                # `post_pct` already computed this a few lines up.
+                # extPct is the SEPARATE secondary number — how far price has
+                # moved since the close — for UI that wants to annotate the
+                # live extended price the way Yahoo's own watchlist shows a
+                # small overnight/post-market % under the main one, later at
+                # night once it switches to its dual-row "At close" + small
+                # "Overnight" display.
+                ext_pct = post_pct_vs_close or _pct(post_price, base_price) or post_pct
+                # BUG FIX: this used to stamp asOf with the CURRENT wall-clock
+                # time (_t.time()) regardless of how old the underlying candle
+                # actually was. That made a price that hadn't moved in hours
+                # look perfectly live to the client's staleness check — which
+                # is exactly why a frozen post-market print could sit on screen
+                # looking "live" all night. Use the real candle/print timestamp
+                # (post_time) when we have one; only fall back to "now" if we
+                # genuinely have no timestamp at all (better than showing 0).
                 import time as _t
-                send_result({'symbol': symbol, 'price': post_price, 'pct': pct,
+                real_asof = post_time or _t.time()
+                send_result({'symbol': symbol, 'price': post_price, 'pct': post_pct,
+                             'extPct': ext_pct, 'extPrice': post_price,
                              'prev': base_prev, 'marketState': 'POST',
                              'isFutures': False, 'futuresSym': futures_sym,
-                             'hasExtendedData': True, 'asOf': _t.time()})
+                             'hasExtendedData': True, 'asOf': real_asof})
                 return
             # 4:00–4:15 PM ET gap: futures maintenance, no post-market data yet
             # Show last regular-session close labeled POST so UI shows "Post-Market"
@@ -1094,10 +1183,11 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             if pre_price > 0:
                 pct = pre_pct or _pct(pre_price, base_prev)
                 import time as _t
+                real_asof = pre_time or _t.time()
                 send_result({'symbol': symbol, 'price': pre_price, 'pct': pct,
                              'prev': base_prev, 'marketState': 'PRE',
                              'isFutures': False, 'futuresSym': futures_sym,
-                             'hasExtendedData': True, 'asOf': _t.time()})
+                             'hasExtendedData': True, 'asOf': real_asof})
                 return
             # Pre-market gap: no pre-market trades yet (low-volume ETFs, early morning).
             # Show last regular-session close labeled PRE so the UI badge appears
@@ -1120,13 +1210,19 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         # regular close. Yahoo still returns postMarketPrice overnight so we use it.
         # This covers the gap from 8 PM Friday → 4 AM Monday (pre-market opens).
         if post_price > 0 and not clock_regular and not clock_pre:
-            pct = post_pct or _pct(post_price, base_prev)
-            print(f"[POST-carry] {symbol}: overnight/weekend, carrying post-market price {post_price:.2f}")
+            # Same convention as the regular POST branch above: `pct` is the
+            # live carried price vs YESTERDAY's close (matches Yahoo's
+            # headline number through the evening); `extPct` is the
+            # since-4pm-close move, kept only as a secondary annotation.
+            ext_pct = post_pct_vs_close or _pct(post_price, base_price) or post_pct
+            print(f"[POST-carry] {symbol}: overnight/weekend, carrying post-market price {post_price:.2f} (real ts={post_time})")
             import time as _t
-            send_result({'symbol': symbol, 'price': post_price, 'pct': pct,
+            real_asof = post_time or _t.time()
+            send_result({'symbol': symbol, 'price': post_price, 'pct': post_pct,
+                         'extPct': ext_pct, 'extPrice': post_price,
                          'prev': base_prev, 'marketState': 'POST',
                          'isFutures': False, 'futuresSym': futures_sym,
-                         'hasExtendedData': True, 'asOf': _t.time()})
+                         'hasExtendedData': True, 'asOf': real_asof})
             return
 
         # ── LAST RESORT: stale close (better than nothing) ───────────────────────
@@ -1180,13 +1276,28 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         dst_e = datetime.datetime(y,11,1,6,0,tzinfo=datetime.timezone.utc) + datetime.timedelta(days=(6-datetime.datetime(y,11,1).weekday())%7)
         et_off = datetime.timedelta(hours=-4) if dst_s <= now_utc < dst_e else datetime.timedelta(hours=-5)
         now_et = now_utc + et_off
-        midnight_et = datetime.datetime(now_et.year, now_et.month, now_et.day, tzinfo=datetime.timezone.utc) - et_off
+        # Same day-rollback fix as _et_session_windows(): 12am-4am ET is still
+        # last night's overnight carry, and the post window extends to the
+        # next trading day's pre-market open rather than a hard 8pm cutoff.
+        ref_et = now_et
+        if ref_et.hour < 4:
+            ref_et = ref_et - datetime.timedelta(days=1)
+        if ref_et.weekday() == 5:
+            ref_et = ref_et - datetime.timedelta(days=1)
+        elif ref_et.weekday() == 6:
+            ref_et = ref_et - datetime.timedelta(days=2)
+        midnight_et = datetime.datetime(ref_et.year, ref_et.month, ref_et.day, tzinfo=datetime.timezone.utc) - et_off
+        next_day = ref_et + datetime.timedelta(days=1)
+        while next_day.weekday() >= 5:
+            next_day = next_day + datetime.timedelta(days=1)
+        next_midnight_et = datetime.datetime(next_day.year, next_day.month, next_day.day, tzinfo=datetime.timezone.utc) - et_off
         windows = {
             'pre_open':      (midnight_et + datetime.timedelta(hours=4)).timestamp(),
             'regular_open':  (midnight_et + datetime.timedelta(hours=9, minutes=30)).timestamp(),
             'regular_close': (midnight_et + datetime.timedelta(hours=16)).timestamp(),
-            'post_close':    (midnight_et + datetime.timedelta(hours=20)).timestamp(),
+            'post_close':    (next_midnight_et + datetime.timedelta(hours=4)).timestamp(),
             'now_et':        now_et.strftime('%H:%M ET'),
+            'ref_trading_day': ref_et.strftime('%A %Y-%m-%d'),
         }
         out['windows'] = windows
         now_ts = time.time()
