@@ -12,7 +12,7 @@ A personal dashboard for tracking markets, news, your portfolio, weather, and Bi
 - Bitcoin miner monitoring for devices on your local network
 - Weather by ZIP code or coordinates
 - Built-in Nostr client with adjustable panes
-- Nostr Wallet Connect to zap posts, pay invoices, or any lightning address
+- Nostr Wallet Connect to zap posts, pay invoices or any lightning address
 
 ## Requirements
 
