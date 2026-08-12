@@ -216,6 +216,8 @@ a{color:inherit;text-decoration:none;}
 .nv-act.reply:hover{color:var(--accent);}
 .nv-act.repost:hover,.nv-act.repost.done{color:var(--green);}
 .nv-act.like:hover,.nv-act.like.done{color:var(--red);}
+.nv-act.zap:hover,.nv-act.zap.done{color:var(--gold);}
+.nact.zap-sent{color:var(--gold)!important;}
 .nv-replies-hdr{padding:10px 18px;font-family:var(--fm);font-size:10px;font-weight:600;letter-spacing:.12em;color:var(--t3);text-transform:uppercase;border-bottom:1px solid var(--border);background:var(--bg-2);}
 .nv-parent{padding:14px 18px;border-bottom:2px solid var(--border);background:var(--bg-2);cursor:pointer;transition:background .15s;}
 .nv-parent:hover{background:var(--bg-3);}
@@ -851,6 +853,28 @@ a{color:inherit;text-decoration:none;}
   </div>
 </div>
 
+<!-- ═══ NWC LIGHTNING WALLET MODAL ═══ -->
+<div class="mo" id="nwc-modal">
+  <div class="md" style="width:460px;">
+    <div class="md-hdr">
+      <div><div class="md-title">⚡ Lightning Wallet</div><div class="md-sub">For sending zaps</div></div>
+      <button class="md-close" onclick="closeM('nwc-modal')">✕</button>
+    </div>
+    <div class="md-body" id="nwc-body"></div>
+  </div>
+</div>
+
+<!-- ═══ SEND ZAP MODAL ═══ -->
+<div class="mo" id="zap-modal">
+  <div class="md" style="width:380px;">
+    <div class="md-hdr">
+      <div><div class="md-title">⚡ Send a Zap</div><div class="md-sub" id="zap-target-sub">—</div></div>
+      <button class="md-close" onclick="closeM('zap-modal')">✕</button>
+    </div>
+    <div class="md-body" id="zap-body"></div>
+  </div>
+</div>
+
 <!-- ═══ PORTFOLIO MODAL ═══ -->
 <div class="mo" id="port-modal">
   <div class="md" style="width:620px;">
@@ -1084,6 +1108,22 @@ let nPubkey=null, nProfile=null, nSigner=null, nEvents=[], nRelayConns=[];
 let nip46WS=null, nip46Priv=null, nExp=false, ntLoaded=false;
 const DEFAULT_RELAYS=['wss://relay.damus.io','wss://eden.nostr.land','wss://nos.lol','wss://relay.primal.net','wss://nostr.wine'];
 let RELAYS=JSON.parse(localStorage.getItem('mts_relays')||'null')||[...DEFAULT_RELAYS];
+
+// ── NWC (Nostr Wallet Connect / NIP-47) — lightning wallet for zaps ────────
+// The connection string is a bearer secret (like a password/API key for the
+// wallet). It is kept ONLY in this browser's localStorage — it is never sent
+// to proxy.py, never logged, and never leaves the device except in an
+// encrypted (NIP-04) request sent directly to the relay the wallet itself
+// chose. This mirrors how nip46Priv/nsec are already handled above.
+let nwcUri = localStorage.getItem('mts_nwc_uri') || null;
+let nwcWallet = null;   // {pubkey, relay, secret, lud16} parsed from nwcUri
+let nwcBalanceSats = null;
+let nwcWS = null;
+let nwcConnecting = false;
+let nwcZapTarget = null; // {evId, evPub, btn}
+// nwcParseUri is a function declaration further down in this file, so it's
+// hoisted and safe to call here even though it appears textually later.
+if(nwcUri){ try{ nwcWallet = nwcParseUri(nwcUri); }catch{ nwcWallet=null; localStorage.removeItem('mts_nwc_uri'); nwcUri=null; } }
 let cInst=null, cSym=null;
 let btcNetworkHashrate = null; // EH/s
 let btcNetworkHashratePrev = null; // for % change
@@ -4106,7 +4146,7 @@ function renderNPModalTab(tab) {
       <button class="nact reply" style="font-size:10px;padding:2px 7px;" onclick="startReply('${evIdEsc}','${evPubEsc}',${JSON.stringify((ev.content||'').slice(0,80))})">↩ reply<span class="nact-count" data-type="replies" style="color:var(--t3);margin-left:3px;">${r.replies>0?fmtReactCount(r.replies):''}</span></button>
       <button class="nact repost${reposted?' done':''}" style="font-size:10px;padding:2px 7px;" onclick="nRepost('${evIdEsc}','${evPubEsc}',this)">⇄ repost<span class="nact-count" data-type="reposts" style="color:var(--t3);margin-left:3px;">${r.reposts>0?fmtReactCount(r.reposts):''}</span></button>
       <button class="nact like" style="font-size:10px;padding:2px 7px;${liked?'color:var(--red)':''}" onclick="nLike('${evIdEsc}','${evPubEsc}',this)">♥ ${liked?'liked':'like'}<span class="nact-count" data-type="likes" style="color:var(--t3);margin-left:3px;">${r.likes>0?fmtReactCount(r.likes):''}</span></button>
-      <button class="nact" style="font-size:10px;padding:2px 7px;color:var(--t3);" onclick="openNoteView('${evIdEsc}',event)">⚡<span class="nact-count" data-type="zaps" style="color:var(--t3);margin-left:3px;">${r.zapSats>0?fmtSatsShort(r.zapSats):r.zaps>0?fmtReactCount(r.zaps):''}</span></button>
+      <button class="nact" style="font-size:10px;padding:2px 7px;color:var(--t3);" onclick="openZapModal('${evIdEsc}','${evPubEsc}',this)">⚡<span class="nact-count" data-type="zaps" style="color:var(--t3);margin-left:3px;">${r.zapSats>0?fmtSatsShort(r.zapSats):r.zaps>0?fmtReactCount(r.zaps):''}</span></button>
     </div>`;
     return `<div class="np-post-item" data-evid="${evIdEsc}" onclick="closeM('np-modal');openNoteView('${evIdEsc}',event)">
       ${replyHeader}
@@ -5159,7 +5199,9 @@ function renderNS() {
       <div id="relay-add-err" style="font-family:var(--fm);font-size:10px;color:var(--red);min-height:14px;"></div>
       <div style="display:flex;gap:6px;margin-top:6px;">
         <button class="btn" onclick="resetRelays()" style="font-size:10px;">Reset to defaults</button>
-      </div>`;
+      </div>
+      <div class="ssec" style="margin-top:20px;">Lightning Wallet (for Zaps)</div>
+      ${buildNwcSettingsHTML()}`;
   } else {
     el.innerHTML = `
       <div class="ssec">Connect Nostr Account</div>
@@ -5434,6 +5476,7 @@ function buildNExp(){
           <button id="nf-btn-all" class="btn ${nFeedFilter==='all'?'a':''}" style="font-size:9px;padding:2px 8px;" onclick="setNFilter('all')">Posts &amp; Replies</button>
         </div>
         <span id="nfeed-status" style="font-family:var(--fm);font-size:9px;color:var(--t3);margin-left:auto;"></span>
+        <button id="npane-wallet-btn" class="btn" style="font-size:9px;padding:2px 8px;${nwcWallet?'color:var(--gold);border-color:rgba(247,183,49,.4);':''}" onclick="openNwcModal()" title="${nwcWallet?'Lightning wallet connected':'Connect a Lightning wallet to send zaps'}">⚡ ${nwcWallet?'Wallet':'Connect Wallet'}</button>
       </div>
       <div id="nfeed" style="flex:1;overflow-y:auto;display:${nActivePane==='feed'?'block':'none'};"></div>
       <div id="nnotifs" style="flex:1;overflow-y:auto;display:${nActivePane==='notifs'?'block':'none'};"></div>
@@ -5629,7 +5672,7 @@ function renderNppTab(tab) {
       <button class="nact reply" style="font-size:10px;padding:2px 7px;" onclick="startReply('${pIdEsc}','${pPubEsc}',${JSON.stringify((p.content||'').slice(0,80))})">↩ reply<span class="nact-count" data-type="replies" style="color:var(--t3);margin-left:3px;">${r.replies>0?fmtReactCount(r.replies):''}</span></button>
       <button class="nact repost${reposted?' done':''}" style="font-size:10px;padding:2px 7px;" onclick="nRepost('${pIdEsc}','${pPubEsc}',this)">⇄ repost<span class="nact-count" data-type="reposts" style="color:var(--t3);margin-left:3px;">${r.reposts>0?fmtReactCount(r.reposts):''}</span></button>
       <button class="nact like" style="font-size:10px;padding:2px 7px;${liked?'color:var(--red)':''}" onclick="nLike('${pIdEsc}','${pPubEsc}',this)">♥ ${liked?'liked':'like'}<span class="nact-count" data-type="likes" style="color:var(--t3);margin-left:3px;">${r.likes>0?fmtReactCount(r.likes):''}</span></button>
-      <button class="nact" style="font-size:10px;padding:2px 7px;color:var(--t3);" onclick="openNoteView('${pIdEsc}',event)">⚡<span class="nact-count" data-type="zaps" style="color:var(--t3);margin-left:3px;">${r.zapSats>0?fmtSatsShort(r.zapSats):r.zaps>0?fmtReactCount(r.zaps):''}</span></button>
+      <button class="nact" style="font-size:10px;padding:2px 7px;color:var(--t3);" onclick="openZapModal('${pIdEsc}','${pPubEsc}',this)">⚡<span class="nact-count" data-type="zaps" style="color:var(--t3);margin-left:3px;">${r.zapSats>0?fmtSatsShort(r.zapSats):r.zaps>0?fmtReactCount(r.zaps):''}</span></button>
     </div>`;
     return`<div class="np-post-item" data-evid="${pIdEsc}" onclick="openNoteView('${pIdEsc}',event)">
       ${replyHeader}
@@ -6492,7 +6535,7 @@ function renderNFeed(){
           <button class="nact reply" onclick='startReply("${origIdEsc}","${origPubEsc}",${JSON.stringify((origEv.content||'').slice(0,80))})'>↩ reply<span class="nact-count" data-type="replies" style="color:var(--t3);margin-left:3px;">${nFeedReactions[origEv.id]?.replies>0?fmtReactCount(nFeedReactions[origEv.id].replies):''}</span></button>
           <button class="nact repost${reposted?' done':''}" onclick='nRepost("${origIdEsc}","${origPubEsc}",this)'>⇄ repost<span class="nact-count" data-type="reposts" style="color:var(--t3);margin-left:3px;">${nFeedReactions[origEv.id]?.reposts>0?fmtReactCount(nFeedReactions[origEv.id].reposts):''}</span></button>
           <button class="nact like" style="${liked?'color:var(--red)':''}" onclick='nLike("${origIdEsc}","${origPubEsc}",this)'>♥ ${liked?'liked':'like'}<span class="nact-count" data-type="likes" style="color:var(--t3);margin-left:3px;">${nFeedReactions[origEv.id]?.likes>0?fmtReactCount(nFeedReactions[origEv.id].likes):''}</span></button>
-          <button class="nact" style="color:var(--t3);" onclick='openNoteView("${origIdEsc}",event)'>⚡<span class="nact-count" data-type="zaps" style="color:var(--t3);margin-left:3px;">${nFeedReactions[origEv.id]?.zapSats>0?fmtSatsShort(nFeedReactions[origEv.id].zapSats):nFeedReactions[origEv.id]?.zaps>0?fmtReactCount(nFeedReactions[origEv.id].zaps):''}</span></button>
+          <button class="nact" style="color:var(--t3);" onclick='openZapModal("${origIdEsc}","${origPubEsc}",this)'>⚡<span class="nact-count" data-type="zaps" style="color:var(--t3);margin-left:3px;">${nFeedReactions[origEv.id]?.zapSats>0?fmtSatsShort(nFeedReactions[origEv.id].zapSats):nFeedReactions[origEv.id]?.zaps>0?fmtReactCount(nFeedReactions[origEv.id].zaps):''}</span></button>
         </div>
       </div>`;
       return;
@@ -6559,7 +6602,7 @@ function renderNFeed(){
         <button class="nact reply" onclick='startReply("${evId}","${evPub}",${JSON.stringify(e.content.slice(0,80))})'>↩ reply<span class="nact-count" data-type="replies" style="color:var(--t3);margin-left:3px;">${nFeedReactions[e.id]?.replies>0?fmtReactCount(nFeedReactions[e.id].replies):''}</span></button>
         <button class="nact repost${reposted?' done':''}" onclick='nRepost("${evId}","${evPub}",this)'>⇄ repost<span class="nact-count" data-type="reposts" style="color:var(--t3);margin-left:3px;">${nFeedReactions[e.id]?.reposts>0?fmtReactCount(nFeedReactions[e.id].reposts):''}</span></button>
         <button class="nact like" style="${liked?'color:var(--red)':''}" onclick='nLike("${evId}","${evPub}",this)'>♥ ${liked?'liked':'like'}<span class="nact-count" data-type="likes" style="color:var(--t3);margin-left:3px;">${nFeedReactions[e.id]?.likes>0?fmtReactCount(nFeedReactions[e.id].likes):''}</span></button>
-        <button class="nact" style="color:var(--t3);" onclick='openNoteView("${evId}",event)'>⚡<span class="nact-count" data-type="zaps" style="color:var(--t3);margin-left:3px;">${nFeedReactions[e.id]?.zapSats>0?fmtSatsShort(nFeedReactions[e.id].zapSats):nFeedReactions[e.id]?.zaps>0?fmtReactCount(nFeedReactions[e.id].zaps):''}</span></button>
+        <button class="nact" style="color:var(--t3);" onclick='openZapModal("${evId}","${evPub}",this)'>⚡<span class="nact-count" data-type="zaps" style="color:var(--t3);margin-left:3px;">${nFeedReactions[e.id]?.zapSats>0?fmtSatsShort(nFeedReactions[e.id].zapSats):nFeedReactions[e.id]?.zaps>0?fmtReactCount(nFeedReactions[e.id].zaps):''}</span></button>
       </div>
     </div>`;
   });
@@ -7335,6 +7378,7 @@ async function openNoteView(evId, evt){
         <button class="nv-act reply" onclick='startReply("${evIdEsc}","${evPubEsc}",${JSON.stringify(ev.content.slice(0,80))});closeM("nv-modal")'>↩ reply</button>
         <button class="nv-act repost${reposted?' done':''}" id="nva-repost" onclick='nRepost("${evIdEsc}","${evPubEsc}",this)'>⇄ ${reposted?'reposted':'repost'}</button>
         <button class="nv-act like${liked?' done':''}" id="nva-like" onclick='nLike("${evIdEsc}","${evPubEsc}",this)'>♥ ${liked?'liked':'like'}</button>
+        <button class="nv-act zap" id="nva-zap" onclick='openZapModal("${evIdEsc}","${evPubEsc}")'>⚡ zap</button>
       </div>
     </div>
     <div class="nv-replies-hdr">Replies</div>
@@ -7687,18 +7731,41 @@ function updateNVStats(evId,likes,reposts,zaps,zapSats,replies,likers,reposters,
     const ct=buildNContent(ev.content||'');
     const evId=esc(ev.id), evPub=esc(ev.pubkey);
     const preview=ev.content.slice(0,80);
-    return`<div class="nv-reply" style="cursor:pointer;" onclick="openNoteView('${evId}',event)">
+    const rLiked=nLiked.has(ev.id), rReposted=nReposted.has(ev.id);
+    const rr=nFeedReactions[ev.id]||{};
+    return`<div class="nv-reply" data-evid="${evId}" style="cursor:pointer;" onclick="openNoteView('${evId}',event)">
       <div class="nv-reply-meta">
         <div class="nv-reply-av">${avH}</div>
         <span style="font-family:var(--fm);font-size:11px;font-weight:500;color:var(--t0);">${esc(n)}</span>
         <span style="font-family:var(--fm);font-size:10px;color:var(--t3);margin-left:auto;">${timeAgo(new Date(ev.created_at*1000))}</span>
       </div>
       <div style="font-size:12px;color:var(--t1);line-height:1.5;word-break:break-word;margin-bottom:6px;">${ct}</div>
-      <div style="display:flex;gap:4px;">
-        <button class="nv-act reply" style="font-size:10px;padding:3px 8px;" onclick='event.stopPropagation();startReply("${evId}","${evPub}",${JSON.stringify(preview)});closeM("nv-modal")'>↩ reply</button>
+      <div style="display:flex;gap:8px;" onclick="event.stopPropagation()">
+        <button class="nact reply" style="font-size:10px;padding:2px 7px;" onclick='startReply("${evId}","${evPub}",${JSON.stringify(preview)});closeM("nv-modal")'>↩ reply<span class="nact-count" data-type="replies" style="color:var(--t3);margin-left:3px;">${rr.replies>0?fmtReactCount(rr.replies):''}</span></button>
+        <button class="nact repost${rReposted?' done':''}" style="font-size:10px;padding:2px 7px;" onclick='nRepost("${evId}","${evPub}",this)'>⇄ ${rReposted?'reposted':'repost'}<span class="nact-count" data-type="reposts" style="color:var(--t3);margin-left:3px;">${rr.reposts>0?fmtReactCount(rr.reposts):''}</span></button>
+        <button class="nact like" style="font-size:10px;padding:2px 7px;${rLiked?'color:var(--red)':''}" onclick='nLike("${evId}","${evPub}",this)'>♥ ${rLiked?'liked':'like'}<span class="nact-count" data-type="likes" style="color:var(--t3);margin-left:3px;">${rr.likes>0?fmtReactCount(rr.likes):''}</span></button>
+        <button class="nact" style="font-size:10px;padding:2px 7px;color:var(--t3);" onclick='openZapModal("${evId}","${evPub}",this)'>⚡<span class="nact-count" data-type="zaps" style="color:var(--t3);margin-left:3px;">${rr.zapSats>0?fmtSatsShort(rr.zapSats):rr.zaps>0?fmtReactCount(rr.zaps):''}</span></button>
       </div>
     </div>`;
   }).join('');
+  // Debounce + dedup: updateNVStats fires once per incoming relay event while
+  // replies are streaming in, so batch reply IDs across that burst and fetch
+  // their like/repost/zap counts (nact-count badges) only once it settles,
+  // skipping any ID already fetched in the last 5s.
+  if(!updateNVStats._pendingIds) updateNVStats._pendingIds=new Set();
+  sorted.forEach(({ev})=>updateNVStats._pendingIds.add(ev.id));
+  clearTimeout(updateNVStats._frTimer);
+  updateNVStats._frTimer=setTimeout(()=>{
+    const ids=[...updateNVStats._pendingIds].filter(id=>{
+      const lastFetch=nFeedReactionsFetched.get(id)||0;
+      return !lastFetch||(Date.now()-lastFetch>5000);
+    });
+    updateNVStats._pendingIds.clear();
+    if(ids.length){
+      ids.forEach(id=>nFeedReactionsFetched.set(id,Date.now()));
+      for(let i=0;i<ids.length;i+=50) fetchFeedReactions(ids.slice(i,i+50));
+    }
+  },500);
 }
 
 // ═══════════════════════════════════════════════════════
@@ -7837,15 +7904,20 @@ function renderNVReplies(){
     const ct=buildNContent(ev.content||'');
     const evId=esc(ev.id), evPub=esc(ev.pubkey);
     const preview=ev.content.slice(0,80);
-    return`<div class="nv-reply" style="cursor:pointer;" onclick="openNoteView('${evId}',event)">
+    const rLiked=nLiked.has(ev.id), rReposted=nReposted.has(ev.id);
+    const rr=nFeedReactions[ev.id]||{};
+    return`<div class="nv-reply" data-evid="${evId}" style="cursor:pointer;" onclick="openNoteView('${evId}',event)">
       <div class="nv-reply-meta">
         <div class="nv-reply-av">${avH}</div>
         <span style="font-family:var(--fm);font-size:11px;font-weight:500;color:var(--t0);">${esc(n)}</span>
         <span style="font-family:var(--fm);font-size:10px;color:var(--t3);margin-left:auto;">${timeAgo(new Date(ev.created_at*1000))}</span>
       </div>
       <div style="font-size:12px;color:var(--t1);line-height:1.55;word-break:break-word;margin-bottom:6px;">${ct}</div>
-      <div style="display:flex;gap:4px;">
-        <button class="nv-act reply" style="font-size:10px;padding:3px 8px;" onclick='event.stopPropagation();startReply("${evId}","${evPub}",${JSON.stringify(preview)});closeM("nv-modal")'>↩ reply</button>
+      <div style="display:flex;gap:8px;" onclick="event.stopPropagation()">
+        <button class="nact reply" style="font-size:10px;padding:2px 7px;" onclick='startReply("${evId}","${evPub}",${JSON.stringify(preview)});closeM("nv-modal")'>↩ reply<span class="nact-count" data-type="replies" style="color:var(--t3);margin-left:3px;">${rr.replies>0?fmtReactCount(rr.replies):''}</span></button>
+        <button class="nact repost${rReposted?' done':''}" style="font-size:10px;padding:2px 7px;" onclick='nRepost("${evId}","${evPub}",this)'>⇄ ${rReposted?'reposted':'repost'}<span class="nact-count" data-type="reposts" style="color:var(--t3);margin-left:3px;">${rr.reposts>0?fmtReactCount(rr.reposts):''}</span></button>
+        <button class="nact like" style="font-size:10px;padding:2px 7px;${rLiked?'color:var(--red)':''}" onclick='nLike("${evId}","${evPub}",this)'>♥ ${rLiked?'liked':'like'}<span class="nact-count" data-type="likes" style="color:var(--t3);margin-left:3px;">${rr.likes>0?fmtReactCount(rr.likes):''}</span></button>
+        <button class="nact" style="font-size:10px;padding:2px 7px;color:var(--t3);" onclick='openZapModal("${evId}","${evPub}",this)'>⚡<span class="nact-count" data-type="zaps" style="color:var(--t3);margin-left:3px;">${rr.zapSats>0?fmtSatsShort(rr.zapSats):rr.zaps>0?fmtReactCount(rr.zaps):''}</span></button>
       </div>
     </div>`;
   }).join('');
@@ -7977,6 +8049,322 @@ function nLogout(){
   const nu=document.getElementById('n-user');if(nu){nu.textContent='';nu.style.display='none';}
   document.getElementById('n-relays').textContent='';nRelayConns=[];
   if(nExp)buildNExp();
+}
+
+// ═══════════════════════════════════════════════════════
+//  NWC (NOSTR WALLET CONNECT) — lightning wallet + zaps
+// ═══════════════════════════════════════════════════════
+
+// Parse a "nostr+walletconnect://<pubkey>?relay=wss://...&secret=hex&lud16=..." string.
+function nwcParseUri(uri){
+  try{
+    const u = uri.trim();
+    if(!/^nostr\+walletconnect:\/\//i.test(u)) throw new Error('Not an NWC connection string (should start with nostr+walletconnect://)');
+    const withoutScheme = u.replace(/^nostr\+walletconnect:\/\//i,'');
+    const qIdx = withoutScheme.indexOf('?');
+    const pubkey = (qIdx===-1?withoutScheme:withoutScheme.slice(0,qIdx)).toLowerCase();
+    if(!/^[0-9a-f]{64}$/.test(pubkey)) throw new Error('Invalid wallet pubkey in connection string');
+    const params = new URLSearchParams(qIdx===-1?'':withoutScheme.slice(qIdx+1));
+    const relay = params.get('relay');
+    const secret = params.get('secret');
+    const lud16 = params.get('lud16')||'';
+    if(!relay) throw new Error('Missing relay in connection string');
+    if(!secret || !/^[0-9a-f]{64}$/.test(secret)) throw new Error('Missing or invalid secret in connection string');
+    return {pubkey, relay, secret, lud16};
+  }catch(e){ throw e; }
+}
+
+// Persist + activate a wallet connection. Stored ONLY in localStorage — see note above.
+async function nwcSaveConnection(uri, statusEl){
+  const parsed = nwcParseUri(uri); // throws on invalid input
+  nwcUri = uri.trim();
+  nwcWallet = parsed;
+  nwcBalanceSats = null;
+  localStorage.setItem('mts_nwc_uri', nwcUri);
+  if(statusEl) statusEl.textContent = '⏳ Testing connection...';
+  try{
+    await loadNT();
+    const info = await nwcRequest('get_info', {}, 12000).catch(()=>null);
+    const bal = await nwcRequest('get_balance', {}, 12000).catch(()=>null);
+    if(bal && typeof bal.balance === 'number') nwcBalanceSats = Math.floor(bal.balance/1000);
+    if(statusEl) statusEl.textContent = '✓ Wallet connected'+(info?.alias?` (${info.alias})`:'');
+  }catch(e){
+    if(statusEl) statusEl.textContent = '⚠️ Saved, but could not verify: '+e.message;
+  }
+  renderNS(); _refreshWalletBtn();
+}
+
+function nwcDisconnect(){
+  if(!confirm('Disconnect this Lightning wallet? You can reconnect any time with a new or the same connection string.')) return;
+  nwcUri=null; nwcWallet=null; nwcBalanceSats=null;
+  localStorage.removeItem('mts_nwc_uri');
+  if(nwcWS){ try{nwcWS.close();}catch{} nwcWS=null; }
+  renderNS(); _refreshWalletBtn();
+  const b=document.getElementById('nwc-body'); if(b) renderNwcModalBody();
+}
+
+function _refreshWalletBtn(){
+  const btn=document.getElementById('npane-wallet-btn');
+  if(!btn) return;
+  btn.style.color = nwcWallet ? 'var(--gold)' : '';
+  btn.style.borderColor = nwcWallet ? 'rgba(247,183,49,.4)' : '';
+  btn.title = nwcWallet ? 'Lightning wallet connected' : 'Connect a Lightning wallet to send zaps';
+  btn.textContent = '⚡ '+(nwcWallet?'Wallet':'Connect Wallet');
+}
+
+// Low-level NIP-47 request/response over the wallet's relay.
+// Encrypts `params` with NIP-04 using the connection secret as our key and the
+// wallet's pubkey as the recipient, publishes a kind:23194 event, and waits for
+// the matching kind:23195 response (tagged with our request's event id).
+function nwcRequest(method, params, timeoutMs){
+  return new Promise(async (resolve, reject)=>{
+    if(!nwcWallet) return reject(new Error('No wallet connected'));
+    try{
+      await loadNT();
+      const content = JSON.stringify({method, params: params||{}});
+      const enc = await window.NostrTools.nip04.encrypt(nwcWallet.secret, nwcWallet.pubkey, content);
+      const reqEv = window.NostrTools.finalizeEvent({
+        kind:23194, created_at:Math.floor(Date.now()/1000),
+        tags:[['p', nwcWallet.pubkey]], content:enc
+      }, nwcWallet.secret);
+
+      let ws, done=false, timer;
+      const cleanup=()=>{ done=true; clearTimeout(timer); try{ws.close();}catch{} };
+      timer = setTimeout(()=>{ if(!done){ cleanup(); reject(new Error('Wallet did not respond in time')); } }, timeoutMs||20000);
+
+      ws = new WebSocket(nwcWallet.relay);
+      ws.onopen = ()=>{
+        ws.send(JSON.stringify(['REQ', 'nwc-'+reqEv.id.slice(0,10), {kinds:[23195], authors:[nwcWallet.pubkey], '#e':[reqEv.id]}]));
+        ws.send(JSON.stringify(['EVENT', reqEv]));
+      };
+      ws.onmessage = async (msg)=>{
+        if(done) return;
+        try{
+          const m = JSON.parse(msg.data);
+          if(m[0]!=='EVENT') return;
+          const ev = m[2];
+          if(!ev || ev.kind!==23195) return;
+          if(!ev.tags?.some(t=>t[0]==='e' && t[1]===reqEv.id)) return;
+          const dec = await window.NostrTools.nip04.decrypt(nwcWallet.secret, nwcWallet.pubkey, ev.content);
+          const payload = JSON.parse(dec);
+          cleanup();
+          if(payload.error) reject(new Error(payload.error.message || payload.error.code || 'Wallet error'));
+          else resolve(payload.result || {});
+        }catch(e){ /* ignore malformed */ }
+      };
+      ws.onerror = ()=>{ if(!done){ cleanup(); reject(new Error('Relay connection error')); } };
+    }catch(e){ reject(e); }
+  });
+}
+
+async function nwcPayInvoice(bolt11){
+  return nwcRequest('pay_invoice', {invoice: bolt11}, 45000);
+}
+
+// ── Wallet Connect modal (setup / manage) ─────────────────────────────────
+function openNwcModal(){ renderNwcModalBody(); openM('nwc-modal'); }
+
+function buildNwcSettingsHTML(){
+  if(nwcWallet){
+    return `<div class="nc-card" style="border-color:rgba(247,183,49,.25);">
+      <div class="nc-av"><div style="width:100%;height:100%;background:var(--bg-4);display:flex;align-items:center;justify-content:center;font-size:16px;">⚡</div></div>
+      <div><div style="font-size:13px;font-weight:600;color:var(--t0);">Wallet Connected</div><div style="font-family:var(--fm);font-size:10px;color:var(--gold);margin-top:2px;">${nwcBalanceSats!==null?fmtSats(nwcBalanceSats)+' available':'Ready to zap'}</div></div>
+      <button class="btn" style="margin-left:auto;" onclick="openNwcModal()">Manage</button>
+    </div>`;
+  }
+  return `<div class="nm-card" onclick="openNwcModal()"><span style="font-size:18px;">⚡</span><div style="flex:1;"><div style="font-size:12px;font-weight:600;color:var(--t0);margin-bottom:2px;">Connect a Lightning Wallet</div><div style="font-size:11px;color:var(--t2);">Send zaps straight from this dashboard.</div></div><span class="nbadge bs">SET UP</span></div>`;
+}
+
+function renderNwcModalBody(){
+  const b = document.getElementById('nwc-body');
+  if(!b) return;
+  if(nwcWallet){
+    b.innerHTML = `
+      <div class="nc-card" style="border-color:rgba(247,183,49,.25);">
+        <div class="nc-av"><div style="width:100%;height:100%;background:var(--bg-4);display:flex;align-items:center;justify-content:center;font-size:16px;">⚡</div></div>
+        <div><div style="font-size:13px;font-weight:600;color:var(--t0);">Wallet Connected</div><div style="font-family:var(--fm);font-size:10px;color:var(--t2);margin-top:2px;" id="nwc-balance-lbl">${nwcBalanceSats!==null?fmtSats(nwcBalanceSats)+' available':'Balance unknown'}</div></div>
+      </div>
+      <div class="info">Zaps sent from this dashboard will draw directly from this wallet over your chosen relay. This connection string is stored only in this browser.</div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <button class="btn" onclick="nwcCheckBalance()">↻ Check Balance</button>
+        <button class="btn" onclick="renderNwcModalBody_change()">Change Wallet</button>
+        <button class="btn" style="border-color:rgba(255,90,90,.4);color:var(--red);" onclick="nwcDisconnect()">Disconnect</button>
+      </div>
+      <div id="nwc-modal-status" style="font-family:var(--fm);font-size:11px;color:var(--t2);margin-top:10px;"></div>`;
+  } else {
+    renderNwcModalBody_change();
+  }
+}
+
+function renderNwcModalBody_change(){
+  const b = document.getElementById('nwc-body');
+  if(!b) return;
+  b.innerHTML = `
+    <div class="info">Connect an existing Lightning wallet so you can zap posts from here. Your wallet stays in full control of your funds — this dashboard only ever asks it to pay an invoice, and can be disconnected any time.</div>
+    <details style="margin-bottom:10px;"><summary style="cursor:pointer;font-family:var(--fm);font-size:11px;color:var(--accent);margin-bottom:6px;">📱 Primal Wallet — where do I find this?</summary>
+      <div style="font-size:11px;color:var(--t2);line-height:1.6;padding:8px 4px;">Open Primal → Settings → Connected Wallets (or, in the mobile Primal Wallet, Settings → Nostr Wallet Connect) → <strong>New Connection</strong>, name it "Monitor", then copy the string it gives you and paste it below.</div>
+    </details>
+    <details style="margin-bottom:10px;"><summary style="cursor:pointer;font-family:var(--fm);font-size:11px;color:var(--accent);margin-bottom:6px;">⚡ Zeus Wallet — where do I find this?</summary>
+      <div style="font-size:11px;color:var(--t2);line-height:1.6;padding:8px 4px;">Open Zeus → Tools → <strong>Nostr Wallet Connect</strong> → Add Connection, name it "Monitor", set a budget if you'd like, then copy the connection string and paste it below.</div>
+    </details>
+    <details style="margin-bottom:14px;"><summary style="cursor:pointer;font-family:var(--fm);font-size:11px;color:var(--accent);margin-bottom:6px;">Other wallets (Strike, Alby, Coinos, LNbits...)</summary>
+      <div style="font-size:11px;color:var(--t2);line-height:1.6;padding:8px 4px;">Any wallet or service that supports "Nostr Wallet Connect" / NIP-47 works the same way — look for that setting and copy the connection string. Strike and Phoenix don't offer this natively yet; Strike users can use a small bridge service, and Phoenix currently has no NWC option.</div>
+    </details>
+    <div class="fgrp">
+      <label class="flbl">Wallet Connection String</label>
+      <input class="fin" type="password" id="nwc-uri-in" placeholder="nostr+walletconnect://..." style="font-family:var(--fm);font-size:11px;">
+    </div>
+    <div style="display:flex;gap:8px;justify-content:flex-end;">
+      ${nwcWallet?'<button class="btn" onclick="renderNwcModalBody()">Cancel</button>':''}
+      <button class="btn-p" onclick="nwcConnectFromInput()">Connect Wallet</button>
+    </div>
+    <div id="nwc-modal-status" style="margin-top:10px;font-family:var(--fm);font-size:11px;color:var(--t2);"></div>
+    <div style="margin-top:16px;font-family:var(--fm);font-size:9px;color:var(--t3);line-height:1.6;">🔒 This connection string acts like a password for your wallet. It's stored only in this browser's local storage — never sent to any server, never included if you share this project's code. Use "Disconnect" any time to remove it, or revoke it from your wallet's own settings.</div>`;
+}
+
+async function nwcConnectFromInput(){
+  const input = document.getElementById('nwc-uri-in');
+  const st = document.getElementById('nwc-modal-status');
+  const val = input?.value.trim();
+  if(!val){ if(st){st.textContent='Paste your connection string first.';st.style.color='var(--red)';} return; }
+  if(st){ st.textContent='⏳ Connecting...'; st.style.color='var(--t2)'; }
+  try{
+    await nwcSaveConnection(val, st);
+    setTimeout(renderNwcModalBody, 500);
+  }catch(e){
+    if(st){ st.textContent='❌ '+e.message; st.style.color='var(--red)'; }
+  }
+}
+
+async function nwcCheckBalance(){
+  const st = document.getElementById('nwc-modal-status');
+  if(st){ st.textContent='⏳ Checking balance...'; }
+  try{
+    const bal = await nwcRequest('get_balance', {}, 12000);
+    if(typeof bal.balance==='number'){
+      nwcBalanceSats = Math.floor(bal.balance/1000);
+      const lbl=document.getElementById('nwc-balance-lbl'); if(lbl) lbl.textContent = fmtSats(nwcBalanceSats)+' available';
+      if(st) st.textContent = '✓ Updated';
+      renderNS();
+    }
+  }catch(e){ if(st) st.textContent='❌ '+e.message; }
+}
+
+// ── Sending a zap (NIP-57) ─────────────────────────────────────────────────
+async function openZapModal(evId, evPub, btn){
+  nwcZapTarget = {evId, evPub, btn};
+  const prof = nProfiles[evPub] || (evPub===nPubkey?nProfile:null);
+  document.getElementById('zap-target-sub').textContent = 'to '+(prof?.name||trunc(evPub));
+  const body = document.getElementById('zap-body');
+
+  if(!nPubkey){
+    body.innerHTML = `<div class="warn">Connect your Nostr account first — zaps are signed by your identity.</div><div style="display:flex;justify-content:flex-end;"><button class="btn-p" onclick="closeM('zap-modal');openSettings('nostr')">Connect Nostr</button></div>`;
+    openM('zap-modal'); return;
+  }
+  if(!nwcWallet){
+    body.innerHTML = `<div class="warn">Connect a Lightning wallet first so zaps have somewhere to send sats from.</div><div style="display:flex;justify-content:flex-end;"><button class="btn-p" onclick="closeM('zap-modal');openNwcModal()">Connect Wallet</button></div>`;
+    openM('zap-modal'); return;
+  }
+  if(!prof || (!prof.lud16 && !prof.lud06)){
+    // Try a quick fetch in case profile just wasn't cached yet
+    await fetchNProfiles([evPub]).catch(()=>{});
+  }
+  const prof2 = nProfiles[evPub];
+  if(!prof2 || (!prof2.lud16 && !prof2.lud06)){
+    body.innerHTML = `<div class="warn">This person hasn't set up a Lightning address on their profile, so they can't receive zaps yet.</div>`;
+    openM('zap-modal'); return;
+  }
+
+  body.innerHTML = `
+    <div class="fgrp">
+      <label class="flbl">Amount (sats)</label>
+      <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;" id="zap-preset-row">
+        ${[21,100,500,1000,5000,21000].map(a=>`<button class="btn zap-preset" data-amt="${a}" onclick="pickZapAmt(${a})" style="font-size:10px;">${a>=1000?(a/1000)+'k':a}</button>`).join('')}
+      </div>
+      <input class="fin" id="zap-amt-in" type="number" min="1" value="21" style="font-family:var(--fm);">
+    </div>
+    <div class="fgrp">
+      <label class="flbl">Comment (optional)</label>
+      <input class="fin" id="zap-comment-in" placeholder="Nice post!" maxlength="200">
+    </div>
+    <div style="display:flex;gap:8px;justify-content:flex-end;">
+      <button class="btn" onclick="closeM('zap-modal')">Cancel</button>
+      <button class="btn-p" id="zap-send-btn" onclick="sendZap()">⚡ Send Zap</button>
+    </div>
+    <div id="zap-status" style="margin-top:10px;font-family:var(--fm);font-size:11px;color:var(--t2);"></div>`;
+  openM('zap-modal');
+}
+
+function pickZapAmt(a){
+  const inp=document.getElementById('zap-amt-in'); if(inp) inp.value=a;
+  document.querySelectorAll('.zap-preset').forEach(b=>b.classList.toggle('a', Number(b.dataset.amt)===a));
+}
+
+async function sendZap(){
+  const {evId, evPub, btn} = nwcZapTarget||{};
+  if(!evId) return;
+  const amtSats = Math.max(1, Math.floor(Number(document.getElementById('zap-amt-in')?.value)||0));
+  const comment = document.getElementById('zap-comment-in')?.value.trim()||'';
+  const st = document.getElementById('zap-status');
+  const sendBtn = document.getElementById('zap-send-btn');
+  if(!amtSats){ if(st) st.textContent='Enter a valid amount.'; return; }
+
+  if(sendBtn) sendBtn.disabled=true;
+  if(st){ st.textContent='⏳ Fetching invoice...'; st.style.color='var(--t2)'; }
+  try{
+    const prof = nProfiles[evPub];
+    const lnAddr = prof.lud16 || null;
+    let lnurlPayUrl;
+    if(lnAddr){
+      const [name, domain] = lnAddr.split('@');
+      if(!name || !domain) throw new Error('Invalid lightning address on profile');
+      lnurlPayUrl = `https://${domain}/.well-known/lnurlp/${name}`;
+    } else {
+      await loadNT();
+      const dec = window.NostrTools.nip19.decode(prof.lud06);
+      lnurlPayUrl = new TextDecoder().decode(dec.data);
+    }
+
+    const lnurlRes = await fetch(`${PROXY}/proxy/${lnurlPayUrl}`).then(r=>r.json());
+    if(lnurlRes.status==='ERROR') throw new Error(lnurlRes.reason||'Wallet service rejected the request');
+    const amountMsat = amtSats*1000;
+    if(lnurlRes.minSendable && amountMsat<lnurlRes.minSendable) throw new Error(`Minimum is ${Math.ceil(lnurlRes.minSendable/1000)} sats`);
+    if(lnurlRes.maxSendable && amountMsat>lnurlRes.maxSendable) throw new Error(`Maximum is ${Math.floor(lnurlRes.maxSendable/1000)} sats`);
+
+    let callbackUrl = lnurlRes.callback;
+    const qs = new URLSearchParams({amount:String(amountMsat)});
+
+    // NIP-57: attach a signed zap request so the receipt links back to this note/author
+    if(lnurlRes.allowsNostr && lnurlRes.nostrPubkey){
+      const zapReq = {
+        kind:9734, created_at:Math.floor(Date.now()/1000), pubkey:nPubkey,
+        tags:[['relays',...RELAYS.slice(0,4)],['amount',String(amountMsat)],['p',evPub],['e',evId]],
+        content:comment
+      };
+      let signedZap;
+      if(nSigner==='extension'&&window.nostr) signedZap=await window.nostr.signEvent(zapReq);
+      else if(nSigner==='nsec'&&window._nPriv){ await loadNT(); signedZap=window.NostrTools.finalizeEvent(zapReq,window._nPriv); }
+      else throw new Error('Zaps need your Nostr signer (extension or nsec) to sign the zap request.');
+      qs.set('nostr', JSON.stringify(signedZap));
+    } else if(comment){
+      qs.set('comment', comment.slice(0, lnurlRes.commentAllowed||0));
+    }
+
+    const sep = callbackUrl.includes('?') ? '&' : '?';
+    const invRes = await fetch(`${PROXY}/proxy/${callbackUrl}${sep}${qs.toString()}`).then(r=>r.json());
+    if(invRes.status==='ERROR' || !invRes.pr) throw new Error(invRes.reason||'Could not get an invoice');
+
+    if(st) st.textContent='⏳ Paying via wallet...';
+    await nwcPayInvoice(invRes.pr);
+
+    if(st){ st.textContent='✓ Zap sent!'; st.style.color='var(--green)'; }
+    if(btn && btn.classList) btn.classList.add('zap-sent');
+    setTimeout(()=>closeM('zap-modal'), 1200);
+  }catch(e){
+    if(st){ st.textContent='❌ '+e.message; st.style.color='var(--red)'; }
+  }finally{
+    if(sendBtn) sendBtn.disabled=false;
+  }
 }
 
 // ═══════════════════════════════════════════════════════
