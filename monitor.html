@@ -1,4 +1,4 @@
-<!-- Monitor The Situation v2.4 — 2026-03-05 — hashrate charts, NIP-46 fix, portfolio edit, news cleanup -->
+<!-- Monitor The Situation v2.9.13 — 2026-08-17 — NWC: fixed a race where two NWC requests in flight at once could make a real payment go unanswered. nwcAutoRefreshOnLoad (v2.9.10) fires a background get_balance check on every page load, which — being a full nwcRequest call — can retry for a while if its first attempt hits a flaky connection. If the user opened the wallet and hit Pay while that background check was still retrying, BOTH requests targeted the same relay, and the shared per-relay socket pool (v2.9.8) multiplexes concurrent callers onto one WebSocket by design — so the wallet service received a pay_invoice and a get_balance request interleaved on the same connection. That matches this session's exact symptom: relay accepted the request (OK true), then silence until timeout, reproducing identically across two different wallets/relays — a strong sign the trigger was on our side (timing), not the wallet's. NIP-47 is fundamentally request/reply; a wallet not built to juggle two concurrent requests over one connection can end up answering neither. nwcRequest is now serialized through a promise-chain mutex (_nwcRequestQueue) so every call — background refresh, manual balance checks, payments — runs one at a time in call order, never overlapping on the shared connection. To keep this queue from making a real payment wait behind a slow background nicety, nwcAutoRefreshOnLoad also now makes just ONE short attempt (new maxPasses param, 8s vs. the usual 16s + 2-pass retry) instead of potentially occupying the queue for up to ~35s. — v2.9.12 — 2026-08-17 — NWC: balance/budget now persists across sessions via a localStorage cache, so a hard refresh shows the last-known figures immediately instead of "Balance unknown" while waiting on (or if it fails to get) a fresh get_balance round-trip. Previously nwcBalanceSats was purely an in-memory variable, reset to null on every page load — nwcAutoRefreshOnLoad (v2.9.10) helped by kicking off a live check on startup, but that check can take several seconds or fail outright (per this file's extensive NWC-reliability history), and the panel had nothing to show in the meantime. Now _nwcApplyBalanceResult writes {sats, maxAmount, budgetRenewal, at} to localStorage (mts_nwc_last_balance) on every successful live check, and that cache is read back in synchronously at startup — before any UI renders — so the wallet-manage panel opens with real numbers right away. A new nwcBalanceIsLive flag tracks whether THIS session has actually confirmed the balance yet; until it has, the manage panel tags the figure "(last known)" so a stale cached number is never mistaken for a live-confirmed one. Cache is cleared on disconnect and on connecting a new/changed wallet (nwcSaveConnection), since a stale balance would otherwise belong to the wrong wallet. nwcAutoRefreshOnLoad also now re-renders an already-open wallet-manage panel (not just the compact balance labels) once the live check lands, since the budget line is baked into that panel's innerHTML and doesn't update from the live text-patch alone. — v2.9.11 — NWC: dropped the "Budget not reported by this wallet" fallback line entirely. The displayed sats figure is already the connection's spending budget (wallets like Alby/Zeus cap the reported "balance" to the remaining per-connection budget — see v2.9.9's note), so a separate "not reported" caveat next to it was just confusing noise, not new information. When nwcWallet.maxAmount isn't explicitly present, budgetLine now renders empty instead of a line implying something is missing. — v2.9.10 — NWC: budget/balance now auto-refreshes on page load for an already-connected wallet, instead of staying stuck at "Budget not reported" until a manual "Check Balance" click. On startup nwcWallet was only ever reconstituted by re-parsing the saved connection STRING (nwcParseUri) — the actual get_balance round-trip that populates nwcBalanceSats and nwcWallet.maxAmount/budgetRenewal (via _nwcApplyBalanceResult, added in v2.9.9) only ran from a manual balance check or from re-entering the connection string. So every fresh page load showed the wallet as connected but with a budget the wallet in fact reports — this app just hadn't asked yet. Added nwcAutoRefreshOnLoad(), fired non-blocking from init() alongside the existing restoreNSession() call, which runs one silent get_balance on startup and re-renders the wallet strip/settings/manage panes so the real figures appear without user action. — v2.9.9 — NWC: fixed "Budget not reported" showing next to a balance figure that WAS the budget. nwcWallet.maxAmount was only ever populated from the (non-standard, rarely-used) max_amount/budget query params on the connection URI. Several wallet-service implementations (e.g. Alby's NWC service, whose BalanceResponse carries max_amount/budget_renewal — and apparently Zeus's too) instead report the budget by including it directly in the get_balance RESPONSE, and cap the reported "balance" itself to the connection's remaining budget rather than the wallet's true balance — confirmed by a real case where a 507-sat wallet with a 500-sat connection budget reported "balance": 500000 msats. The panel was reading that 500 as "sats available" while separately declaring the budget "not reported," which is self-contradictory: that number effectively IS the budget. Added _nwcApplyBalanceResult() to also read max_amount/budget_renewal out of the get_balance result (msats, same as balance) in both nwcSaveConnection and nwcCheckBalance, and reworded the budget explainer text since "most wallets don't report it" is no longer accurate. — v2.9.8 — NWC: fixed excessive WebSocket churn against the wallet's own relay. — NWC: fixed excessive WebSocket churn against the wallet's own relay. A single "test connection" (nwcSaveConnection) was opening up to 5 independent raw WebSockets to the same relay within ~7s — one invisible kind:13194 info-probe socket (nwcAdvertisedSchemes -> _nwcFetchInfoEvent) to pick an encryption scheme, a fresh socket per scheme tried for get_info, and a fresh socket per pass/retry for get_balance — because _nwcAttemptOnRelay, _nwcFetchInfoEvent, and _nwcRelayControlCheck each always called `new WebSocket(relayUrl)` and tore the connection down again when done, even when the very next line of code was about to talk to the identical relay. Rapid repeat handshakes like that are a well-known trigger for transient connection resets, which presented as intermittent "Relay connection error" sitting right next to a successful reply from the SAME relay moments earlier — indistinguishable from relay flakiness unless you counted the sockets. Added a shared per-relay WebSocket pool (_nwcPoolAcquire/_nwcPoolRelease/_nwcPoolEntry/_nwcPoolRoute): the info probe, get_info, and get_balance now reuse one already-open socket per relay (kept warm for 15s after last use), with subscriptions/publishes multiplexed over it by sub-id/event-id and NIP-42 AUTH handled once per socket instead of once per request. This is the same class of fix already applied to the feed/notification relays in v2.9 (single-flight reconnects) — it just hadn't been applied to the NWC path yet. — v2.9.7 — NWC: fixed silent wrong-wallet testing + softened overconfident IP-throttling claims. (1) A password-manager-vulnerable connection-string field could have a freshly pasted string silently overridden by a saved credential, with zero indication anything was wrong — added a live "→ will test: relay(s) / lud16 / wallet suffix" preview as you type (before you even click Connect), autocomplete="new-password" to discourage autofill, and a "parsed connection: ..." line now stamped at the top of every debug log so a mismatch is undeniable after the fact too. (2) Re-applied the relay panel + a retry button to the entry/error view (was connected-view-only, so it was unreachable after a failed test) — the button is now explicitly labeled with the exact relay(s) it retries, so it can't be mistaken for testing whatever's currently pasted in the field above it. (3) Error hints no longer confidently assert relay.primal.net-specific IP throttling as the cause — now framed as "this relay/network path is unreliable for this connection right now," since the same failure pattern has now reproduced across a different wallet (Zeus) and relay (damus.io) on this connection. — v2.9.5 — NWC: user-selectable relays. Every NWC network call (request, info-event probe, control check) now routes through _nwcAllRelays(), the union of the connection string's own relay(s) with a new user-managed nwcExtraRelays list (persisted in mts_nwc_extra_relays). New relay panel in the wallet-manage pane: shows the wallet's own relay(s) read-only, lets you quick-add any of the app's current Nostr feed relays (RELAYS), or type a custom wss:// relay, with remove buttons for each extra. UI is explicit about the constraint: the wallet SERVICE only listens on relay(s) it was configured with, so an added relay only helps if the wallet happens to also listen there — it can't make a wallet that's only ever published to its own relay (e.g. Primal's custodial wallet) start answering somewhere new. — v2.9.4 — NWC liveness check now includes a control test: when the kind:13194 info-event presence probe is still inconclusive after 2 tries (relay not completing subscriptions), a new `_nwcRelayControlCheck()` fires a totally generic, wallet-unrelated subscription (REQ with just a limit, no filter) at the same relay. If that ALSO gets no EOSE, it conclusively proves the relay itself is failing to complete subscriptions for this connection right now — not the wallet. If the control succeeds, the miss is narrowed down to something specific to the wallet/connection instead. The error hint now branches on this control result instead of always giving the same "could be relay or wallet" hedge. — v2.9.3 — NWC wallet-liveness check hardened: the kind:13194 info-event presence probe (used to tell "wallet service is dead" apart from "wallet is alive but silent" on a "did not respond in time" failure) was a single 4s attempt against relay.primal.net, which under any load misses EOSE and falls back to a vague "inconclusive" hint that reads identically to "we didn't check." New `_nwcCheckWalletAlive()` retries once with a longer 8s window before giving up, and the debug log now shows exactly what each attempt found instead of silently swallowing the first miss. The "still inconclusive" hint text now says explicitly that the relay itself — not the wallet — is what's being unreliable. — v2.9.2 — NWC bugfix: v2.9.1 accidentally left TWO `openTimer = setTimeout(...)` assignments in _nwcAttemptOnRelay. Only the second (later) one was ever stored in `openTimer`, so ws.onopen's clearTimeout(openTimer) only cancelled that one — the FIRST timer (a 3-6s handshake guard) was orphaned and kept running even after the socket opened, the relay accepted the request, and the wallet was mid-reply. It fired regardless and force-failed the attempt with "Could not open relay connection (handshake timed out)", which is why retries kept dying right after "relay accepted request, waiting for wallet reply..." even on fresh IPs — it was never a relay/rate-limit issue. Removed the stray duplicate assignment; only one handshake-guard timer is created now. — v2.9.1: NWC diagnosis fix: stuck WebSocket handshakes (relay.primal.net IP rate-limit symptom) are now ACTUALLY reported as "Could not open relay connection" — v2.9's handshake guard tied with the request timer at budgets under 9s and lost the race, so every stuck handshake was mislabeled "Wallet did not respond in time" and triggered the misleading dead-connection probe. Socket-level failures also no longer spray the remaining encryption schemes at an unreachable relay (they break to the backoff pass instead), and the relay-unreachable hint now explains the rate-limit cause + remedy. — v2.9: (1) connect-error box no longer wiped 900ms after render (re-render now only fires when the wallet ACTUALLY answered), (2) kind:13194 presence probe now distinguishes "relay answered, no event" (=dead) from "relay unreachable" (=unknown) — an unreachable probe no longer cries "dead connection" on healthy strings, (3) stuck WebSocket handshakes (IP rate-limit symptom) now fail fast as a retryable socket error instead of burning the whole budget as a fake "wallet did not respond". Feed/notification relay fixes: single-flight reconnects (watchdog/CLOSED closes no longer double-spawn replacement sockets via onclose) + a feed-generation epoch so reconnectFeed()/removeRelay() teardowns can't leave ghost sockets reconnecting to removed relays — the churn that was getting the client IP rate-limited on relay.primal.net. Also: profile-fetch TDZ ReferenceError fixed (seen-but-pictureless profiles can backfill again). -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -250,7 +250,7 @@ a{color:inherit;text-decoration:none;}
 .lp-desc{font-size:10px;color:var(--t2);margin-top:2px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;}
 /* Video embeds */
 .nv-video{max-width:100%;border-radius:6px;margin-top:8px;max-height:240px;}
-.wli{display:grid;grid-template-columns:1fr 90px 92px 70px;align-items:center;padding:10px 14px;border-bottom:1px solid var(--border);cursor:pointer;transition:background .12s;gap:6px;}
+.wli{display:grid;grid-template-columns:1fr 90px 92px 70px;align-items:center;padding:5px 14px;border-bottom:1px solid var(--border);cursor:pointer;transition:background .12s;gap:6px;}
 .wli:hover{background:var(--bg-2);}
 .wli:last-child{border-bottom:none;}
 .wli-name{font-size:12px;font-weight:500;color:var(--t0);}
@@ -260,8 +260,8 @@ a{color:inherit;text-decoration:none;}
 .wli-chg.pos{color:var(--green);background:var(--gd);}
 .wli-chg.neg{color:var(--red);background:var(--rd);}
 .wli-chg.neu{color:var(--t2);background:var(--bg-3);}
-.wli-spark{height:30px;}
-.wli-spark canvas{width:80px!important;height:30px!important;}
+.wli-spark{height:40px;}
+.wli-spark canvas{width:88px!important;height:40px!important;}
 /* special rows */
 .wli.portfolio-row .wli-name{color:var(--gold);}
 .wli.mining-row .wli-name{color:var(--bitcoin);}
@@ -491,6 +491,7 @@ a{color:inherit;text-decoration:none;}
   <button class="btn" id="nostr-hdr-btn" onclick="openSettings('nostr')">
     <span id="nhd" style="display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--t3);margin-right:4px;vertical-align:middle;"></span>Nostr
   </button>
+  <button class="btn" id="lightning-hdr-btn" onclick="openLnModal()" title="Pay a lightning address or invoice · manage your wallet">⚡ Lightning</button>
   <button class="btn" onclick="openSettings('ticker')">⚙ Settings</button>
 </div>
 
@@ -896,6 +897,59 @@ a{color:inherit;text-decoration:none;}
   </div>
 </div>
 
+<!-- ═══ NWC TRANSACTION HISTORY MODAL ═══ -->
+<div class="mo" id="nwc-tx-modal">
+  <div class="md" style="width:480px;">
+    <div class="md-hdr">
+      <div><div class="md-title">🧾 Transaction History</div><div class="md-sub">From your connected Lightning wallet</div></div>
+      <button class="md-close" onclick="closeM('nwc-tx-modal')">✕</button>
+    </div>
+    <div class="md-body" id="nwc-tx-body"></div>
+  </div>
+</div>
+
+<!-- ═══ LIGHTNING MODAL (header ⚡ button) ═══ -->
+<div class="mo" id="ln-modal">
+  <div class="md" style="width:560px;max-height:88vh;">
+    <div class="md-hdr">
+      <div><div class="md-title">⚡ Lightning</div><div class="md-sub">Pay an address or invoice · manage your wallet</div></div>
+      <button class="md-close" onclick="closeM('ln-modal')">✕</button>
+    </div>
+    <div class="stabs">
+      <div class="stab on" id="lntab-pay" onclick="switchLnTab('pay')">Pay</div>
+      <div class="stab" id="lntab-wallet" onclick="switchLnTab('wallet')">Wallet</div>
+      <div class="stab" id="lntab-history" onclick="switchLnTab('history')">History</div>
+    </div>
+    <div class="md-body">
+      <!-- PAY TAB -->
+      <div class="spane on" id="lnp-pay">
+        <div id="lnp-wallet-strip" style="margin-bottom:14px;"></div>
+        <div class="ssec">Pay a Lightning Address</div>
+        <div style="display:flex;gap:8px;margin-bottom:10px;">
+          <input class="fin" id="lnp-addr-in" placeholder="name@wallet.com" style="flex:1;font-size:13px;font-family:var(--fm);" onkeydown="if(event.key==='Enter')doLnAddrSearch('lnp-addr')">
+          <button class="btn-p" onclick="doLnAddrSearch('lnp-addr')" style="white-space:nowrap;padding:0 18px;">Look Up</button>
+        </div>
+        <div id="lnp-addr-status" style="font-family:var(--fm);font-size:11px;color:var(--t2);min-height:16px;margin-bottom:8px;"></div>
+        <div id="lnp-addr-result" style="margin-bottom:18px;"></div>
+        <div class="ssec">Or Paste an Invoice</div>
+        <div class="fgrp" style="margin-bottom:10px;">
+          <textarea class="fin" id="lnp-inv-in" rows="3" placeholder="lnbc1..." style="font-family:var(--fm);font-size:11px;resize:vertical;width:100%;" oninput="onInvoiceInput('lnp-inv')"></textarea>
+        </div>
+        <div id="lnp-inv-status" style="font-family:var(--fm);font-size:11px;color:var(--t2);min-height:16px;margin-bottom:8px;"></div>
+        <div id="lnp-inv-result"></div>
+      </div>
+      <!-- WALLET TAB -->
+      <div class="spane" id="lnp-wallet">
+        <div id="lnw-body"></div>
+      </div>
+      <!-- HISTORY TAB -->
+      <div class="spane" id="lnp-history">
+        <div id="lnh-body"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- ═══ SEND ZAP MODAL ═══ -->
 <div class="mo" id="zap-modal">
   <div class="md" style="width:380px;">
@@ -987,7 +1041,7 @@ a{color:inherit;text-decoration:none;}
     </div>
     <div class="md-body">
       <div class="tfs">
-        <button class="tf on" onclick="setHRTF('1d',this)">1D</button>
+        <button class="tf on" id="hr-tf-1d" onclick="setHRTF('1d',this)">1D</button>
         <button class="tf" onclick="setHRTF('1w',this)">1W</button>
         <button class="tf" onclick="setHRTF('1m',this)">1M</button>
         <button class="tf" onclick="setHRTF('6m',this)">6M</button>
@@ -1153,9 +1207,39 @@ let nwcBalanceSats = null;
 let nwcWS = null;
 let nwcConnecting = false;
 let nwcZapTarget = null; // {evId, evPub, btn}
+// User-added extra relays to try for NWC requests, IN ADDITION to whatever
+// relay(s) are baked into the connection string. IMPORTANT: this can only
+// help if the wallet SERVICE also happens to be listening on one of these —
+// we cannot make the wallet listen somewhere it wasn't told to. For a
+// wallet that only publishes to its own dedicated relay (e.g. Primal's
+// custodial wallet), an extra relay here will just sit unused. It's mainly
+// useful for wallets that support/advertise multiple relays (self-hosted
+// NWC, Alby Hub, etc.) or when the wallet's OWN relay is intermittently
+// unreachable and it happens to also listen elsewhere.
+let nwcExtraRelays = JSON.parse(localStorage.getItem('mts_nwc_extra_relays')||'null') || [];
 // nwcParseUri is a function declaration further down in this file, so it's
 // hoisted and safe to call here even though it appears textually later.
 if(nwcUri){ try{ nwcWallet = nwcParseUri(nwcUri); }catch{ nwcWallet=null; localStorage.removeItem('mts_nwc_uri'); nwcUri=null; } }
+// Hydrate balance/budget from the last successful check, stored in
+// localStorage, so a hard refresh shows the last-known figures immediately
+// instead of "Balance unknown" while nwcAutoRefreshOnLoad's live get_balance
+// round-trip (which can take several seconds, or fail outright — see the
+// extensive NWC reliability notes above) is still in flight. This is
+// explicitly a CACHE, not a live value — nwcLastBalanceAt records when it
+// was captured so the UI can show it's not necessarily current.
+let nwcLastBalanceAt = null; // ms epoch of the cached figures below, or null
+let nwcBalanceIsLive = false; // true once THIS session has confirmed the balance live (vs. showing the cache)
+if(nwcWallet){
+  try{
+    const cached = JSON.parse(localStorage.getItem('mts_nwc_last_balance')||'null');
+    if(cached && typeof cached.sats==='number'){
+      nwcBalanceSats = cached.sats;
+      if(typeof cached.maxAmount==='number') nwcWallet.maxAmount = cached.maxAmount;
+      if(cached.budgetRenewal) nwcWallet.budgetRenewal = cached.budgetRenewal;
+      nwcLastBalanceAt = cached.at || null;
+    }
+  }catch{}
+}
 let cInst=null, cSym=null;
 let btcNetworkHashrate = null; // EH/s
 let btcNetworkHashratePrev = null; // for % change
@@ -1693,23 +1777,39 @@ async function fetchBtcNetworkHashrate() {
     renderTicker(); renderWL();
   }
 
-  // Source 1: mempool.space — most accurate (live currentHashrate)
-  // difficulty-adjustment gives a true block-by-block live hashrate.
-  // /24h gives the historical daily averages we need for the 24h-prev baseline.
-  // Fetch both in parallel so we get a live value AND a good 24h comparison point.
+  // Source 1: the proxy's canonical /network-hashrate endpoint. ONE value for
+  // the whole dashboard — the watchlist row, the ticker, and the chart modal's
+  // "Current" stat all render btcNetworkHashrate, so they can never disagree.
+  // The proxy runs its own fallback chain server-side (mempool.space →
+  // blockchair → blockchain.info chart → stale cache) with a short 2-min cache.
+  //
+  // Why not the old chain: mempool.space REMOVED currentHashrate from
+  // /api/v1/difficulty-adjustment, so the old "live reading" was always
+  // undefined; blockchair has no hashrate_mean_1h field (and hashrate_24h is a
+  // string); and blockchain.info's /q/hashrate endpoint is stale — it reads
+  // ~25% below blockchain.info's own chart data (~800 vs ~1000+ EH/s), which
+  // is exactly the wrong value the watchlist used to show.
   try {
-    const [rLive, rHist] = await Promise.all([
-      fetchT(`${PROXY}/proxy/https://mempool.space/api/v1/difficulty-adjustment`, 10000),
-      fetchT(`${PROXY}/proxy/https://mempool.space/api/v1/mining/hashrate/24h`, 12000),
-    ]);
-    const dLive = rLive.ok ? await rLive.json() : null;
+    const r = await fetchT(`${PROXY}/network-hashrate`, 20000);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const d = await r.json();
+    if (d?.hashrate > 0) {
+      console.log('[hashrate] /network-hashrate OK:', (d.hashrate/1e18).toFixed(2), 'EH/s (' + (d.source||'?') + ')');
+      _commitHashrate(d.hashrate / 1e18, null);
+      return;
+    }
+    throw new Error('no hashrate in response');
+  } catch(e) {
+    console.warn('[hashrate] /network-hashrate failed:', e.message);
+  }
+
+  // Source 2 (direct, in case an older proxy without /network-hashrate is
+  // running): mempool.space mining/hashrate/24h — currentHashrate first,
+  // latest daily candle as backup.
+  try {
+    const rHist = await fetchT(`${PROXY}/proxy/https://mempool.space/api/v1/mining/hashrate/24h`, 15000);
     const dHist = rHist.ok ? await rHist.json() : null;
-    // difficulty-adjustment returns currentHashrate in H/s
-    const liveRaw = dLive?.currentHashrate;
-    // Fall back to last daily candle only if the live endpoint failed
-    const rawCurrent = (liveRaw && liveRaw > 0)
-      ? liveRaw
-      : dHist?.currentHashrate || dHist?.hashrates?.[dHist.hashrates.length - 1]?.avgHashrate;
+    const rawCurrent = dHist?.currentHashrate || dHist?.hashrates?.[dHist.hashrates.length - 1]?.avgHashrate;
     if (rawCurrent && rawCurrent > 0) {
       console.log('[hashrate] mempool.space OK:', (rawCurrent/1e18).toFixed(2), 'EH/s');
       _commitHashrate(rawCurrent / 1e18, dHist?.hashrates || null);
@@ -1720,31 +1820,35 @@ async function fetchBtcNetworkHashrate() {
     console.warn('[hashrate] mempool.space failed:', e.message);
   }
 
-  // Source 2: blockchair
+  // Source 3: blockchair — hashrate_24h (a STRING, in H/s)
   try {
     const r2 = await fetchT(`${PROXY}/proxy/https://api.blockchair.com/bitcoin/stats`, 12000);
     if (!r2.ok) throw new Error(`HTTP ${r2.status}`);
     const d2 = await r2.json();
-    const raw2 = d2?.data?.hashrate_mean_1h;
+    const raw2 = parseFloat(d2?.data?.hashrate_24h);
     if (raw2 && raw2 > 0) {
       console.log('[hashrate] blockchair OK:', (raw2/1e18).toFixed(2), 'EH/s');
       _commitHashrate(raw2 / 1e18, null);
       return;
     }
-    throw new Error('missing hashrate_mean_1h');
+    throw new Error('missing hashrate_24h');
   } catch(e) {
     console.warn('[hashrate] blockchair failed:', e.message);
   }
 
-  // Source 3: blockchain.info — plain-text H/s value
+  // Source 4: blockchain.info hash-rate CHART, latest daily point.
+  // NOT /q/hashrate — that legacy endpoint is stale (~25% low).
   try {
-    const r3 = await fetchT(`${PROXY}/proxy/https://blockchain.info/q/hashrate`, 8000);
+    const r3 = await fetchT(`${PROXY}/proxy/https://api.blockchain.info/charts/hash-rate?timespan=30days&format=json`, 12000);
     if (!r3.ok) throw new Error(`HTTP ${r3.status}`);
-    const raw3 = parseFloat(await r3.text());
-    // blockchain.info returns GH/s
-    if (!isNaN(raw3) && raw3 > 0) {
-      const ehsVal = raw3 / 1e9; // GH/s → EH/s
-      console.log('[hashrate] blockchain.info OK:', ehsVal.toFixed(2), 'EH/s');
+    const d3 = await r3.json();
+    const vals = d3?.values || [];
+    const unit = (d3?.unit || '').toLowerCase();
+    const mult = unit.includes('th/s') ? 1e12 : unit.includes('gh/s') ? 1e9 : 1;
+    const last = vals[vals.length - 1];
+    if (last?.y > 0) {
+      const ehsVal = last.y * mult / 1e18;
+      console.log('[hashrate] blockchain.info chart OK:', ehsVal.toFixed(2), 'EH/s');
       _commitHashrate(ehsVal, null);
       return;
     }
@@ -1770,18 +1874,63 @@ async function fetchBtcNetworkHashrate() {
 
 // Weekly network hashrate spark — powers the small inline chart on the
 // BTC Network Hashrate watchlist row. Same mempool.space endpoint the
-// hashrate modal uses for its 1W tab, just downsampled for a sparkline.
+// hashrate modal uses for its 1W tab. Kept at full resolution (no LTTB
+// downsampling) so the spark's shape actually matches what you see when
+// you click into the full 1W chart — mempool's 1w series is only ~168
+// points anyway, trivial to draw as-is, and downsampling it to 60 pts
+// was flattening/muting peaks that the full chart shows clearly.
 async function fetchNetworkWeeklySpark() {
   try {
-    const r = await fetchT(`${PROXY}/proxy/https://mempool.space/api/v1/mining/hashrate/1w`, 12000);
+    // Same resilient endpoint the modal uses — hard-deadline + fallback
+    // + stale cache live server-side, so a mempool.space stall can't hang
+    // this poll until the abort fires either.
+    const r = await fetchT(`${PROXY}/hashrate-history?span=1w`, 28000);
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const d = await r.json();
     if (!d?.hashrates?.length) throw new Error('No data');
     const pts = d.hashrates.map(p => ({t: p.timestamp * 1000, v: p.avgHashrate / 1e18}));
-    networkWeeklySpark = lttbDownsample(pts, 60);
+    // Append the same live/current point the modal's 1W tab appends, so the
+    // spark's tail matches what you see when you click into the full chart.
+    // The live point is the canonical btcNetworkHashrate — the SAME number the
+    // watchlist row prints — so spark tail, watchlist value, and the modal's
+    // "Current" stat always agree. (difficulty-adjustment no longer returns
+    // currentHashrate, so it can't be used for this anymore.)
+    try {
+      let liveVal = btcNetworkHashrate || 0;
+      if (!liveVal) {
+        const rLive = await fetchT(`${PROXY}/network-hashrate`, 8000);
+        if (rLive.ok) { const dLive = await rLive.json(); if (dLive?.hashrate > 0) liveVal = dLive.hashrate / 1e18; }
+      }
+      if (!liveVal && d.currentHashrate) liveVal = d.currentHashrate / 1e18;
+      const lastCandleTs = pts[pts.length - 1]?.t || 0;
+      const nowTs = Date.now();
+      if (liveVal && nowTs - lastCandleTs > 3600000) {
+        pts.push({t: nowTs, v: liveVal});
+      }
+    } catch {}
+    networkWeeklySpark = pts;
     _drawWLSparklines(calcPortfolio());
+    return;
   } catch(e) {
     console.warn('[hashrate] weekly spark failed:', e.message);
+  }
+
+  // Fallback: if every upstream source is down, build the spark from our own
+  // local hashrateHistory.network samples instead (populated every ~10min by
+  // fetchBtcNetworkHashrate's multi-source fallback chain). Coarser than the
+  // real weekly candles, but keeps the chart populated instead of blank.
+  try {
+    const cutoff = Date.now() - 7 * 86400000;
+    const localPts = hashrateHistory.network
+      .filter(p => p.t >= cutoff)
+      .map(p => ({t: p.t, v: p.v}));
+    if (localPts.length >= 2) {
+      console.warn('[hashrate] weekly spark: using local history fallback,', localPts.length, 'pts');
+      networkWeeklySpark = localPts;
+      _drawWLSparklines(calcPortfolio());
+    }
+  } catch(e2) {
+    console.warn('[hashrate] weekly spark local fallback failed:', e2.message);
   }
 }
 
@@ -2052,22 +2201,28 @@ function renderWL() {
     return;
   }
 
-  // Full rebuild (only on structural change)
-  const rows = [];
+  // Structural change — reconcile in place instead of a full teardown/rebuild.
+  // Previously this nuked and recreated every row (and every Chart.js
+  // sparkline) any time a single row's presence flipped — e.g. the NETWORK
+  // row popping in once its fetch resolves, or the mining rows appearing
+  // after a delayed miner-list retry. That made every *other* asset's chart
+  // flicker (destroy+recreate) at the same moment, even though nothing about
+  // them had changed. Now we only touch the rows that actually appeared or
+  // disappeared; everything else — and its live Chart.js instance — is left
+  // untouched, so _drawWLSparklines can keep updating it in place.
+  const keyToHTML = {};
 
-  // 1. Portfolio row (first)
   if (portfolio.length > 0) {
     const displayPct = window._port1DReturn != null ? window._port1DReturn : port.totalPct;
     const sign = displayPct>=0?'+':'', cls=displayPct>0?'pos':displayPct<0?'neg':'neu';
-    rows.push(`<div class="wli portfolio-row" data-wlkey="PORTFOLIO" onclick="openPortfolio();switchPortTab('chart')">
+    keyToHTML['PORTFOLIO'] = `<div class="wli portfolio-row" data-wlkey="PORTFOLIO" onclick="openPortfolio();switchPortTab('chart')">
       <div><div class="wli-name">Portfolio</div><div class="wli-sym">PORTFOLIO</div></div>
       <div class="wli-spark"><canvas id="sp-PORTFOLIO"></canvas></div>
       <div class="wli-prc">$${port.totalValue.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})}</div>
       <div class="wli-chg ${cls}">${sign}${displayPct.toFixed(2)}%</div>
-    </div>`);
+    </div>`;
   }
 
-  // 2. Regular watchlist assets
   watchlist.forEach(a => {
     const q = PC[a.sym];
     const pr = q ? fp(q.price,a.sym) : '—';
@@ -2076,56 +2231,84 @@ function renderWL() {
     let extBadge = '';
     if (q?.isFutures) extBadge = ` <span style="font-family:var(--fm);font-size:8px;color:var(--gold);background:rgba(247,183,49,.13);border:1px solid rgba(247,183,49,.3);border-radius:2px;padding:1px 3px;letter-spacing:.04em;vertical-align:middle;">FUT</span>`;
     else if (q && hasExtendedHoursSession(a.sym)) { const _sb = getSessionBadge(); if (_sb) extBadge = ` <span title="${esc(sessionBadgeTitle(_sb, q.hasExtendedData, q.asOf))}" style="font-family:var(--fm);font-size:8px;color:var(--gold);background:rgba(247,183,49,.13);border:1px solid rgba(247,183,49,.3);border-radius:2px;padding:1px 3px;letter-spacing:.04em;vertical-align:middle;cursor:help;">${_sb}</span>`; }
-    rows.push(`<div class="wli" data-wlkey="wl-${a.sym}" onclick="openChart('${a.sym}')">
+    keyToHTML['wl-'+a.sym] = `<div class="wli" data-wlkey="wl-${a.sym}" onclick="openChart('${a.sym}')">
       <div><div class="wli-name">${a.name}${extBadge}</div><div class="wli-sym">${a.sym}</div></div>
       <div class="wli-spark"><canvas id="sp-${a.sym.replace(/[^a-zA-Z0-9]/g,'_')}"></canvas></div>
       <div class="wli-prc">${pr}</div>
       <div class="wli-chg ${cls}">${ch}</div>
-    </div>`);
+    </div>`;
   });
 
-  // 3. BTC Network Hashrate
   if (btcNetworkHashrate !== null) {
     const pct = btcNetworkHashratePrev ? (btcNetworkHashrate - btcNetworkHashratePrev) / btcNetworkHashratePrev * 100 : null;
     const cls = pct === null ? 'neu' : pct > 0 ? 'pos' : pct < 0 ? 'neg' : 'neu';
     const chg = pct !== null ? `${pct>=0?'+':''}${pct.toFixed(2)}%` : '—';
-    rows.push(`<div class="wli hashrate-row" data-wlkey="NETWORK" onclick="openHashrateChart('network')">
+    keyToHTML['NETWORK'] = `<div class="wli hashrate-row" data-wlkey="NETWORK" onclick="openHashrateChart('network')">
       <div><div class="wli-name">BTC Network Hashrate</div><div class="wli-sym">NETWORK</div></div>
       <div class="wli-spark"><canvas id="sp-NETWORK"></canvas></div>
       <div class="wli-prc" style="font-size:11px;">${btcNetworkHashrate.toFixed(2)} EH/s</div>
       <div class="wli-chg ${cls}">${chg}</div>
-    </div>`);
+    </div>`;
   }
 
-  // 4. Mining rows
   if (miners.length > 0) {
     const fleetPct = fleetHashratePrev && fleet.totalHashRate ? (fleet.totalHashRate - fleetHashratePrev) / fleetHashratePrev * 100 : null;
     const fCls = fleetPct === null ? 'neu' : fleetPct > 0 ? 'pos' : fleetPct < 0 ? 'neg' : 'neu';
     const fChg = fleetPct !== null ? `${fleetPct>=0?'+':''}${fleetPct.toFixed(2)}%` : '—';
-    rows.push(`<div class="wli mining-row" data-wlkey="MINING-fleet" onclick="openHashrateChart('fleet')">
+    keyToHTML['MINING-fleet'] = `<div class="wli mining-row" data-wlkey="MINING-fleet" onclick="openHashrateChart('fleet')">
       <div><div class="wli-name">Fleet Hashrate</div><div class="wli-sym">MINING</div></div>
       <div class="wli-spark"><canvas id="sp-MINING_fleet"></canvas></div>
       <div class="wli-prc" style="font-size:11px;">${fmtHashrate(fleet.totalHashRate)}</div>
       <div class="wli-chg ${fCls}">${fChg}</div>
-    </div>`);
-    rows.push(`<div class="wli mining-row" data-wlkey="MINING-best">
+    </div>`;
+    keyToHTML['MINING-best'] = `<div class="wli mining-row" data-wlkey="MINING-best">
       <div><div class="wli-name">Session Best Share</div><div class="wli-sym">MINING</div></div>
       <div class="wli-spark"></div>
       <div class="wli-prc" style="font-size:11px;color:var(--orange);">${fleet.sessionBest}</div>
       <div class="wli-chg neu">—</div>
-    </div>`);
-    rows.push(`<div class="wli mining-row" data-wlkey="MINING-alltime">
+    </div>`;
+    keyToHTML['MINING-alltime'] = `<div class="wli mining-row" data-wlkey="MINING-alltime">
       <div><div class="wli-name">All-Time Best Share</div><div class="wli-sym">MINING</div></div>
       <div class="wli-spark"></div>
       <div class="wli-prc" style="font-size:11px;color:var(--gold);">${fleet.allTimeBest}</div>
       <div class="wli-chg neu">—</div>
-    </div>`);
+    </div>`;
   }
 
-  // Full rebuild — destroy all existing sparkline instances first so Chart.js
-  // cleans up properly before the canvas elements are replaced by innerHTML.
-  Object.keys(sparks).forEach(k => { try { sparks[k].destroy(); } catch {} delete sparks[k]; });
-  body.innerHTML = rows.join('');
+  // Remove rows that are no longer expected, destroying only their own
+  // chart instance(s) — not everyone else's.
+  existing.forEach(el => {
+    const k = el.dataset.wlkey;
+    if (!expectedKeys.includes(k)) {
+      el.querySelectorAll('canvas').forEach(cv => {
+        if (sparks[cv.id]) { try { sparks[cv.id].destroy(); } catch {} delete sparks[cv.id]; }
+      });
+      el.remove();
+    }
+  });
+
+  // Walk the expected key order, creating any missing rows fresh and
+  // reusing/repositioning rows that already exist. insertAdjacentElement
+  // moves an already-attached node rather than cloning it, so an existing
+  // row (and its live canvas/Chart.js instance) is preserved even if its
+  // position shifts.
+  let prevEl = null;
+  expectedKeys.forEach(k => {
+    let el = body.querySelector(`[data-wlkey="${CSS.escape(k)}"]`);
+    if (!el) {
+      const tmp = document.createElement('div');
+      tmp.innerHTML = (keyToHTML[k] || '').trim();
+      el = tmp.firstElementChild;
+      if (!el) return;
+    }
+    if (prevEl) {
+      if (prevEl.nextElementSibling !== el) prevEl.insertAdjacentElement('afterend', el);
+    } else if (body.firstElementChild !== el) {
+      body.insertBefore(el, body.firstChild);
+    }
+    prevEl = el;
+  });
+
   _drawWLSparklines(port);
 }
 
@@ -2147,7 +2330,7 @@ function _drawSimpleSpark(cid, pts, boundsVals) {
   const { min: yMin, max: yMax } = computeYBounds(boundsVals || sparkData);
   if (!sparks[cid]) {
     const ctx = cv.getContext('2d');
-    const g = ctx.createLinearGradient(0,0,0,30);
+    const g = ctx.createLinearGradient(0,0,0,40);
     g.addColorStop(0, 'rgba(255,159,67,.3)'); g.addColorStop(1,'rgba(0,0,0,0)');
     sparks[cid] = new Chart(cv, {
       type:'line',
@@ -2181,7 +2364,7 @@ function _drawWLSparklines(port) {
     if (needsRebuild) {
       if (sparks[cid]) { try { sparks[cid].destroy(); } catch {} }
       const ctx = cv.getContext('2d');
-      const g = ctx.createLinearGradient(0,0,0,30);
+      const g = ctx.createLinearGradient(0,0,0,40);
       g.addColorStop(0, ip?'rgba(0,212,160,.3)':'rgba(255,77,106,.3)');
       g.addColorStop(1,'rgba(0,0,0,0)');
       sparks[cid] = new Chart(cv, {
@@ -2275,7 +2458,7 @@ function _drawWLSparklines(port) {
       if (needsRebuild) {
         if (existingInst) { try { existingInst.destroy(); } catch {} }
         const ctx = portCv.getContext('2d');
-        const g = ctx.createLinearGradient(0,0,0,30);
+        const g = ctx.createLinearGradient(0,0,0,40);
         g.addColorStop(0, ip?'rgba(0,212,160,.3)':'rgba(255,77,106,.3)');
         g.addColorStop(1,'rgba(0,0,0,0)');
         sparks['sp-PORTFOLIO'] = new Chart(portCv, {
@@ -2429,9 +2612,14 @@ async function setTF(tf,btn){document.querySelectorAll('#chart-modal .tf').forEa
 // ═══════════════════════════════════════════════════════
 let srchSym=null, srchName=null, srchInst=null;
 
-function openSearch(){
+// openSearch(tab) — optionally pre-select a tab ('asset'|'nostr'|'ln'|'invoice').
+// The header ⚡ Lightning button uses openSearch('ln') so one click lands on the
+// lightning-address pay box, with the 🧾 Invoice tab one click away.
+function openSearch(tab){
   openM('search-modal');
-  setTimeout(()=>{ const inp=document.getElementById('srch-in'); if(inp)inp.focus(); },80);
+  if(tab && tab!==srchActiveTab){ switchSrchTab(tab); return; } // switchSrchTab focuses the right input
+  const focusId = srchActiveTab==='ln'?'lnsrch-in':srchActiveTab==='invoice'?'inv-in':srchActiveTab==='nostr'?'nsrch-in':'srch-in';
+  setTimeout(()=>{ const inp=document.getElementById(focusId); if(inp)inp.focus(); },80);
 }
 function closeSearch(){
   closeM('search-modal');
@@ -2840,7 +3028,7 @@ async function loadAssetNews(sym){
       return `
       <div class="cm-news-item" data-url="${linkEsc}" data-title="${titleEsc}" data-src="${srcHost}" data-desc="${descEsc}" onclick="openReader(this.dataset.url,this.dataset.title,this.dataset.src,this.dataset.desc)">
         <div class="cm-news-title">${esc(it.title)}</div>
-        <div class="cm-news-meta">${it.pub?new Date(it.pub).toLocaleString():''}${it.desc?' · '+esc(it.desc.slice(0,80))+'…':''}</div>
+        <div class="cm-news-meta">${srcHost?esc(srcHost):''}${it.pub?' · '+new Date(it.pub).toLocaleString():''}${it.desc?' · '+esc(it.desc.slice(0,80))+'…':''}</div>
       </div>`;
     }).join('');
   }catch(e){body.innerHTML='<div style="font-family:var(--fm);font-size:11px;color:var(--t3);">News unavailable.</div>';}
@@ -3324,7 +3512,7 @@ async function loadSrchNews(sym){
       return `
       <div class="cm-news-item" data-url="${linkEsc}" data-title="${titleEsc}" data-src="${srcHost}" data-desc="${descEsc}" onclick="openReader(this.dataset.url,this.dataset.title,this.dataset.src,this.dataset.desc)">
         <div class="cm-news-title">${esc(it.title)}</div>
-        <div class="cm-news-meta">${it.pub?new Date(it.pub).toLocaleString():''}${it.desc?' · '+esc(it.desc.slice(0,80))+'…':''}</div>
+        <div class="cm-news-meta">${srcHost?esc(srcHost):''}${it.pub?' · '+new Date(it.pub).toLocaleString():''}${it.desc?' · '+esc(it.desc.slice(0,80))+'…':''}</div>
       </div>`;
     }).join('');
   }catch(e){body.innerHTML='<div style="font-family:var(--fm);font-size:11px;color:var(--t3);">News unavailable.</div>';}
@@ -3349,11 +3537,14 @@ function switchSrchTab(tab){
 }
 
 // ── Lightning address lookup — resolve an LNURL-pay address and offer to pay it ──
-async function doLnAddrSearch(){
-  const raw=(document.getElementById('lnsrch-in')?.value||'').trim();
+// pfx selects which input/result set to use: 'lnsrch' = search-modal Lightning
+// tab, 'lnp-addr' = Lightning modal Pay tab.
+async function doLnAddrSearch(pfx){
+  pfx = pfx || 'lnsrch';
+  const raw=(document.getElementById(pfx+'-in')?.value||'').trim();
   if(!raw) return;
-  const statusEl=document.getElementById('lnsrch-status');
-  const resultEl=document.getElementById('lnsrch-result');
+  const statusEl=document.getElementById(pfx+'-status');
+  const resultEl=document.getElementById(pfx+'-result');
   resultEl.innerHTML='';
   if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(raw)){
     statusEl.textContent='Enter a valid lightning address, like name@wallet.com';
@@ -3476,17 +3667,21 @@ function decodeBolt11(invoiceStr){
   return {network,amountSats,timestamp,expirySeconds,description,descriptionHash,paymentHash,expiresAt:timestamp+expirySeconds};
 }
 
-let decodedInvoice=null;
+// Decoded invoices are kept per-pane ('inv' = search-modal Invoice tab,
+// 'lnp-inv' = Lightning modal Pay tab) so the two never clobber each other.
+const decodedInvoices={};
 let invDecodeTimer=null;
-function onInvoiceInput(){
+function onInvoiceInput(pfx){
+  pfx = pfx || 'inv';
   clearTimeout(invDecodeTimer);
-  invDecodeTimer=setTimeout(decodeAndShowInvoice,250);
+  invDecodeTimer=setTimeout(()=>decodeAndShowInvoice(pfx),250);
 }
-function decodeAndShowInvoice(){
-  const raw=(document.getElementById('inv-in')?.value||'').trim();
-  const statusEl=document.getElementById('inv-status');
-  const resultEl=document.getElementById('inv-result');
-  decodedInvoice=null;
+function decodeAndShowInvoice(pfx){
+  pfx = pfx || 'inv';
+  const raw=(document.getElementById(pfx+'-in')?.value||'').trim();
+  const statusEl=document.getElementById(pfx+'-status');
+  const resultEl=document.getElementById(pfx+'-result');
+  decodedInvoices[pfx]=null;
   resultEl.innerHTML='';
   if(!raw){ statusEl.textContent=''; return; }
   let inv;
@@ -3497,7 +3692,7 @@ function decodeAndShowInvoice(){
     return;
   }
   statusEl.textContent='✓ Invoice decoded'; statusEl.style.color='var(--green)';
-  decodedInvoice={raw:raw.trim().replace(/^lightning:/i,''), ...inv};
+  decodedInvoices[pfx]={raw:raw.trim().replace(/^lightning:/i,''), ...inv};
 
   const netLbl={bc:'',tb:' (testnet)',bcrt:' (regtest)',sb:' (signet)'}[inv.network]||'';
   const expired = (Date.now()/1000) > inv.expiresAt;
@@ -3505,7 +3700,7 @@ function decodeAndShowInvoice(){
   const expiryStr = expired ? 'Expired' : 'Expires '+expiryDate.toLocaleString();
 
   if(!nwcWallet){
-    resultEl.innerHTML = `<div class="warn">Connect a Lightning wallet first so you can pay invoices.</div><div style="display:flex;justify-content:flex-end;margin-top:8px;"><button class="btn-p" onclick="openNwcModal()">Connect Wallet</button></div>`;
+    resultEl.innerHTML = `<div class="warn">Connect a Lightning wallet first so you can pay invoices.</div><div style="display:flex;justify-content:flex-end;margin-top:8px;"><button class="btn-p" onclick="openWalletManage()">Connect Wallet</button></div>`;
     return;
   }
 
@@ -3517,31 +3712,33 @@ function decodeAndShowInvoice(){
       </div>
       ${inv.description?`<div style="font-size:12px;color:var(--t1);margin-bottom:8px;">${esc(inv.description)}</div>`:inv.descriptionHash?`<div style="font-family:var(--fm);font-size:10px;color:var(--t2);margin-bottom:8px;">Description hash: ${inv.descriptionHash.slice(0,16)}…</div>`:''}
       ${inv.paymentHash?`<div style="font-family:var(--fm);font-size:9px;color:var(--t3);margin-bottom:10px;">Payment hash: ${inv.paymentHash.slice(0,16)}…</div>`:''}
-      ${inv.amountSats==null?`<div class="fgrp" style="margin-bottom:10px;"><label class="flbl">Amount (sats)</label><input class="fin" id="inv-amt-in" type="number" min="1" value="21" style="font-family:var(--fm);"></div>`:''}
+      ${inv.amountSats==null?`<div class="fgrp" style="margin-bottom:10px;"><label class="flbl">Amount (sats)</label><input class="fin" id="${pfx}-amt-in" type="number" min="1" value="21" style="font-family:var(--fm);"></div>`:''}
       <div style="display:flex;justify-content:flex-end;">
-        <button class="btn-p" id="inv-pay-btn" onclick="payDecodedInvoice()" ${expired?'disabled':''}>⚡ Pay Invoice</button>
+        <button class="btn-p" id="${pfx}-pay-btn" onclick="payDecodedInvoice('${pfx}')" ${expired?'disabled':''}>⚡ Pay Invoice</button>
       </div>
-      <div id="inv-pay-status" style="margin-top:8px;font-family:var(--fm);font-size:11px;color:var(--t2);"></div>
+      <div id="${pfx}-pay-status" style="margin-top:8px;font-family:var(--fm);font-size:11px;color:var(--t2);"></div>
     </div>`;
 }
-async function payDecodedInvoice(){
+async function payDecodedInvoice(pfx){
+  pfx = pfx || 'inv';
+  const decodedInvoice = decodedInvoices[pfx];
   if(!decodedInvoice) return;
-  if(!nwcWallet){ openNwcModal(); return; }
-  const st=document.getElementById('inv-pay-status');
-  const btn=document.getElementById('inv-pay-btn');
+  if(!nwcWallet){ openWalletManage(); return; }
+  const st=document.getElementById(pfx+'-pay-status');
+  const btn=document.getElementById(pfx+'-pay-btn');
   let amountMsat=null;
   if(decodedInvoice.amountSats==null){
-    const amtSats=Math.max(1,Math.floor(Number(document.getElementById('inv-amt-in')?.value)||0));
+    const amtSats=Math.max(1,Math.floor(Number(document.getElementById(pfx+'-amt-in')?.value)||0));
     if(!amtSats){ if(st) st.textContent='Enter a valid amount.'; return; }
     amountMsat=amtSats*1000;
   }
   if(btn) btn.disabled=true;
-  if(st){ st.textContent='⏳ Paying via wallet...'; st.style.color='var(--t2)'; }
   try{
-    await nwcPayInvoice(decodedInvoice.raw, amountMsat);
+    // Clean UI: spinner while paying; on failure a single error box with a
+    // collapsible debug log (nwcRunUI renders it — don't overwrite here).
+    await nwcRunUI(st, 'Paying via wallet', (onStatus)=>nwcPayInvoice(decodedInvoice.raw, amountMsat, onStatus));
     if(st){ st.textContent='✓ Invoice paid!'; st.style.color='var(--green)'; }
   }catch(e){
-    if(st){ st.textContent='❌ '+e.message; st.style.color='var(--red)'; }
     if(btn) btn.disabled=false;
   }
 }
@@ -4695,16 +4892,23 @@ let hrType = 'network'; // 'network' or 'fleet'
 let hrInst = null;
 // mempool.space hashrate endpoint timeframes
 const HR_TF = {
-  '1d': '1d', '1w': '1w', '1m': '1m', '6m': '3m', '1y': '1y', '4y': '2y', '10y': '3y'
+  '1d': '24h', '1w': '1w', '1m': '1m', '6m': '3m', '1y': '1y', '4y': '2y', '10y': '3y'
 };
 
 async function openHashrateChart(type) {
   hrType = type;
   document.getElementById('hr-title').textContent = type === 'network' ? 'BTC Network Hashrate' : 'Fleet Hashrate';
   document.getElementById('hr-sub').textContent = type === 'network' ? 'EH/s — source: mempool.space' : 'GH/s — your mining fleet';
-  document.querySelectorAll('#hr-modal .tf').forEach((b,i)=>b.classList.toggle('on',i===0));
+  // Network hashrate has no meaningful 1-day resolution (mempool.space's
+  // hashrate/1d endpoint isn't a real timeframe — that's what was hanging
+  // and aborting), so the 1D option is hidden for the network chart only.
+  // Fleet chart keeps 1D since it's built from locally-sampled history.
+  const oneDayBtn = document.getElementById('hr-tf-1d');
+  oneDayBtn.style.display = type === 'network' ? 'none' : '';
+  const visibleTfBtns = Array.from(document.querySelectorAll('#hr-modal .tf')).filter(b => b.style.display !== 'none');
+  visibleTfBtns.forEach((b,i)=>b.classList.toggle('on', i===0));
   openM('hr-modal');
-  await loadHashrateChart('1d');
+  await loadHashrateChart(type === 'network' ? '1w' : '1d');
 }
 
 // Robust y-axis bounds: dropout points (miner offline, host off the home
@@ -4801,25 +5005,82 @@ async function loadHashrateChart(tf) {
 
   // Network hashrate from mempool.space
   try {
-    const span = HR_TF[tf] || '1d';
-    const r = await fetchT(`${PROXY}/proxy/https://mempool.space/api/v1/mining/hashrate/${span}`, 10000);
-    const d = await r.json();
-    if (!d?.hashrates?.length) throw new Error('No data');
-    const pts = d.hashrates.map(p => ({t: p.timestamp * 1000, v: p.avgHashrate / 1e18}));
-    // Prefer difficulty-adjustment for the live reading (block-by-block accuracy).
-    // d.currentHashrate from the /Nd history endpoint may be 0 or a stale daily avg.
-    let liveRaw = 0;
-    try {
-      const rAdj = await fetchT(`${PROXY}/proxy/https://mempool.space/api/v1/difficulty-adjustment`, 8000);
-      if (rAdj.ok) { const dAdj = await rAdj.json(); liveRaw = dAdj?.currentHashrate || 0; }
-    } catch {}
-    if (!liveRaw) liveRaw = d.currentHashrate || d.hashrates[d.hashrates.length - 1]?.avgHashrate;
-    const liveVal = liveRaw / 1e18;
-    const lastCandleTs = pts[pts.length - 1]?.t || 0;
-    const nowTs = Date.now();
-    if (liveRaw && nowTs - lastCandleTs > 3600000) {
-      // Only append if the live point is meaningfully newer than the last candle (>1h gap)
-      pts.push({t: nowTs, v: liveVal});
+    let pts, liveVal;
+    if (tf === '1w' && networkWeeklySpark.length) {
+      // The watchlist sparkline (fetchNetworkWeeklySpark) already polls this
+      // exact endpoint every 10min and caches the result. Firing a second,
+      // independent hit to mempool.space/1w here — on top of that one — was
+      // what produced the "Failed: The operation was aborted." timeout, since
+      // both requests hammer the same rate-limited endpoint back to back.
+      // Reusing the cache instead also guarantees the mini chart in the
+      // watchlist row and this modal's 1W tab render identical data.
+      pts = networkWeeklySpark.slice(); // copy — the tail gets synced below
+      // The "Current" stat must be the canonical live reading
+      // (btcNetworkHashrate — the SAME number the watchlist row prints), not
+      // the spark's last point. The spark's tail is either the latest HOURLY
+      // CANDLE AVERAGE (naturally a bit above/below the live reading) or a
+      // live point appended when the spark was last polled (possibly minutes
+      // stale) — both showed up as the modal and the watchlist disagreeing
+      // by a few EH/s (e.g. 998 vs 1003).
+      let liveRaw = 0;
+      if (btcNetworkHashrate) liveRaw = btcNetworkHashrate * 1e18;
+      if (!liveRaw) {
+        try {
+          const rLive = await fetchT(`${PROXY}/network-hashrate`, 8000);
+          if (rLive.ok) { const dLive = await rLive.json(); if (dLive?.hashrate > 0) liveRaw = dLive.hashrate; }
+        } catch {}
+      }
+      liveVal = liveRaw ? liveRaw / 1e18 : pts[pts.length - 1]?.v;
+      // Sync the chart's right edge with the live reading too: if the spark's
+      // tail is a previously-appended live point (within the last hour),
+      // refresh it in place; if the last real candle is older, append.
+      if (liveRaw) {
+        const nowTs = Date.now();
+        const lastT = pts[pts.length - 1]?.t || 0;
+        if (nowTs - lastT > 3600000) pts.push({t: nowTs, v: liveVal});
+        else pts[pts.length - 1] = {t: lastT, v: liveVal};
+      }
+    } else {
+      const span = HR_TF[tf] || '24h';
+      // /hashrate-history enforces a HARD wall-clock deadline server-side
+      // (a stalled upstream can't dribble bytes past a socket timeout and
+      // hang the request forever — that stall, not the budget, was what
+      // produced "Failed: The operation was aborted."), falls back to
+      // blockchain.info when mempool.space stalls/errors, and serves a
+      // stale cache copy when both are down. The two fetches run in
+      // parallel so a slow live-reading call can't stack on top of the
+      // history call.
+      const r = await fetchT(`${PROXY}/hashrate-history?span=${span}`, 28000);
+      const d = await r.json().catch(() => null);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      if (!d?.hashrates?.length) throw new Error('No data');
+      // Show which upstream actually served the data, so a fallback period
+      // is visible instead of silently looking like mempool.space data.
+      const src = r.headers.get('X-Hashrate-Source') || d.source;
+      document.getElementById('hr-sub').textContent = 'EH/s — source: ' +
+        (src === 'blockchain.info' ? 'blockchain.info (mempool.space unavailable)' :
+         src === 'stale-cache' ? 'cached data (sources unavailable)' : 'mempool.space');
+      pts = d.hashrates.map(p => ({t: p.timestamp * 1000, v: p.avgHashrate / 1e18}));
+      // The live reading is the canonical btcNetworkHashrate — the SAME value
+      // the watchlist row shows — so the modal's "Current" stat and the
+      // watchlist can never disagree. (difficulty-adjustment no longer returns
+      // currentHashrate; it used to be the source of the live reading.)
+      let liveRaw = 0;
+      if (btcNetworkHashrate) liveRaw = btcNetworkHashrate * 1e18;
+      if (!liveRaw) {
+        try {
+          const rLive = await fetchT(`${PROXY}/network-hashrate`, 8000);
+          if (rLive.ok) { const dLive = await rLive.json(); if (dLive?.hashrate > 0) liveRaw = dLive.hashrate; }
+        } catch {}
+      }
+      if (!liveRaw) liveRaw = d.currentHashrate || d.hashrates[d.hashrates.length - 1]?.avgHashrate;
+      liveVal = liveRaw / 1e18;
+      const lastCandleTs = pts[pts.length - 1]?.t || 0;
+      const nowTs = Date.now();
+      if (liveRaw && nowTs - lastCandleTs > 3600000) {
+        // Only append if the live point is meaningfully newer than the last candle (>1h gap)
+        pts.push({t: nowTs, v: liveVal});
+      }
     }
     const vals = pts.map(p=>p.v);
     const lo = Math.min(...vals), hi = Math.max(...vals), chg = ((liveVal-vals[0])/vals[0]*100);
@@ -5598,9 +5859,10 @@ function removeRelay(i){
   const url=RELAYS[i];
   RELAYS.splice(i,1);
   saveRelays();
-  // Close the connection for the removed relay
+  // Close the connection for the removed relay. Mark it first — otherwise its
+  // onclose handler "helpfully" reconnects to the relay we just removed.
   nFeedWSList=nFeedWSList.filter(ws=>{
-    try{if(ws._relayUrl===url){ws.close();return false;}}catch{}
+    try{if(ws._relayUrl===url){ws._suppressReconnect=true;ws.close();return false;}}catch{}
     return true;
   });
   nRelayConns=nRelayConns.filter(u=>u!==url);
@@ -5615,8 +5877,11 @@ function resetRelays(){
 }
 
 function reconnectFeed(){
-  // Close all existing feed connections and re-subscribe with new relay list
-  nFeedWSList.forEach(ws=>{try{ws.close();}catch{}});
+  // Close all existing feed connections and re-subscribe with new relay list.
+  // Bump the generation FIRST so every closing socket's onclose and every
+  // pending reconnect timer stands down instead of spawning ghost sockets.
+  nFeedEpoch++;
+  nFeedWSList.forEach(ws=>{try{ws._suppressReconnect=true;ws.close();}catch{}});
   nFeedWSList=[];
   nRelayConns=[];
   const relEl=document.getElementById('n-relays');
@@ -5921,6 +6186,7 @@ function buildNExp(){
         </div>
         <span id="nfeed-status" style="font-family:var(--fm);font-size:9px;color:var(--t3);margin-left:auto;"></span>
         <button id="npane-wallet-btn" class="btn" style="font-size:9px;padding:2px 8px;${nwcWallet?'color:var(--gold);border-color:rgba(247,183,49,.4);':''}" onclick="openNwcModal()" title="${nwcWallet?'Lightning wallet connected':'Connect a Lightning wallet to send zaps'}">⚡ ${nwcWallet?'Wallet':'Connect Wallet'}</button>
+        <button id="npane-tx-btn" class="btn" style="font-size:9px;padding:2px 8px;" onclick="openNwcTxModal()" title="Lightning transaction history">🧾 History</button>
       </div>
       <div id="nfeed" style="flex:1;overflow-y:auto;display:${nActivePane==='feed'?'block':'none'};"></div>
       <div id="nnotifs" style="flex:1;overflow-y:auto;display:${nActivePane==='notifs'?'block':'none'};"></div>
@@ -6398,12 +6664,14 @@ function connectNNotifs(){
       // Watchdog: if the relay goes quiet, ping it; if still no response, reconnect
       let _watchdog=null;
       ws._lastMsg=Date.now();
+      ws._suppressReconnect=false; // set when WE close it and schedule the replacement — keeps onclose from double-scheduling
       const startWatchdog=()=>{
         _watchdog=setInterval(()=>{
           if(ws.readyState!==WebSocket.OPEN) return;
           const staleSecs=(Date.now()-ws._lastMsg)/1000;
           if(staleSecs>105){
             clearInterval(_watchdog);
+            ws._suppressReconnect=true;
             try{ws.close();}catch{}
             setTimeout(()=>connectOneNotifRelay(relayUrl,0),1000);
             return;
@@ -6445,6 +6713,7 @@ function connectNNotifs(){
           } else if(m[0]==='CLOSED'){
             // Relay rejected/closed our sub \u2014 reconnect after a short delay
             clearInterval(_watchdog);
+            ws._suppressReconnect=true;
             try{ws.close();}catch{}
             setTimeout(()=>connectOneNotifRelay(relayUrl,0),2000);
           }
@@ -6453,6 +6722,7 @@ function connectNNotifs(){
       ws.onerror=()=>{ clearInterval(_watchdog); /* onclose fires next */ };
       ws.onclose=()=>{
         clearInterval(_watchdog);
+        if(ws._suppressReconnect) return; // reconnect already scheduled by whoever closed us
         if(_cancelled || !nPubkey) return; // session cancelled or logged out — do not reconnect
         // Exponential backoff: if we connected successfully, reset backoff
         const nextAttempt=_everConnected?0:attempt+1;
@@ -6633,12 +6903,28 @@ function subscribeToFeed(){
   RELAYS.forEach(url=>connectFeedRelay(url,authors,since));
 }
 
+// Feed generation counter. Bumped by reconnectFeed()/removeRelay() whenever the
+// feed sockets are torn down on purpose. Every scheduled reconnect captures the
+// generation it belongs to and stands down if the feed has been rebuilt since —
+// otherwise a closing socket's onclose (or a pending reconnect timer) spawns a
+// GHOST socket for a relay we just removed or replaced.
+let nFeedEpoch=0;
+
 function connectFeedRelay(url,authors,since,attempt=0){
   if(!nPubkey)return;
+  const epoch=nFeedEpoch;
   try{
     const ws=new WebSocket(url);
     ws._relayUrl=url;
     ws._lastMsg=Date.now(); // track last activity for stale detection
+    // Set when WE close this socket and schedule the replacement ourselves.
+    // Without this guard, close() fires onclose, which scheduled a SECOND
+    // reconnect on top of the watchdog's/CLOSED-handler's own — every flap
+    // opened two replacement sockets to the same relay. That connection churn
+    // is exactly what gets an IP rate-limited on busy relays
+    // (relay.primal.net especially), which then presents as "the relay won't
+    // stay connected" — a loop the old code was feeding itself.
+    ws._suppressReconnect=false;
     nFeedWSList.push(ws);
     let _everConnected=false;
     let _watchdog=null;
@@ -6651,13 +6937,35 @@ function connectFeedRelay(url,authors,since,attempt=0){
       if(relEl)relEl.textContent=`${nRelayConns.length}/${RELAYS.length} relays`;
     };
 
+    // Lookback anchored to this socket's last message (min 120s), so a quick
+    // flap only refetches seconds of feed while a laptop sleep still backfills
+    // the gap — without the old full 3-day refetch.
+    const _lookbackSince=()=>Math.floor(Math.min(ws._lastMsg||Date.now(),Date.now()-120000)/1000)-30;
+    // Single-flight reconnect: only fires if the feed hasn't been rebuilt and
+    // the relay hasn't been removed since this socket was opened.
+    const _scheduleReconnect=(delay,nextAttempt)=>{
+      const s=_lookbackSince();
+      setTimeout(()=>{
+        if(epoch!==nFeedEpoch) return;      // feed was rebuilt — stale timer
+        if(!RELAYS.includes(url)) return;   // relay was removed — no ghost socket
+        connectFeedRelay(url,nFollowing.length?nFollowing:[nPubkey],s,nextAttempt);
+      },delay);
+    };
+
     ws.onopen=()=>{
       _everConnected=true;
       ws._lastMsg=Date.now();
       if(!nRelayConns.includes(url)) nRelayConns.push(url);
       const relEl=document.getElementById('n-relays');
       if(relEl)relEl.textContent=`${nRelayConns.length}/${RELAYS.length} relays`;
-      const sinceNow=Math.floor(Date.now()/1000)-(attempt===0?86400*3:60);
+      // Use the caller-provided `since` directly: subscribeToFeed passes a
+      // 3-day window for the initial sync; every reconnect path passes a
+      // short, downtime-aware lookback (see _lookbackSince). Previously this
+      // param was IGNORED and attempt===0 forced a full 3-day refetch on EVERY
+      // watchdog flap — hundreds of authors × 3 days re-pulled each time a
+      // relay went quiet, which itself invites rate-limiting/kicks on heavily
+      // loaded relays (relay.primal.net especially) and feeds the flap loop.
+      const sinceNow=since;
       const subId='tl-'+encodeURIComponent(url).slice(-12).replace(/[^a-z0-9]/gi,'x');
       // Split authors into chunks of 200 to avoid relay filter size limits.
       // Each chunk gets its own sub ID so the relay tracks them independently.
@@ -6674,9 +6982,10 @@ function connectFeedRelay(url,authors,since,attempt=0){
         const staleSecs=(Date.now()-ws._lastMsg)/1000;
         if(staleSecs>105){
           console.log('[Nostr] stale relay, reconnecting:',url);
+          ws._suppressReconnect=true; // we handle the reconnect — onclose must not
           _cleanup();
           try{ws.close();}catch{}
-          setTimeout(()=>connectFeedRelay(url,nFollowing.length?nFollowing:[nPubkey],Math.floor(Date.now()/1000)-120,0),1000);
+          _scheduleReconnect(1000,0);
           return;
         }
         try{ws.send(JSON.stringify(['REQ','ping-'+Date.now().toString(36),{kinds:[1],authors:[nPubkey],limit:0}]));}catch{}
@@ -6690,20 +6999,24 @@ function connectFeedRelay(url,authors,since,attempt=0){
         else if(m[0]==='CLOSED'){
           // Relay rejected or closed our subscription — reconnect
           console.log('[Nostr] sub CLOSED by relay:',url,m[1],m[2]);
+          ws._suppressReconnect=true; // we handle the reconnect — onclose must not
           _cleanup();
-          try{ws.close();}catch{}
-          setTimeout(()=>connectFeedRelay(url,nFollowing.length?nFollowing:[nPubkey],Math.floor(Date.now()/1000)-120,0),2000);
+          try{ws.close();}catch{};
+          _scheduleReconnect(2000,0);
         }
       }catch{}
     };
     ws.onerror=(err)=>{/* close will fire next */};
     ws.onclose=()=>{
       _cleanup();
+      if(ws._suppressReconnect)return; // reconnect already scheduled by whoever closed us
       if(!nPubkey)return;
+      if(epoch!==nFeedEpoch)return;     // stale socket from a previous feed generation
+      if(!RELAYS.includes(url))return;  // relay was removed — do not resurrect it
       // Reset backoff if we had a successful connection; otherwise keep backing off
       const nextAttempt=_everConnected?0:attempt+1;
       const delay=Math.min(3000*Math.pow(2,nextAttempt),60000);
-      setTimeout(()=>connectFeedRelay(url,nFollowing.length?nFollowing:[nPubkey],Math.floor(Date.now()/1000)-120,nextAttempt),delay);
+      _scheduleReconnect(delay,nextAttempt);
     };
   }catch{}
 }
@@ -6729,11 +7042,15 @@ function fetchNProfiles(pubkeys){
             const m=JSON.parse(e.data);
             if(m[0]==='EVENT'&&m[2]?.kind===0){
               const pk=m[2].pubkey;
+              // meta must be parsed BEFORE the condition below reads it —
+              // it used to be declared after, so any "seen but no picture yet"
+              // event hit a ReferenceError (TDZ), got swallowed by the outer
+              // catch, and that profile could never be backfilled.
+              const meta=JSON.parse(m[2].content||'{}');
               // Accept this profile if: not seen yet, OR seen but picture was empty
               const existingHasPic = seenPks.has(pk) && nProfiles[pk]?.picture;
               if(!seenPks.has(pk) || (!existingHasPic && meta.picture)){
                 seenPks.add(pk);
-                const meta=JSON.parse(m[2].content||'{}');
                 // Store full metadata so banner, about, website, nip05, lud16 are all available
                 nProfiles[pk]=Object.assign({},meta,{name:meta.name||meta.display_name||trunc(pk),picture:meta.picture||''});
                 // Patch name + avatar IN-PLACE — no evict/re-render, no flicker
@@ -8635,13 +8952,163 @@ function nwcParseUri(uri){
     const pubkey = (qIdx===-1?withoutScheme:withoutScheme.slice(0,qIdx)).toLowerCase();
     if(!/^[0-9a-f]{64}$/.test(pubkey)) throw new Error('Invalid wallet pubkey in connection string');
     const params = new URLSearchParams(qIdx===-1?'':withoutScheme.slice(qIdx+1));
-    const relay = params.get('relay');
+    // The NWC spec allows a connection string to list more than one relay
+    // (repeated ?relay=... params) for redundancy. We used to only ever read
+    // the first one via params.get('relay') — if that particular relay was
+    // slow, geo-blocked, or just down, every single request would silently
+    // hang until timeout with NO other symptom (looks identical to an
+    // encryption mismatch). Now we keep the full list and race all of them.
+    const relays = [...new Set(params.getAll('relay').map(r=>r.trim()).filter(Boolean))];
+    const relay = relays[0];
     const secret = params.get('secret');
     const lud16 = params.get('lud16')||'';
     if(!relay) throw new Error('Missing relay in connection string');
     if(!secret || !/^[0-9a-f]{64}$/.test(secret)) throw new Error('Missing or invalid secret in connection string');
-    return {pubkey, relay, secret, lud16};
+    // Some wallets embed the per-connection spending budget directly in the
+    // connection string (non-standard, but a handful of implementations do
+    // it) — grab it opportunistically so we can show it if present. Most
+    // wallets do NOT expose this; NIP-47 has no standard "get budget" call.
+    const maxAmount = params.get('max_amount')||params.get('budget')||'';
+    const budgetRenewal = params.get('budget_renewal')||'';
+    return {pubkey, relay, relays, secret, lud16, maxAmount, budgetRenewal};
   }catch(e){ throw e; }
+}
+
+// Union of the connection string's own relay(s) with any user-added extra
+// relays (nwcExtraRelays). Every function that talks to the wallet's relay(s)
+// routes through this so "add a relay" only has to be implemented once.
+// See the nwcExtraRelays declaration above for why this only helps when the
+// wallet service also happens to listen on one of the extras.
+function _nwcAllRelays(){
+  const base = (nwcWallet && nwcWallet.relays && nwcWallet.relays.length) ? nwcWallet.relays : (nwcWallet ? [nwcWallet.relay] : []);
+  return [...new Set([...base, ...(nwcExtraRelays||[])])].filter(Boolean);
+}
+
+function nwcAddExtraRelay(url){
+  const u = (url||'').trim();
+  if(!/^wss?:\/\/.+/i.test(u)) throw new Error('Enter a valid relay URL (wss://...)');
+  if(nwcExtraRelays.includes(u)) return; // already added
+  nwcExtraRelays = [...nwcExtraRelays, u];
+  localStorage.setItem('mts_nwc_extra_relays', JSON.stringify(nwcExtraRelays));
+}
+function nwcRemoveExtraRelay(url){
+  nwcExtraRelays = nwcExtraRelays.filter(r=>r!==url);
+  localStorage.setItem('mts_nwc_extra_relays', JSON.stringify(nwcExtraRelays));
+}
+
+// ── Clean wallet-request status UI ────────────────────────────────────────
+// Wallet requests used to stream every relay-level event (connected / sent /
+// accepted / retrying...) into the status line as they happened — a wall of
+// ⏳ lines on every failure. Now: one spinner + one line while the request
+// runs, and on failure a single readable error box. The full relay log is
+// still captured and attached to the error box inside a collapsed "debug
+// log" <details>, so nothing needed for debugging is lost — it's just not
+// in your face unless you ask for it.
+function _nwcUiBusy(st, label){
+  if(!st) return;
+  st.style.color='var(--t2)';
+  st.innerHTML=`<span style="display:inline-flex;align-items:center;gap:8px;"><span class="spin" style="width:12px;height:12px;border-width:2px;"></span><span>${esc(label)}…</span></span>`;
+}
+function _nwcUiOk(st, msg){
+  if(!st) return;
+  st.style.color='var(--green)';
+  st.textContent='✓ '+msg;
+}
+function _nwcUiErr(st, err, lines, elapsedMs, walletAlive){
+  if(!st) return;
+  const msg=(err && err.message) || 'Unknown error';
+  const isPrimalRelay = !!(nwcWallet && (nwcWallet.relay||'').includes('primal.net'));
+  // One helpful, actionable hint per failure class — this is the "what do I
+  // actually do about it" part that the raw relay log never gave you.
+  let hint='';
+  if(/did not respond in time/i.test(msg)){
+    if(walletAlive===false){
+      // No kind:13194 info event on the connection's own relay(s): the wallet
+      // service isn't publishing anything, so nobody is listening on the other
+      // end. The connection is dead — no amount of retrying will fix it.
+      hint='This connection appears to be dead — the wallet service has no presence on its relay (it publishes no NWC info event), so it was revoked or the service behind it was shut down.'
+        + (isPrimalRelay
+          ? ' Primal shut down their old custodial wallet on April 30, 2026 and every NWC connection created before then stopped working — open your current Primal wallet, create a NEW Nostr Wallet Connect connection string, and paste it here (the old one can never work again).'
+          : ' Create a fresh connection string in your wallet\u2019s Nostr Wallet Connect settings and paste it here.');
+    } else if(walletAlive===true){
+      hint='The wallet service is online on the relay but didn\u2019t answer this request. Retry once; if it keeps happening, re-create the connection string in your wallet.'
+        + (isPrimalRelay ? ' Note: Primal\u2019s current wallet is the new Spark-based one — its NWC is still young and is known to be unreliable with some third-party apps; keeping the Primal app open while you pay is worth a try.' : '');
+    } else {
+      const ctrl = nwcWallet && nwcWallet._lastControlHealthy;
+      if(ctrl===false){
+        hint='Confirmed: even a generic, wallet-unrelated test subscription got no response from this relay — this relay is failing to complete subscriptions for this connection right now, so it isn\u2019t about your wallet. What\u2019s causing that isn\u2019t certain (could be IP-level throttling, a transient relay issue, or something else) — testing from a different network (e.g. phone hotspot) is the fastest way to tell whether it\u2019s network-side, and trying a relay you\u2019ve added in the panel above narrows it further.';
+      } else if(ctrl===true){
+        hint='A generic test subscription on the same relay worked fine, so the relay itself is not blanket-broken right now — this looks specific to the wallet\u2019s presence/response rather than a relay outage. Most likely causes: the wallet app is closed or asleep (open it and try again), the wallet service is down, or this connection was revoked in the wallet\u2019s Nostr Wallet Connect settings.'
+          + (isPrimalRelay ? ' Also: if this connection string was created in Primal before April 30, 2026, it died with Primal\u2019s old custodial wallet — create a fresh one from your current Primal wallet.' : '');
+      } else {
+        hint='Checked twice whether the wallet service is present on its relay and couldn\u2019t get a clear answer either time — the relay itself is being unreliable right now, not just this request. Most likely causes: the wallet app is closed or asleep (open it and try again), the wallet service is down, or this connection was revoked in the wallet\u2019s Nostr Wallet Connect settings.'
+          + (isPrimalRelay ? ' Also: if this connection string was created in Primal before April 30, 2026, it died with Primal\u2019s old custodial wallet — create a fresh one from your current Primal wallet.' : '');
+      }
+    }
+  }
+  else if(/insufficient|balance|quota|budget/i.test(msg))
+    hint='Check that the wallet has enough funds and that this connection\u2019s spending budget (set in your wallet\u2019s NWC settings) hasn\u2019t been exhausted.';
+  else if(/relay|connection|closed|could not open/i.test(msg))
+    hint='No WebSocket could be opened to the relay, so your wallet never even saw the request — this is a relay/network problem, not a wallet problem.'
+      + (isPrimalRelay
+        ? ' This has repeated across different networks and even a different wallet on a different relay, so it isn\u2019t simple IP throttling on relay.primal.net — treat it as this relay/network path being unreliable for this connection right now rather than a rate limit you can wait out. Try adding a different relay in the panel above (only helps if your wallet also listens there), or test from a different network to isolate whether it\u2019s local-network-specific.'
+        : ' Check your internet connection/VPN, or try a relay you\u2019ve added in the panel above.');
+  else if(/decrypt/i.test(msg))
+    hint='The wallet answered but the reply couldn\u2019t be decrypted — this connection string may be corrupted or from an incompatible wallet. Try creating a fresh connection string in your wallet.';
+  st.style.color='var(--t1)';
+  st.innerHTML=`<div style="background:var(--rd);border:1px solid rgba(255,77,106,.3);border-radius:var(--r);padding:10px 12px;text-align:left;">
+    <div style="color:var(--red);font-weight:600;font-size:11px;line-height:1.5;">⚠ ${esc(msg)}</div>
+    ${hint?`<div style="color:var(--t2);font-size:10px;line-height:1.55;margin-top:4px;">${hint}</div>`:''}
+    ${lines&&lines.length?`<details style="margin-top:6px;"><summary style="cursor:pointer;font-family:var(--fm);font-size:9px;color:var(--t3);">debug log · ${lines.length} events · ${((elapsedMs||0)/1000).toFixed(1)}s</summary><div style="margin-top:4px;font-family:var(--fm);font-size:9px;color:var(--t3);line-height:1.6;max-height:140px;overflow-y:auto;">${lines.map(esc).join('<br>')}</div></details>`:''}
+  </div>`;
+}
+// Run one wallet request with the clean UI: busy spinner while it works,
+// error box (with debug log) if it throws. Re-throws so callers can decide
+// what happens next (re-enable buttons etc.) — but they should NOT render
+// the error themselves, it's already on screen.
+async function nwcRunUI(st, busyLabel, fn){
+  const lines=[]; const t0=Date.now();
+  _nwcUiBusy(st, busyLabel);
+  try{
+    return await fn((line)=>lines.push(line));
+  }catch(e){
+    // On a "wallet silent" failure, do one fresh liveness check: does the
+    // wallet service publish its NIP-47 info event (kind 13194) on the
+    // connection's relay(s) at all? We only get here after the relay provably
+    // worked (it accepted our request), so a missing info event means the
+    // connection itself is dead (revoked / retired wallet service) — e.g.
+    // Primal's old custodial-wallet connections, which all died 2026-04-30.
+    // That distinction changes the advice from "open your wallet app" to
+    // "this connection can never work — make a new one".
+    let walletAlive=null;
+    if(/did not respond in time/i.test(e?.message||'')){
+      try{
+        _nwcUiBusy(st,'Checking if this wallet connection is still alive');
+        walletAlive = await _nwcCheckWalletAlive((l)=>lines.push(l));
+      }catch{ walletAlive=null; }
+    }
+    _nwcUiErr(st, e, lines, Date.now()-t0, walletAlive);
+    throw e;
+  }
+}
+
+// Re-render every place wallet state is shown: the standalone wallet modal,
+// the Lightning modal's wallet tab + pay-tab strip, the Nostr pane wallet
+// button, and Settings → Lightning.
+function renderAllWalletUI(){
+  renderNwcManage('nwc-body','nwc');
+  renderNwcManage('lnw-body','lnw');
+  renderLnWalletStrip();
+  renderNS(); renderLightningSettings(); _refreshWalletBtn();
+}
+
+// "Connect Wallet" buttons inside payment flows route here: if the Lightning
+// modal is open, flip to its Wallet tab; otherwise open the standalone
+// wallet modal (used from the Nostr pane).
+function openWalletManage(){
+  const lnOpen = document.getElementById('ln-modal')?.classList.contains('vis');
+  if(lnOpen){ switchLnTab('wallet'); }
+  else openNwcModal();
 }
 
 // Persist + activate a wallet connection. Stored ONLY in localStorage — see note above.
@@ -8650,27 +9117,92 @@ async function nwcSaveConnection(uri, statusEl){
   nwcUri = uri.trim();
   nwcWallet = parsed;
   nwcBalanceSats = null;
+  nwcBalanceIsLive = false;
   localStorage.setItem('mts_nwc_uri', nwcUri);
-  if(statusEl) statusEl.textContent = '⏳ Testing connection...';
+  localStorage.removeItem('mts_nwc_last_balance'); // new/changed connection — any cached balance was for the OLD wallet
+  let verified=false; // returned so the caller only swaps the view on a REAL success
   try{
     await loadNT();
-    const info = await nwcRequest('get_info', {}, 12000).catch(()=>null);
-    const bal = await nwcRequest('get_balance', {}, 12000).catch(()=>null);
-    if(bal && typeof bal.balance === 'number') nwcBalanceSats = Math.floor(bal.balance/1000);
-    if(statusEl) statusEl.textContent = '✓ Wallet connected'+(info?.alias?` (${info.alias})`:'');
+    let info=null, balErr=null;
+    const lines=[]; const t0=Date.now();
+    lines.push(`parsed connection: relay(s) = ${(parsed.relays&&parsed.relays.length?parsed.relays:[parsed.relay]).join(', ')} · wallet …${parsed.pubkey.slice(-8)}${parsed.lud16?' · '+parsed.lud16:''}`);
+    _nwcUiBusy(statusEl, 'Testing connection');
+    try{ info = await nwcRequest('get_info', {}, 16000, (l)=>lines.push(l)); }catch(e){ /* alias is cosmetic — balance check below is the real test */ }
+    try{
+      const bal = await nwcRequest('get_balance', {}, 16000, (l)=>lines.push(l));
+      _nwcApplyBalanceResult(bal);
+    }catch(e){ balErr=e.message; }
+    const encLbl = nwcWallet.encryption==='nip44_v2' ? ' · NIP-44' : (nwcWallet.encryption==='nip04' ? ' · NIP-04' : '');
+    if(balErr){
+      // Same liveness check as nwcRunUI: on a silent wallet, find out whether
+      // the wallet service even exists on its relay before telling the user
+      // to just "open the app".
+      let walletAlive=null;
+      if(/did not respond in time/i.test(balErr)){
+        try{ walletAlive = await _nwcCheckWalletAlive((l)=>lines.push(l)); }catch{}
+      }
+      _nwcUiErr(statusEl, new Error('Saved, but the wallet did not answer a test request: '+balErr), lines.filter(Boolean), Date.now()-t0, walletAlive);
+    } else {
+      verified=true;
+      _nwcUiOk(statusEl, 'Wallet connected'+(info?.alias?` (${info.alias})`:'')+encLbl);
+    }
   }catch(e){
-    if(statusEl) statusEl.textContent = '⚠️ Saved, but could not verify: '+e.message;
+    _nwcUiErr(statusEl, new Error('Saved, but could not verify: '+e.message), [], 0);
   }
-  renderNS(); renderLightningSettings(); _refreshWalletBtn();
+  // NOTE: deliberately NOT renderAllWalletUI() here — that would immediately
+  // re-render the manage pane and wipe the ✓/⚠ status line just written.
+  // nwcConnectFromInput re-renders the panes after a short delay, and only
+  // when verification actually passed.
+  renderLnWalletStrip(); renderNS(); renderLightningSettings(); _refreshWalletBtn();
+  return verified;
+}
+
+// BUG FIX (v2.9.10): on a fresh page load, a previously-saved wallet is
+// reconstituted straight from localStorage (nwcWallet = nwcParseUri(nwcUri)
+// at startup) — but that only parses the connection STRING. nwcBalanceSats
+// and nwcWallet.maxAmount/budgetRenewal are populated exclusively by an
+// actual get_balance round-trip (_nwcApplyBalanceResult), which previously
+// only ever ran from a manual "Check Balance" click or from re-entering the
+// connection string via nwcSaveConnection. So every reload showed "Wallet
+// connected" with the budget line reading "Budget not reported by this
+// wallet" — not because the wallet doesn't report it, but because this app
+// simply hadn't asked yet since the page opened. This fires one silent,
+// non-blocking get_balance on startup (mirrors restoreNSession's pattern in
+// init()) whenever a wallet is already connected, then re-renders whatever
+// wallet UI is currently visible so the real budget/balance shows up
+// without requiring the user to open the modal and click refresh first.
+async function nwcAutoRefreshOnLoad(){
+  if(!nwcWallet || !nwcUri) return;
+  try{
+    await loadNT();
+    // Single short attempt, not the usual 2-pass retry (maxPasses=1, 8s not
+    // 16s) — this is a background nicety (we already showed the cached
+    // figures from localStorage) riding the same request queue as actual
+    // user actions like Pay. It should never make a real payment wait
+    // behind a slow/flaky background retry cycle. If it misses, the
+    // localStorage cache is still on screen, and any manual balance check
+    // or the next reload will pick it up.
+    const bal = await nwcRequest('get_balance', {}, 8000, null, 1);
+    _nwcApplyBalanceResult(bal);
+    document.querySelectorAll('[data-nwc-balance]').forEach(lbl=>{ lbl.textContent = fmtSats(nwcBalanceSats)+' available'; });
+    renderLnWalletStrip(); renderNS(); renderLightningSettings(); _refreshWalletBtn();
+    // If a wallet-manage panel happens to already be open (user clicked
+    // through fast, before this background refresh landed), re-render it
+    // too — the balance span above gets live-patched either way, but the
+    // budget line is baked into the panel's innerHTML and only updates on
+    // a full re-render.
+    if(document.getElementById('nwc-body')) renderNwcManage('nwc-body','nwc');
+    if(document.getElementById('lnw-body')) renderNwcManage('lnw-body','lnw');
+  }catch(e){ console.debug('[NWC] auto balance refresh on load failed (non-fatal):', e.message); }
 }
 
 function nwcDisconnect(){
   if(!confirm('Disconnect this Lightning wallet? You can reconnect any time with a new or the same connection string.')) return;
-  nwcUri=null; nwcWallet=null; nwcBalanceSats=null;
+  nwcUri=null; nwcWallet=null; nwcBalanceSats=null; nwcLastBalanceAt=null;
   localStorage.removeItem('mts_nwc_uri');
+  localStorage.removeItem('mts_nwc_last_balance');
   if(nwcWS){ try{nwcWS.close();}catch{} nwcWS=null; }
-  renderNS(); renderLightningSettings(); _refreshWalletBtn();
-  const b=document.getElementById('nwc-body'); if(b) renderNwcModalBody();
+  renderAllWalletUI();
 }
 
 function _refreshWalletBtn(){
@@ -8682,60 +9214,568 @@ function _refreshWalletBtn(){
   btn.textContent = '⚡ '+(nwcWallet?'Wallet':'Connect Wallet');
 }
 
-// Low-level NIP-47 request/response over the wallet's relay.
-// Encrypts `params` with NIP-04 using the connection secret as our key and the
-// wallet's pubkey as the recipient, publishes a kind:23194 event, and waits for
-// the matching kind:23195 response (tagged with our request's event id).
-function nwcRequest(method, params, timeoutMs){
-  return new Promise(async (resolve, reject)=>{
-    if(!nwcWallet) return reject(new Error('No wallet connected'));
-    try{
-      await loadNT();
-      const content = JSON.stringify({method, params: params||{}});
-      const enc = await window.NostrTools.nip04.encrypt(nwcWallet.secret, nwcWallet.pubkey, content);
-      const reqEv = window.NostrTools.finalizeEvent({
-        kind:23194, created_at:Math.floor(Date.now()/1000),
-        tags:[['p', nwcWallet.pubkey]], content:enc
-      }, nwcWallet.secret);
+// ── Encryption negotiation (NIP-47 compliant) ─────────────────────────────
+// Per NIP-47 the client is supposed to read the wallet service's kind:13194
+// info event and use the `encryption` tag to pick a scheme (absence of the
+// tag means nip04-only). The old code skipped that and blindly tried NIP-44
+// first: a wallet that can't decrypt a NIP-44 request can't even parse it,
+// so most real-world wallet services just DROP it silently — every payment
+// burned a full timeout waiting for a reply that could never come, and then
+// the NIP-04 retry immediately reconnected to the same relay, which
+// relay.primal.net frequently refuses (one connection per client, slow
+// reconnect), killing the attempt at the socket level before the request
+// was ever sent. Now: (1) we read the info event first and try only the
+// schemes the wallet actually advertises, (2) a scheme that produces no
+// response is remembered and skipped for the rest of the session, and
+// (3) connection-level failures are retried on a fresh socket after a short
+// backoff instead of instantly hammering the same relay.
+function _hexToBytes(hex){
+  const b=new Uint8Array(hex.length/2);
+  for(let i=0;i<b.length;i++) b[i]=parseInt(hex.substr(i*2,2),16);
+  return b;
+}
 
-      let ws, done=false, timer;
-      const cleanup=()=>{ done=true; clearTimeout(timer); try{ws.close();}catch{} };
-      timer = setTimeout(()=>{ if(!done){ cleanup(); reject(new Error('Wallet did not respond in time')); } }, timeoutMs||20000);
+function _nwcHasNip44(){ return !!(window.NostrTools?.nip44?.v2); }
 
-      ws = new WebSocket(nwcWallet.relay);
-      ws.onopen = ()=>{
-        ws.send(JSON.stringify(['REQ', 'nwc-'+reqEv.id.slice(0,10), {kinds:[23195], authors:[nwcWallet.pubkey], '#e':[reqEv.id]}]));
-        ws.send(JSON.stringify(['EVENT', reqEv]));
-      };
-      ws.onmessage = async (msg)=>{
-        if(done) return;
-        try{
-          const m = JSON.parse(msg.data);
-          if(m[0]!=='EVENT') return;
-          const ev = m[2];
-          if(!ev || ev.kind!==23195) return;
-          if(!ev.tags?.some(t=>t[0]==='e' && t[1]===reqEv.id)) return;
-          const dec = await window.NostrTools.nip04.decrypt(nwcWallet.secret, nwcWallet.pubkey, ev.content);
-          const payload = JSON.parse(dec);
-          cleanup();
-          if(payload.error) reject(new Error(payload.error.message || payload.error.code || 'Wallet error'));
-          else resolve(payload.result || {});
-        }catch(e){ /* ignore malformed */ }
-      };
-      ws.onerror = ()=>{ if(!done){ cleanup(); reject(new Error('Relay connection error')); } };
-    }catch(e){ reject(e); }
+function _nwcConvKey(){
+  return window.NostrTools.nip44.v2.utils.getConversationKey(_hexToBytes(nwcWallet.secret), nwcWallet.pubkey);
+}
+
+async function nwcEncryptWith(scheme, content){
+  if(scheme==='nip44_v2') return window.NostrTools.nip44.v2.encrypt(content, _nwcConvKey());
+  return window.NostrTools.nip04.encrypt(nwcWallet.secret, nwcWallet.pubkey, content);
+}
+async function nwcDecryptWith(scheme, content){
+  if(scheme==='nip44_v2') return window.NostrTools.nip44.v2.decrypt(content, _nwcConvKey());
+  return window.NostrTools.nip04.decrypt(nwcWallet.secret, nwcWallet.pubkey, content);
+}
+
+// BUG FIX: we used to ONLY read the per-connection spending budget from the
+// (non-standard, rarely-populated) connection URI's max_amount/budget query
+// params, and unconditionally showed "Budget not reported by this wallet"
+// whenever it was absent from the URI. But several wallet-service
+// implementations — including Alby's NWC service (see nostr-wallet-connect-
+// next's BalanceResponse, which carries max_amount/budget_renewal) — report
+// the budget by including it directly in the get_balance RESPONSE instead,
+// and cap the reported "balance" to whatever's left of that budget rather
+// than the wallet's true balance. That's exactly what was happening here:
+// a wallet with 507 sats total and a 500-sat connection budget reported
+// "balance": 500000 (msats) — the budget-capped spendable amount, not the
+// real balance — while the URI never carried a max_amount, so the panel
+// showed "500 sats available" directly above "Budget not reported," which
+// is self-contradictory: that 500 IS the budget. Now we also read
+// max_amount/budget_renewal out of the get_balance result itself (msats,
+// like balance) and let it fill in/override the URI-derived value.
+function _nwcApplyBalanceResult(bal){
+  if(!bal) return;
+  if(typeof bal.balance==='number') nwcBalanceSats = Math.floor(bal.balance/1000);
+  if(typeof bal.max_amount==='number' && bal.max_amount>0) nwcWallet.maxAmount = Math.floor(bal.max_amount/1000);
+  if(bal.budget_renewal) nwcWallet.budgetRenewal = bal.budget_renewal;
+  // Cache the freshly-confirmed figures so the NEXT page load can show them
+  // immediately instead of "Balance unknown" while it waits on a live
+  // round-trip — see the nwcLastBalanceAt hydration at startup above.
+  nwcLastBalanceAt = Date.now();
+  nwcBalanceIsLive = true;
+  try{
+    localStorage.setItem('mts_nwc_last_balance', JSON.stringify({
+      sats: nwcBalanceSats, maxAmount: nwcWallet.maxAmount||null,
+      budgetRenewal: nwcWallet.budgetRenewal||null, at: nwcLastBalanceAt
+    }));
+  }catch{}
+}
+
+// ── Shared WebSocket pool for NWC relay connections ─────────────────────
+// BUG FIX (v2.9.8): every NWC operation used to open its own throwaway
+// WebSocket, even when several ran back-to-back against the SAME relay
+// within the same few seconds. A single "test connection" click did:
+//   1. an invisible kind:13194 info-probe socket (to pick an encryption
+//      scheme) — nwcAdvertisedSchemes() -> _nwcFetchInfoEvent()
+//   2. a fresh socket per encryption scheme tried for get_info
+//   3. a fresh socket per pass/retry for get_balance
+// That's up to 5 independent socket opens to one relay in ~7s for what
+// only needs one connection carrying a couple of requests. Rapid repeat
+// handshakes like that are a well-known trigger for transient connection
+// resets — it looks exactly like relay flakiness ("✗ Relay connection
+// error" sitting right next to a successful reply from the very same
+// relay moments earlier) but is really this app hammering the relay with
+// more connections than the operation needs. This mirrors the churn bug
+// already fixed for the feed/notification relays (single-flight
+// reconnects, v2.9's notes) — that fix never made it to the NWC path.
+//
+// _nwcPoolAcquire(relayUrl) now hands out ONE shared, already-open socket
+// per relay URL, reused by every caller for as long as it stays healthy.
+// Multiple logical subscriptions/publishes are multiplexed over it by
+// sub-id / event-id. A socket is kept warm for a short idle window after
+// its last user releases it (instead of being closed the instant one
+// caller is done), so the very next call in the same test cycle — e.g.
+// get_balance right after get_info — reuses the connection instead of
+// reopening it. NIP-42 AUTH is handled once per socket, at the pool
+// level, and re-triggers a resend of anything currently in flight on
+// that socket.
+const _nwcPool = new Map(); // relayUrl -> pool entry
+const NWC_POOL_IDLE_MS = 15000;
+
+function _nwcPoolBroadcastFail(entry, err){
+  entry.subs.forEach(s=>s.onFail && s.onFail(err));
+  entry.pubs.forEach(p=>p.onFail && p.onFail(err));
+  entry.subs.clear(); entry.pubs.clear();
+}
+
+function _nwcPoolRoute(entry, msg){
+  let m;
+  try{ m = JSON.parse(msg.data); }catch{ return; }
+  const type = m[0];
+  if(type==='AUTH'){
+    if(!entry.authed){
+      entry.authed = true;
+      try{
+        const authEv = window.NostrTools.finalizeEvent({
+          kind:22242, created_at:Math.floor(Date.now()/1000),
+          tags:[['relay', entry.url], ['challenge', m[1]]], content:''
+        }, nwcWallet.secret);
+        entry.ws.send(JSON.stringify(['AUTH', authEv]));
+        // Re-send anything already in flight on this socket in case the
+        // relay silently queued/dropped it pre-auth rather than rejecting it.
+        entry.subs.forEach(s=>s.resend && s.resend());
+        entry.pubs.forEach(p=>p.resend && p.resend());
+      }catch(e){ console.debug('[NWC] auth failed', e); }
+    }
+    return;
+  }
+  if(type==='OK'){ const pub = entry.pubs.get(m[1]); if(pub) pub.onOk && pub.onOk(m[2], m[3]); return; }
+  if(type==='NOTICE'){ entry.subs.forEach(s=>s.onNotice && s.onNotice(m[1])); return; }
+  if(type==='CLOSED'){ const sub = entry.subs.get(m[1]); if(sub) sub.onClosed && sub.onClosed(m[2]); return; }
+  if(type==='EOSE'){ const sub = entry.subs.get(m[1]); if(sub) sub.onEose && sub.onEose(); return; }
+  if(type==='EVENT'){ const sub = entry.subs.get(m[1]); if(sub) sub.onEvent && sub.onEvent(m[2]); return; }
+}
+
+function _nwcPoolEntry(relayUrl){
+  let entry = _nwcPool.get(relayUrl);
+  if(entry && (entry.ws.readyState===WebSocket.CLOSED || entry.ws.readyState===WebSocket.CLOSING)) entry = null;
+  if(entry) return entry;
+  entry = { url: relayUrl, subs: new Map(), pubs: new Map(), authed:false, refCount:0, idleTimer:null, ready:null };
+  let resolveReady, rejectReady;
+  entry.ready = new Promise((res, rej)=>{ resolveReady=res; rejectReady=rej; });
+  entry.ready.catch(()=>{}); // this promise is also awaited elsewhere; prevent unhandled-rejection noise
+  let ws;
+  try{ ws = new WebSocket(relayUrl); }
+  catch(e){ const err = new Error('Could not open relay connection: '+e.message); rejectReady(err); entry.failed = err; _nwcPool.set(relayUrl, entry); return entry; }
+  entry.ws = ws;
+  ws.onopen = ()=>resolveReady(ws);
+  ws.onmessage = (msg)=>_nwcPoolRoute(entry, msg);
+  ws.onerror = ()=>{
+    const err = new Error('Relay connection error');
+    entry.failed = err;
+    rejectReady(err);
+    _nwcPool.delete(relayUrl);
+    _nwcPoolBroadcastFail(entry, err);
+  };
+  ws.onclose = ()=>{
+    const err = entry.failed || new Error('Relay closed the connection before responding');
+    rejectReady(err);
+    _nwcPool.delete(relayUrl);
+    _nwcPoolBroadcastFail(entry, err);
+  };
+  _nwcPool.set(relayUrl, entry);
+  return entry;
+}
+
+function _nwcPoolAcquire(relayUrl){
+  const entry = _nwcPoolEntry(relayUrl);
+  entry.refCount++;
+  if(entry.idleTimer){ clearTimeout(entry.idleTimer); entry.idleTimer=null; }
+  return entry;
+}
+
+function _nwcPoolRelease(entry){
+  entry.refCount = Math.max(0, entry.refCount-1);
+  if(entry.refCount===0 && !entry.failed){
+    // Keep the socket warm briefly — the next call in the same test/request
+    // cycle (e.g. get_balance right after get_info) very often wants the
+    // exact same relay within a second or two.
+    entry.idleTimer = setTimeout(()=>{
+      if(entry.refCount===0){ try{entry.ws.close();}catch{} _nwcPool.delete(entry.url); }
+    }, NWC_POOL_IDLE_MS);
+  }
+}
+
+// One-shot subscription against a pooled relay socket: resolves with
+// {event} on the first matching event, {eose:true} if EOSE arrives with no
+// match, {failed:true} on a socket-level failure, or {timedOut:true}.
+// Never rejects. Reuses whatever socket is already open/opening for this
+// relay instead of creating a new one.
+function _nwcPoolSubscribeOnce(relayUrl, filter, matchFn, timeoutMs){
+  return new Promise((resolve)=>{
+    const entry = _nwcPoolAcquire(relayUrl);
+    const subId = 'nwc-sub-'+Math.random().toString(36).slice(2,8);
+    let done=false;
+    const finish=(val)=>{
+      if(done) return; done=true; clearTimeout(timer);
+      try{ if(entry.ws.readyState===WebSocket.OPEN) entry.ws.send(JSON.stringify(['CLOSE',subId])); }catch{}
+      entry.subs.delete(subId); _nwcPoolRelease(entry);
+      resolve(val);
+    };
+    const timer=setTimeout(()=>finish({timedOut:true}), timeoutMs);
+    const send=()=>{ try{ entry.ws.send(JSON.stringify(['REQ', subId, filter])); }catch{ finish({failed:true}); } };
+    entry.subs.set(subId, {
+      resend: send,
+      onEvent: (ev)=>{ if(!matchFn || matchFn(ev)) finish({event:ev}); },
+      onEose: ()=>finish({eose:true}),
+      onFail: ()=>finish({failed:true})
+    });
+    if(entry.ws.readyState===WebSocket.OPEN) send();
+    else entry.ready.then(send).catch(()=>finish({failed:true}));
   });
 }
 
-async function nwcPayInvoice(bolt11, amountMsat){
+// Fetch the wallet service's kind:13194 info event from the connection's
+// relays (raced — first relay to return it wins). Resolves null if no relay
+// has it within the timeout; never rejects.
+// Returns {ev} when found, {absent:true} when at least one relay ANSWERED
+// (EOSE) and none had the event — the only outcome that actually proves the
+// wallet publishes nothing — or null when the probe itself couldn't reach any
+// relay (inconclusive: says nothing about whether the wallet exists).
+// Previously every outcome collapsed to null, and callers read null as
+// "wallet is dead" — so a rate-limited/unreachable relay (exactly what
+// relay.primal.net does under connection churn) produced a false
+// "connection appears dead" verdict on perfectly healthy connections.
+async function _nwcFetchInfoEvent(timeoutMs){
+  const relays = _nwcAllRelays();
+  const results = await Promise.all(relays.map(r=>
+    _nwcPoolSubscribeOnce(r, {kinds:[13194], authors:[nwcWallet.pubkey]}, ev=>ev && ev.kind===13194, timeoutMs)
+  ));
+  const found = results.find(r=>r.event);
+  if(found) return {ev: found.event};
+  return results.some(r=>r.eose) ? {absent:true} : null;
+}
+
+// Generic relay-health control check: subscribe with NO filter beyond a
+// limit, on the same relay(s) as the wallet connection. This has nothing to
+// do with the wallet — any relay holding literally any events should EOSE
+// almost instantly. If THIS also gets no EOSE, it proves the relay itself is
+// failing to complete subscriptions for this connection/IP right now, which
+// would produce "wallet did not respond" and an inconclusive info-event probe
+// regardless of whether the wallet is actually fine. Without this control,
+// "still inconclusive" was indistinguishable from "we didn't really check."
+async function _nwcRelayControlCheck(timeoutMs){
+  const relays = _nwcAllRelays();
+  const results = await Promise.all(relays.map(r=>
+    _nwcPoolSubscribeOnce(r, {limit:1}, ()=>true, timeoutMs)
+  ));
+  return results.some(r=>r.event || r.eose);
+}
+
+// Wrapper around _nwcFetchInfoEvent that actually commits to an answer.
+// A single probe attempt against a relay that's under any load at all
+// (relay.primal.net has been flaky) can miss EOSE inside a short timeout and
+// come back null ("inconclusive") even when the wallet is perfectly fine or
+// perfectly dead — that ambiguity was silently falling through to the vaguest
+// possible hint ("check if the wallet app is open") instead of a real answer.
+// This now tries twice — a quick first pass, then a slower second pass only
+// if the first didn't land on a real verdict — before giving up. If it's
+// still inconclusive after both tries, it runs a generic control subscription
+// (unrelated to the wallet) on the same relay: if the control ALSO gets no
+// EOSE, that conclusively points at the relay itself, not the wallet.
+async function _nwcCheckWalletAlive(onLine){
+  const say=(t)=>{ console.debug('[NWC]', t); onLine && onLine(t); };
+  say('checking whether the wallet service is present on its relay (kind:13194)...');
+  let probe = await _nwcFetchInfoEvent(4000).catch(()=>null);
+  let alive = probe && probe.ev ? true : (probe && probe.absent ? false : null);
+  if(alive===null){
+    say('first presence check was inconclusive (relay didn\u2019t answer in time) — retrying once with more time...');
+    probe = await _nwcFetchInfoEvent(8000).catch(()=>null);
+    alive = probe && probe.ev ? true : (probe && probe.absent ? false : null);
+  }
+  if(alive===null){
+    say('still inconclusive — running a control check (a generic, wallet-unrelated subscription on the same relay) to see if the relay can complete ANY subscription right now...');
+    const relayHealthy = await _nwcRelayControlCheck(6000).catch(()=>false);
+    say(relayHealthy
+      ? '? control subscription succeeded — the relay CAN complete subscriptions right now, so the wallet-info miss is more likely specific to this connection/wallet, not a blanket relay outage'
+      : '✗ control subscription ALSO got no EOSE — the relay itself is failing to complete subscriptions for this connection right now (confirmed relay-side, not wallet-side)');
+    nwcWallet._lastControlHealthy = relayHealthy;
+  }
+  say(alive===true ? '✓ wallet service info event found on relay — service exists'
+    : alive===false ? '✗ no wallet info event on relay after 2 checks — connection appears dead'
+    : '? still inconclusive after 2 checks — the relay itself isn\u2019t reliably answering right now, so this says nothing about the wallet');
+  return alive;
+}
+
+// NIP-47 encryption negotiation: read the wallet's info event once per
+// session and cache the advertised schemes on the wallet object.
+// Per spec, an info event WITHOUT an encryption tag means nip04-only.
+async function nwcAdvertisedSchemes(){
+  if(nwcWallet._infoSchemes !== undefined) return nwcWallet._infoSchemes;
+  nwcWallet._infoSchemes = null;
+  try{
+    const probe = await _nwcFetchInfoEvent(5000);
+    const ev = probe && probe.ev;
+    if(ev){
+      const tag = ev.tags?.find(t=>t[0]==='encryption');
+      nwcWallet._infoSchemes = tag ? String(tag[1]||'').split(/\s+/).filter(Boolean) : ['nip04'];
+      nwcWallet._infoMethods = String(ev.content||'').split(/\s+/).filter(Boolean);
+      console.debug('[NWC] info event: encryption =', nwcWallet._infoSchemes.join(' ') || '(none)', '· methods =', nwcWallet._infoMethods.join(' '));
+    } else {
+      console.debug('[NWC] no info event found on the connection relay(s) — will probe schemes directly');
+    }
+  }catch(e){ console.debug('[NWC] info event fetch failed', e); }
+  return nwcWallet._infoSchemes;
+}
+
+// Open (or reuse) a pooled relay connection, publish the (already-built +
+// signed) request event, and resolve with the decrypted result — or reject.
+// Handles NIP-42 ["AUTH", challenge] at the pool level (see _nwcPoolRoute).
+function _nwcAttemptOnRelay(relayUrl, reqEv, scheme, timeoutMs, onStatus){
+  return new Promise((resolve, reject)=>{
+    let done=false, timer, handshakeTimer;
+    const t0 = performance.now();
+    const tag = (t)=>{ const line=`[${relayUrl}] ${t}`; console.debug('[NWC]', (performance.now()-t0).toFixed(0)+'ms', line); onStatus && onStatus(line); };
+    const entry = _nwcPoolAcquire(relayUrl);
+    const subId = 'nwc-'+reqEv.id.slice(0,10);
+    let opened = entry.ws && entry.ws.readyState===WebSocket.OPEN;
+
+    const finish=()=>{ if(done) return; done=true; clearTimeout(timer); clearTimeout(handshakeTimer); entry.subs.delete(subId); entry.pubs.delete(reqEv.id); _nwcPoolRelease(entry); };
+    const fail=(msg)=>{ if(done) return; finish(); tag('✗ '+msg); reject(new Error(msg+' ('+scheme+', '+relayUrl+')')); };
+    const succeed=(val)=>{ if(done) return; finish(); resolve(val); };
+
+    // Main request-level timeout — same "handshake never opened" vs "wallet
+    // never answered" classification as before, driven off `opened`.
+    timer = setTimeout(()=>fail(opened ? 'Wallet did not respond in time' : 'Could not open relay connection (handshake timed out)'), timeoutMs);
+    // Fast-fail guard for a stuck handshake on a NOT-YET-open socket, so a
+    // dead/slow relay doesn't burn the whole request budget before the next
+    // scheme/pass gets a turn. Not needed when reusing an already-open pooled
+    // socket (the common case for a second request against the same relay).
+    if(!opened) handshakeTimer = setTimeout(()=>fail('Could not open relay connection (handshake timed out)'), Math.min(9000, timeoutMs));
+
+    const publish=()=>{
+      try{
+        entry.ws.send(JSON.stringify(['REQ', subId, {kinds:[23195], authors:[nwcWallet.pubkey]}]));
+        entry.ws.send(JSON.stringify(['EVENT', reqEv]));
+      }catch(e){ fail('Could not send on relay connection: '+e.message); return; }
+      tag('→ request sent, waiting for wallet...');
+    };
+
+    entry.subs.set(subId, {
+      resend: publish,
+      onNotice: (m)=>tag('notice: '+m),
+      onClosed: (reason)=>fail('Relay closed subscription'+(reason?': '+reason:'')),
+      onEose: ()=>{}, // ephemeral NWC replies aren't guaranteed before EOSE; keep listening
+      onEvent: async (ev)=>{
+        if(!ev || ev.kind!==23195) return;
+        if(!ev.tags?.some(t=>t[0]==='e' && t[1]===reqEv.id)) return;
+        // Decrypt the reply. Wallets normally tag the response with the
+        // scheme they used, but some don't — so try the tagged scheme, then
+        // the request's scheme, then the other one, before giving up.
+        const respEncTag = ev.tags?.find(t=>t[0]==='encryption');
+        const other = scheme==='nip44_v2' ? 'nip04' : (_nwcHasNip44() ? 'nip44_v2' : null);
+        const candidates = [...new Set([respEncTag?.[1], scheme, other].filter(Boolean))];
+        let payload=null, decErr=null;
+        for(const cs of candidates){
+          try{ payload = JSON.parse(await nwcDecryptWith(cs, ev.content)); break; }
+          catch(e){ decErr=e; }
+        }
+        if(!payload){ fail('Could not decrypt wallet reply'+(decErr?': '+decErr.message:'')); return; }
+        if(payload.error){ tag('✗ wallet error: '+(payload.error.message||payload.error.code)); finish(); reject(new Error(payload.error.message || payload.error.code || 'Wallet error')); }
+        else{ tag('✓ got a reply'); succeed(payload.result || {}); }
+      },
+      onFail: (err)=>fail(err.message || 'Relay connection error')
+    });
+    entry.pubs.set(reqEv.id, {
+      resend: publish,
+      onOk: (ok, reason)=>{ if(ok===false) fail('Relay rejected the request'+(reason?': '+reason:'')); else tag('✓ relay accepted request, waiting for wallet reply...'); },
+      onFail: (err)=>fail(err.message || 'Relay connection error')
+    });
+
+    if(opened){
+      tag('connected'); // reusing an already-open pooled socket — no handshake needed
+      publish();
+    } else {
+      entry.ready.then(()=>{
+        if(done) return;
+        opened=true; clearTimeout(handshakeTimer);
+        tag('connected');
+        publish();
+      }).catch(()=>{ /* entry's own onerror/onclose already calls fail() via onFail */ });
+    }
+  });
+}
+
+// One full request/response round trip, using a single specific encryption
+// scheme, raced across every relay listed in the connection string (usually
+// just one, but NWC strings can list several — see nwcParseUri). Whichever
+// relay answers first wins; only fails if every relay fails.
+async function _nwcAttempt(method, params, scheme, timeoutMs, onStatus){
+  const content = JSON.stringify({method, params: params||{}});
+  const enc = await nwcEncryptWith(scheme, content);
+  // NIP-47: a request carries a 'p' tag (wallet service pubkey) and an
+  // 'encryption' tag naming the scheme used — on EVERY request, including
+  // nip04 ones (an untagged request is assumed nip04, but being explicit
+  // lets wallets that check the tag route it correctly). The 'v' tag we used
+  // to add is not part of NIP-47 and is dropped.
+  const tags = [['p', nwcWallet.pubkey], ['encryption', scheme]];
+  const reqEv = window.NostrTools.finalizeEvent({
+    kind:23194, created_at:Math.floor(Date.now()/1000),
+    tags, content:enc
+  }, nwcWallet.secret);
+
+  const relays = _nwcAllRelays();
+  const attempts = relays.map(r=>_nwcAttemptOnRelay(r, reqEv, scheme, timeoutMs, onStatus));
+  try{
+    return await Promise.any(attempts);
+  }catch(aggErr){
+    // Promise.any's AggregateError buries the individual messages — surface the
+    // most useful one (prefer an explicit rejection over a generic timeout).
+    const errs = aggErr.errors || [aggErr];
+    const notTimeout = errs.find(e=>!/did not respond in time/i.test(e.message));
+    throw notTimeout || errs[0];
+  }
+}
+
+// Public entry point. Scheme order comes from, in priority order:
+//   1. whichever scheme already worked for this wallet (nwcWallet.encryption)
+//   2. the wallet's own kind:13194 info event (NIP-47 negotiation)
+//   3. probing: NIP-44 then NIP-04 (or just NIP-04 if this nostr-tools build
+//      has no NIP-44 module)
+// A scheme that produces no response at all is remembered
+// (nwcWallet._noRespSchemes) and skipped for the rest of the session, so a
+// nip04-only wallet stops paying a full NIP-44 timeout on every request.
+// Connection-level failures (socket error / relay closed / timeout) are
+// retried in a second pass on fresh sockets after a short backoff — an
+// instant reconnect to the same relay (relay.primal.net especially) is often
+// refused, which used to kill the fallback scheme before it was ever sent.
+// onStatus(text), if given, gets a live line for every relay-level event
+// (connected / auth challenge / accepted / reply) — surface it in the UI
+// instead of requiring devtools to see what's actually happening.
+// BUG FIX (v2.9.13): concurrent NWC requests were racing on the shared
+// per-relay pooled socket. nwcAutoRefreshOnLoad (v2.9.10) fires a
+// get_balance check in the background on every page load, and that check
+// can legitimately still be retrying (its own 2.5s backoff + second pass)
+// for up to ~35s after the page opens. If the user opened the Lightning
+// modal and hit Pay inside that window, nwcRequest was called a SECOND
+// time while the background check was still in flight — both calls target
+// the same relay, so _nwcPoolAcquire multiplexes them onto the SAME
+// WebSocket by design (that's what the pool is for). But NIP-47 is
+// fundamentally a request/reply protocol, and a wallet service that isn't
+// built to juggle two concurrent requests over one connection (especially
+// when one of them — pay_invoice — may be waiting on a spend confirmation)
+// can end up answering neither, or silently dropping one. This reproduced
+// with two different wallets/relays because the trigger was on OUR side:
+// timing, not the wallet. nwcRequest is now serialized through a small
+// promise-chain mutex (_nwcRequestQueue) so calls — auto-refresh, manual
+// balance checks, and payments alike — always run one at a time, in the
+// order they were made, never overlapping on the shared connection.
+let _nwcRequestQueue = Promise.resolve();
+function nwcRequest(method, params, timeoutMs, onStatus, maxPasses){
+  const run = ()=>_nwcRequestImpl(method, params, timeoutMs, onStatus, maxPasses);
+  const result = _nwcRequestQueue.then(run, run);
+  _nwcRequestQueue = result.then(()=>{}, ()=>{}); // don't let a rejection stall the queue for the NEXT call
+  return result;
+}
+function _nwcRequestImpl(method, params, timeoutMs, onStatus, maxPasses){
+  return (async ()=>{
+    if(!nwcWallet) throw new Error('No wallet connected');
+    await loadNT();
+    const total = timeoutMs || 20000;
+
+    const supported = _nwcHasNip44() ? ['nip44_v2','nip04'] : ['nip04'];
+    let order;
+    if(nwcWallet.encryption){
+      order = [nwcWallet.encryption];
+    } else {
+      const advertised = await nwcAdvertisedSchemes();
+      if(advertised && advertised.length){
+        order = supported.filter(s=>advertised.includes(s));
+        if(!order.length) order = supported; // wallet advertises something we don't know — probe anyway
+      } else {
+        order = supported;
+      }
+    }
+    // Schemes that already went silent this session get tried last (or skipped on retries)
+    const noResp = nwcWallet._noRespSchemes || {};
+    order = [...order].sort((a,b)=>(noResp[a]?1:0)-(noResp[b]?1:0));
+
+    let lastErr;
+    const passLimit = maxPasses||2;
+    for(let pass=0; pass<passLimit; pass++){
+      if(pass>0){
+        onStatus && onStatus('retrying on a fresh relay connection...');
+        // Give the relay a moment — an instant reconnect is frequently refused
+        await new Promise(r=>setTimeout(r,2500));
+      }
+      // On retries, skip schemes that already produced silence (unless that's all we have)
+      const fresh = order.filter(s=>!(nwcWallet._noRespSchemes||{})[s]);
+      const tryList = (pass===0 || !fresh.length) ? order : fresh;
+      for(let i=0;i<tryList.length;i++){
+        const scheme = tryList[i];
+        const perTry = tryList.length>1 ? Math.max(7000, Math.floor(total/tryList.length)) : total;
+        try{
+          const result = await _nwcAttempt(method, params, scheme, perTry, onStatus);
+          nwcWallet.encryption = scheme; // remember what worked so future calls skip straight to NIP-44 or NIP-04
+          return result;
+        }catch(e){
+          console.debug('[NWC] attempt failed', scheme, e.message);
+          lastErr = e;
+          // Silence ⇒ this scheme can't reach the wallet (usually: wallet can't
+          // decrypt it). Remember and move on.
+          if(/did not respond in time/i.test(e.message)){
+            (nwcWallet._noRespSchemes ||= {})[scheme] = true;
+            continue;
+          }
+          // Socket-level failure ⇒ retryable (next scheme, then next pass).
+          if(/relay connection error|relay closed|could not open/i.test(e.message)) continue;
+          // Anything else is a real wallet-side answer (bad invoice, insufficient
+          // balance, quota, ...) — surface it, don't retry.
+          throw e;
+        }
+      }
+    }
+    throw lastErr || new Error('Wallet did not respond in time');
+  })();
+}
+
+async function nwcPayInvoice(bolt11, amountMsat, onStatus){
   const params = {invoice: bolt11};
   // amount override — required by zero-amount invoices, ignored by wallets otherwise
   if(amountMsat) params.amount = Math.round(amountMsat);
-  return nwcRequest('pay_invoice', params, 45000);
+  return nwcRequest('pay_invoice', params, 45000, onStatus);
 }
 
 // ── Wallet Connect modal (setup / manage) ─────────────────────────────────
-function openNwcModal(){ renderNwcModalBody(); openM('nwc-modal'); }
+function openNwcModal(){ renderNwcManage('nwc-body','nwc'); openM('nwc-modal'); }
+
+// ── Lightning modal (header ⚡ button): pay + wallet + history in one place ─
+function openLnModal(tab){
+  renderLnWalletStrip();
+  renderNwcManage('lnw-body','lnw');
+  openM('ln-modal');
+  switchLnTab(tab || 'pay');
+}
+function switchLnTab(tab){
+  document.querySelectorAll('#ln-modal .stab').forEach(t=>t.classList.remove('on'));
+  document.getElementById('lntab-'+tab)?.classList.add('on');
+  document.getElementById('lnp-pay').style.display    = tab==='pay'    ? 'block':'none';
+  document.getElementById('lnp-wallet').style.display = tab==='wallet' ? 'block':'none';
+  document.getElementById('lnp-history').style.display= tab==='history'? 'block':'none';
+  if(tab==='pay') setTimeout(()=>document.getElementById('lnp-addr-in')?.focus(),60);
+  if(tab==='wallet') renderNwcManage('lnw-body','lnw');
+  if(tab==='history') renderNwcTxInto('lnh-body','lnh');
+}
+// Compact wallet status strip shown at the top of the Pay tab.
+function renderLnWalletStrip(){
+  const el=document.getElementById('lnp-wallet-strip');
+  if(!el) return;
+  if(nwcWallet){
+    el.innerHTML=`<div class="nc-card" style="border-color:rgba(247,183,49,.25);margin-bottom:0;padding:10px 12px;">
+      <div class="nc-av" style="width:28px;height:28px;"><div style="width:100%;height:100%;background:var(--bg-4);display:flex;align-items:center;justify-content:center;font-size:13px;">⚡</div></div>
+      <div style="flex:1;min-width:0;"><div style="font-size:12px;font-weight:600;color:var(--t0);">Wallet connected</div><div style="font-family:var(--fm);font-size:10px;color:var(--gold);margin-top:1px;" data-nwc-balance>${nwcBalanceSats!==null?fmtSats(nwcBalanceSats)+' available':'Ready to pay'}</div></div>
+      <button class="btn" style="font-size:10px;" onclick="switchLnTab('wallet')">Manage</button>
+    </div>`;
+  } else {
+    el.innerHTML=`<div class="warn" style="margin-bottom:0;display:flex;align-items:center;gap:10px;">
+      <span style="flex:1;">No wallet connected — connect one to send payments.</span>
+      <button class="btn-p" style="white-space:nowrap;padding:5px 12px;" onclick="switchLnTab('wallet')">Connect Wallet</button>
+    </div>`;
+  }
+}
 
 function buildNwcSettingsHTML(){
   if(nwcWallet){
@@ -8757,32 +9797,51 @@ function renderLightningSettings(){
   el.innerHTML = buildNwcSettingsHTML();
 }
 
-function renderNwcModalBody(){
-  const b = document.getElementById('nwc-body');
+// Shared wallet setup/manage renderer. Used by BOTH the standalone wallet
+// modal (bodyId 'nwc-body', pfx 'nwc') and the Lightning modal's Wallet tab
+// (bodyId 'lnw-body', pfx 'lnw') — same markup, per-pane element ids.
+// forceChange=true shows the "paste a connection string" form even when a
+// wallet is already connected (the "Change Wallet" button).
+function renderNwcManage(bodyId, pfx, forceChange){
+  const b = document.getElementById(bodyId);
   if(!b) return;
-  if(nwcWallet){
+  if(nwcWallet && !forceChange){
+    const budgetLine = nwcWallet.maxAmount
+      ? `<div style="font-family:var(--fm);font-size:10px;color:var(--t3);margin-top:2px;">Budget: ${Number(nwcWallet.maxAmount).toLocaleString()} sats${nwcWallet.budgetRenewal?' / '+nwcWallet.budgetRenewal:''}</div>`
+      : '';
+    const historyAction = pfx==='lnw'
+      ? `switchLnTab('history')`
+      : `closeM('nwc-modal');openNwcTxModal()`;
     b.innerHTML = `
       <div class="nc-card" style="border-color:rgba(247,183,49,.25);">
         <div class="nc-av"><div style="width:100%;height:100%;background:var(--bg-4);display:flex;align-items:center;justify-content:center;font-size:16px;">⚡</div></div>
-        <div><div style="font-size:13px;font-weight:600;color:var(--t0);">Wallet Connected</div><div style="font-family:var(--fm);font-size:10px;color:var(--t2);margin-top:2px;" id="nwc-balance-lbl">${nwcBalanceSats!==null?fmtSats(nwcBalanceSats)+' available':'Balance unknown'}</div></div>
+        <div><div style="font-size:13px;font-weight:600;color:var(--t0);">Wallet Connected</div><div style="font-family:var(--fm);font-size:10px;color:var(--t2);margin-top:2px;" data-nwc-balance>${nwcBalanceSats!==null?fmtSats(nwcBalanceSats)+' available':'Balance unknown'}${nwcBalanceSats!==null&&!nwcBalanceIsLive?' <span style="color:var(--t3);">(last known)</span>':''}</div>${budgetLine}</div>
       </div>
-      <div class="info">Zaps sent from this dashboard will draw directly from this wallet over your chosen relay. This connection string is stored only in this browser.</div>
+      <div class="info">Payments and zaps sent from this dashboard will draw directly from this wallet over your chosen relay. This connection string is stored only in this browser. Per-connection spending budgets are set and enforced by your wallet, not by this dashboard. Some wallets report the budget back to us (via the connection string or the balance check above); if yours doesn't, "Budget" will say "not reported" — that doesn't mean there isn't one, only that we can't display it.</div>
+      <details style="margin-bottom:10px;">
+        <summary style="cursor:pointer;font-family:var(--fm);font-size:11px;color:var(--accent);margin-bottom:6px;">📡 Relays used for this wallet</summary>
+        <div id="${pfx}-relaypanel"></div>
+      </details>
       <div style="display:flex;gap:8px;flex-wrap:wrap;">
-        <button class="btn" onclick="nwcCheckBalance()">↻ Check Balance</button>
-        <button class="btn" onclick="renderNwcModalBody_change()">Change Wallet</button>
+        <button class="btn" onclick="nwcCheckBalance('${pfx}')">↻ Check Balance</button>
+        <button class="btn" onclick="${historyAction}">🧾 Transaction History</button>
+        <button class="btn" onclick="renderNwcManage('${bodyId}','${pfx}',true)">Change Wallet</button>
         <button class="btn" style="border-color:rgba(255,90,90,.4);color:var(--red);" onclick="nwcDisconnect()">Disconnect</button>
       </div>
-      <div id="nwc-modal-status" style="font-family:var(--fm);font-size:11px;color:var(--t2);margin-top:10px;"></div>`;
-  } else {
-    renderNwcModalBody_change();
+      <div id="${pfx}-status" style="font-family:var(--fm);font-size:11px;color:var(--t2);margin-top:10px;"></div>`;
+    _nwcRenderRelayPanel(pfx);
+    return;
   }
-}
-
-function renderNwcModalBody_change(){
-  const b = document.getElementById('nwc-body');
-  if(!b) return;
   b.innerHTML = `
-    <div class="info">Connect an existing Lightning wallet so you can zap posts from here. Your wallet stays in full control of your funds — this dashboard only ever asks it to pay an invoice, and can be disconnected any time.</div>
+    <div class="info">Connect an existing Lightning wallet so you can pay and zap from here. Your wallet stays in full control of your funds — this dashboard only ever asks it to pay an invoice, and can be disconnected any time.</div>
+    ${nwcWallet ? `
+    <details style="margin-bottom:10px;" open>
+      <summary style="cursor:pointer;font-family:var(--fm);font-size:11px;color:var(--accent);margin-bottom:6px;">📡 Relays for currently saved wallet (…${esc(nwcWallet.pubkey.slice(-8))})</summary>
+      <div id="${pfx}-relaypanel"></div>
+    </details>
+    <div style="display:flex;justify-content:flex-end;margin-bottom:14px;">
+      <button class="btn-p" onclick="nwcRetryTest('${pfx}')">↻ Retry test — ${esc((nwcWallet.relays&&nwcWallet.relays.length?nwcWallet.relays:[nwcWallet.relay]).join(', '))}</button>
+    </div>` : ''}
     <details style="margin-bottom:10px;"><summary style="cursor:pointer;font-family:var(--fm);font-size:11px;color:var(--accent);margin-bottom:6px;">📱 Primal Wallet — where do I find this?</summary>
       <div style="font-size:11px;color:var(--t2);line-height:1.6;padding:8px 4px;">Open Primal → Settings → Connected Wallets (or, in the mobile Primal Wallet, Settings → Nostr Wallet Connect) → <strong>New Connection</strong>, name it "Monitor", then copy the string it gives you and paste it below.</div>
     </details>
@@ -8794,42 +9853,250 @@ function renderNwcModalBody_change(){
     </details>
     <div class="fgrp">
       <label class="flbl">Wallet Connection String</label>
-      <input class="fin" type="password" id="nwc-uri-in" placeholder="nostr+walletconnect://..." style="font-family:var(--fm);font-size:11px;">
+      <input class="fin" type="password" id="${pfx}-uri-in" placeholder="nostr+walletconnect://..." autocomplete="new-password" autocorrect="off" autocapitalize="off" spellcheck="false" oninput="_nwcPreviewUri('${pfx}')" style="font-family:var(--fm);font-size:11px;">
+      <div id="${pfx}-parsed-preview" style="font-family:var(--fm);font-size:9px;color:var(--t3);margin-top:4px;min-height:12px;"></div>
     </div>
     <div style="display:flex;gap:8px;justify-content:flex-end;">
-      ${nwcWallet?'<button class="btn" onclick="renderNwcModalBody()">Cancel</button>':''}
-      <button class="btn-p" onclick="nwcConnectFromInput()">Connect Wallet</button>
+      ${nwcWallet?`<button class="btn" onclick="renderNwcManage('${bodyId}','${pfx}')">Cancel</button>`:''}
+      <button class="btn-p" onclick="nwcConnectFromInput('${pfx}')">Connect Wallet</button>
     </div>
-    <div id="nwc-modal-status" style="margin-top:10px;font-family:var(--fm);font-size:11px;color:var(--t2);"></div>
+    <div id="${pfx}-status" style="margin-top:10px;font-family:var(--fm);font-size:11px;color:var(--t2);"></div>
     <div style="margin-top:16px;font-family:var(--fm);font-size:9px;color:var(--t3);line-height:1.6;">🔒 This connection string acts like a password for your wallet. It's stored only in this browser's local storage — never sent to any server, never included if you share this project's code. Use "Disconnect" any time to remove it, or revoke it from your wallet's own settings.</div>`;
+  if(nwcWallet) _nwcRenderRelayPanel(pfx);
 }
 
-async function nwcConnectFromInput(){
-  const input = document.getElementById('nwc-uri-in');
-  const st = document.getElementById('nwc-modal-status');
+// Live preview of what the pasted string actually parses to (relay + lud16 +
+// pubkey suffix), shown as you type/paste — BEFORE clicking Connect. Exists
+// so a mismatch (e.g. a password manager silently overriding what you typed
+// with an old saved credential) is visible immediately, instead of only
+// showing up buried in a debug log after a failed test against the wrong
+// relay entirely.
+function _nwcPreviewUri(pfx){
+  const input = document.getElementById(pfx+'-uri-in');
+  const prev = document.getElementById(pfx+'-parsed-preview');
+  if(!input || !prev) return;
+  const val = input.value.trim();
+  if(!val){ prev.textContent=''; return; }
+  try{
+    const p = nwcParseUri(val);
+    const relayList = (p.relays&&p.relays.length?p.relays:[p.relay]).join(', ');
+    prev.innerHTML = `→ will test: <strong style="color:var(--t2);">${esc(relayList)}</strong>${p.lud16?' · '+esc(p.lud16):''} · wallet …${esc(p.pubkey.slice(-8))}`;
+    prev.style.color='var(--t3)';
+  }catch(e){
+    prev.textContent = val.length>10 ? '⚠ '+e.message : '';
+    prev.style.color='var(--red)';
+  }
+}
+
+async function nwcConnectFromInput(pfx){
+  pfx = pfx || 'nwc';
+  const input = document.getElementById(pfx+'-uri-in');
+  const st = document.getElementById(pfx+'-status');
   const val = input?.value.trim();
   if(!val){ if(st){st.textContent='Paste your connection string first.';st.style.color='var(--red)';} return; }
-  if(st){ st.textContent='⏳ Connecting...'; st.style.color='var(--t2)'; }
+  _nwcUiBusy(st, 'Connecting');
   try{
-    await nwcSaveConnection(val, st);
-    setTimeout(renderNwcModalBody, 500);
+    const verified = await nwcSaveConnection(val, st);
+    // Briefly show the ✓ result, then swap to the connected-wallet view —
+    // but ONLY when the wallet actually answered. Previously this re-render
+    // fired unconditionally, so a FAILED verification's error box was wiped
+    // 900ms after appearing (the "error flashes, then vanishes, and the pane
+    // says Wallet Connected anyway" bug).
+    if(verified) setTimeout(renderAllWalletUI, 900);
   }catch(e){
     if(st){ st.textContent='❌ '+e.message; st.style.color='var(--red)'; }
   }
 }
 
-async function nwcCheckBalance(){
-  const st = document.getElementById('nwc-modal-status');
-  if(st){ st.textContent='⏳ Checking balance...'; }
+// Re-run verification against the ALREADY-SAVED connection string (nwcUri),
+// without requiring the user to re-paste it. The calling button's label
+// includes the exact relay(s) it's about to test (see renderNwcManage) so
+// it's unambiguous this reuses the SAVED wallet, not whatever's currently
+// typed in the paste field above it.
+async function nwcRetryTest(pfx){
+  pfx = pfx || 'nwc';
+  const st = document.getElementById(pfx+'-status');
+  if(!nwcUri){ if(st){st.textContent='No saved connection string to retry.';st.style.color='var(--red)';} return; }
+  _nwcUiBusy(st, 'Retrying');
   try{
-    const bal = await nwcRequest('get_balance', {}, 12000);
+    const verified = await nwcSaveConnection(nwcUri, st);
+    if(verified) setTimeout(renderAllWalletUI, 900);
+  }catch(e){
+    if(st){ st.textContent='❌ '+e.message; st.style.color='var(--red)'; }
+  }
+}
+
+// ── NWC relay panel: shows the wallet's own relay(s) + user-addable extras ─
+// IMPORTANT constraint (shown in the UI, not just this comment): the wallet
+// SERVICE only listens on relay(s) it was told about when the connection was
+// created. Adding an extra relay here only helps if the wallet ALSO happens
+// to be listening there — it cannot make a wallet that only publishes to its
+// own relay (e.g. Primal's custodial wallet) start listening somewhere new.
+// It's real and useful for wallets that do support multiple relays though
+// (self-hosted NWC, Alby Hub, etc.), and it's harmless to try either way.
+function _nwcRenderRelayPanel(pfx){
+  const el = document.getElementById(pfx+'-relaypanel');
+  if(!el || !nwcWallet) return;
+  const ownRelays = (nwcWallet.relays && nwcWallet.relays.length) ? nwcWallet.relays : [nwcWallet.relay];
+  const suggestable = RELAYS.filter(r=>!ownRelays.includes(r) && !nwcExtraRelays.includes(r));
+  el.innerHTML = `
+    <div style="font-size:10px;color:var(--t3);line-height:1.5;margin:4px 0 8px;">
+      Your wallet only answers on relay(s) it was configured with when the connection was made — adding a relay here can't make it listen somewhere new. It only helps if your wallet already supports multiple relays. Still, it's safe to try if you're seeing connectivity issues.
+    </div>
+    <div style="font-family:var(--fm);font-size:10px;color:var(--t2);margin-bottom:6px;">
+      <div style="color:var(--t3);margin-bottom:2px;">From your wallet's connection string:</div>
+      ${ownRelays.map(r=>`<div style="padding:2px 0;">🔒 ${esc(r)}</div>`).join('')}
+    </div>
+    ${nwcExtraRelays.length ? `
+    <div style="font-family:var(--fm);font-size:10px;color:var(--t2);margin-bottom:6px;">
+      <div style="color:var(--t3);margin-bottom:2px;">Extra relays you've added:</div>
+      ${nwcExtraRelays.map(r=>`<div style="display:flex;align-items:center;gap:6px;padding:2px 0;">
+        <span style="flex:1;">${esc(r)}</span>
+        <button class="btn" style="padding:2px 6px;font-size:9px;" onclick="nwcRemoveExtraRelay('${esc(r).replace(/'/g,"\\'")}');_nwcRenderRelayPanel('${pfx}')">Remove</button>
+      </div>`).join('')}
+    </div>` : ''}
+    ${suggestable.length ? `
+    <div style="margin-bottom:8px;">
+      <div style="font-family:var(--fm);font-size:9px;color:var(--t3);margin-bottom:4px;">Quick-add from your Nostr feed relays:</div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap;">
+        ${suggestable.map(r=>`<button class="btn" style="padding:2px 6px;font-size:9px;" onclick="nwcAddExtraRelay('${esc(r).replace(/'/g,"\\'")}');_nwcRenderRelayPanel('${pfx}')">+ ${esc(r.replace('wss://',''))}</button>`).join('')}
+      </div>
+    </div>` : ''}
+    <div style="display:flex;gap:6px;">
+      <input class="fin" type="text" id="${pfx}-relay-in" placeholder="wss://your-custom-relay.example" style="font-family:var(--fm);font-size:10px;flex:1;">
+      <button class="btn" onclick="_nwcAddCustomRelay('${pfx}')">Add</button>
+    </div>
+    <div id="${pfx}-relay-err" style="font-size:10px;color:var(--red);margin-top:4px;"></div>`;
+}
+function _nwcAddCustomRelay(pfx){
+  const input = document.getElementById(pfx+'-relay-in');
+  const errEl = document.getElementById(pfx+'-relay-err');
+  if(errEl) errEl.textContent='';
+  try{
+    nwcAddExtraRelay(input?.value||'');
+    if(input) input.value='';
+    _nwcRenderRelayPanel(pfx);
+  }catch(e){ if(errEl) errEl.textContent = e.message; }
+}
+
+async function nwcCheckBalance(pfx){
+  pfx = pfx || 'nwc';
+  const st = document.getElementById(pfx+'-status');
+  try{
+    const bal = await nwcRunUI(st, 'Checking balance', (onStatus)=>nwcRequest('get_balance', {}, 12000, onStatus));
     if(typeof bal.balance==='number'){
-      nwcBalanceSats = Math.floor(bal.balance/1000);
-      const lbl=document.getElementById('nwc-balance-lbl'); if(lbl) lbl.textContent = fmtSats(nwcBalanceSats)+' available';
-      if(st) st.textContent = '✓ Updated';
+      _nwcApplyBalanceResult(bal);
+      document.querySelectorAll('[data-nwc-balance]').forEach(lbl=>{ lbl.textContent = fmtSats(nwcBalanceSats)+' available'; });
+      _nwcUiOk(st, 'Balance updated');
+      // Budget line lives in the fuller wallet-manage render, not just the
+      // [data-nwc-balance] label — re-render so a budget/renewal picked up
+      // from this response (see _nwcApplyBalanceResult) actually shows up.
       renderNS(); renderLightningSettings();
     }
-  }catch(e){ if(st) st.textContent='❌ '+e.message; }
+  }catch(e){ /* error box already rendered by nwcRunUI */ }
+}
+
+// ── Transaction History (NIP-47 list_transactions) ─────────────────────────
+let nwcTxCache = []; // last-fetched transactions, so detail view doesn't need a re-fetch
+
+function openNwcTxModal(){
+  renderNwcTxInto('nwc-tx-body','nwtx');
+  openM('nwc-tx-modal');
+}
+
+// Shared history renderer — standalone history modal ('nwc-tx-body'/'nwtx')
+// and the Lightning modal's History tab ('lnh-body'/'lnh').
+function renderNwcTxInto(bodyId, pfx){
+  const b = document.getElementById(bodyId);
+  if(!b) return;
+  if(!nwcWallet){
+    b.innerHTML = `<div class="warn">Connect a Lightning wallet first to see its transaction history.</div><div style="display:flex;justify-content:flex-end;margin-top:8px;"><button class="btn-p" onclick="openWalletManage()">Connect Wallet</button></div>`;
+    return;
+  }
+  b.innerHTML = `<div style="display:flex;justify-content:flex-end;margin-bottom:10px;"><button class="btn" onclick="nwcLoadTransactions('${pfx}')">↻ Refresh</button></div><div id="${pfx}-list" style="font-family:var(--fm);font-size:11px;color:var(--t2);"></div>`;
+  nwcLoadTransactions(pfx);
+}
+
+async function nwcLoadTransactions(pfx){
+  pfx = pfx || 'nwtx';
+  const list = document.getElementById(pfx+'-list');
+  if(!list) return;
+  try{
+    const res = await nwcRunUI(list, 'Loading transactions', (onStatus)=>nwcRequest('list_transactions', {limit:50}, 25000, onStatus));
+    const txs = res?.transactions || [];
+    if(!txs.length){ list.innerHTML = '<div style="text-align:center;padding:16px 0;color:var(--t3);">No transactions found.</div>'; return; }
+    // Newest first
+    txs.sort((a,b)=>(b.settled_at||b.created_at||0)-(a.settled_at||a.created_at||0));
+    nwcTxCache = txs;
+    list.innerHTML = txs.map((tx,i)=>{
+      const isIn = tx.type==='incoming';
+      const sats = Math.round((tx.amount||0)/1000);
+      const feeSats = tx.fees_paid ? Math.round(tx.fees_paid/1000) : 0;
+      const when = tx.settled_at ? new Date(tx.settled_at*1000) : (tx.created_at ? new Date(tx.created_at*1000) : null);
+      const whenStr = when ? when.toLocaleString() : '';
+      const desc = tx.description ? esc(tx.description) : (isIn?'Payment received':'Payment sent');
+      const unsettled = !tx.settled_at;
+      return `<div class="nwc-tx-row" style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--border);cursor:pointer;" onclick="nwcShowTxDetail(${i},'${pfx}')">
+        <div style="width:26px;height:26px;border-radius:50%;flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:12px;background:var(--bg-4);color:${isIn?'var(--green)':'var(--red)'};">${isIn?'↓':'↑'}</div>
+        <div style="flex:1;min-width:0;">
+          <div style="color:var(--t0);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${desc}</div>
+          <div style="color:var(--t3);font-size:9px;margin-top:2px;">${whenStr}${unsettled?' · pending':''}</div>
+        </div>
+        <div style="text-align:right;flex-shrink:0;">
+          <div style="color:${isIn?'var(--green)':'var(--red)'};font-weight:600;">${isIn?'+':'-'}${fmtSats(sats)}</div>
+          ${feeSats?`<div style="color:var(--t3);font-size:9px;">fee ${feeSats} sats</div>`:''}
+        </div>
+        <div style="color:var(--t3);font-size:12px;flex-shrink:0;">›</div>
+      </div>`;
+    }).join('');
+  }catch(e){
+    // Error box already rendered by nwcRunUI — just add the method-support note if relevant
+    if(/not supported|unknown method|not implemented/i.test(e.message)){
+      list.insertAdjacentHTML('beforeend', '<div style="font-family:var(--fm);font-size:10px;color:var(--t3);margin-top:6px;">This wallet may not support the list_transactions command.</div>');
+    }
+  }
+}
+
+// Full detail view for a single transaction — payment hash (the closest thing
+// Lightning has to a "txid"), preimage (proof of payment), raw invoice, and
+// timestamps. Reuses the already-fetched list, so no extra wallet round trip.
+function nwcShowTxDetail(idx, pfx){
+  pfx = pfx || 'nwtx';
+  const bodyId = pfx==='lnh' ? 'lnh-body' : 'nwc-tx-body';
+  const tx = nwcTxCache[idx];
+  const b = document.getElementById(bodyId);
+  if(!tx || !b) return;
+  const isIn = tx.type==='incoming';
+  const sats = Math.round((tx.amount||0)/1000);
+  const feeSats = tx.fees_paid ? Math.round(tx.fees_paid/1000) : 0;
+  const createdStr = tx.created_at ? new Date(tx.created_at*1000).toLocaleString() : '—';
+  const settledStr = tx.settled_at ? new Date(tx.settled_at*1000).toLocaleString() : 'Not settled yet';
+  const expiresStr = tx.expires_at ? new Date(tx.expires_at*1000).toLocaleString() : null;
+  const row = (label, val, mono, copyable) => val ? `
+    <div style="padding:8px 0;border-bottom:1px solid var(--border);">
+      <div style="font-size:9px;color:var(--t3);text-transform:uppercase;letter-spacing:.08em;margin-bottom:3px;">${label}</div>
+      <div style="display:flex;align-items:flex-start;gap:6px;">
+        <div style="flex:1;min-width:0;word-break:break-all;font-size:11px;color:var(--t1);${mono?'font-family:var(--fm);':''}">${esc(String(val))}</div>
+        ${copyable?`<button class="btn" style="flex-shrink:0;font-size:9px;padding:2px 6px;" onclick="navigator.clipboard.writeText('${esc(String(val)).replace(/'/g,"\\'")}');this.textContent='✓';setTimeout(()=>this.textContent='Copy',1200);">Copy</button>`:''}
+      </div>
+    </div>` : '';
+  b.innerHTML = `
+    <button class="btn" style="margin-bottom:12px;font-size:10px;" onclick="renderNwcTxInto('${bodyId}','${pfx}')">← Back to History</button>
+    <div style="display:flex;align-items:center;gap:10px;padding-bottom:12px;margin-bottom:6px;border-bottom:1px solid var(--border-l);">
+      <div style="width:32px;height:32px;border-radius:50%;flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:15px;background:var(--bg-4);color:${isIn?'var(--green)':'var(--red)'};">${isIn?'↓':'↑'}</div>
+      <div>
+        <div style="font-size:16px;font-weight:700;color:${isIn?'var(--green)':'var(--red)'};">${isIn?'+':'-'}${fmtSats(sats)}</div>
+        <div style="font-size:10px;color:var(--t3);">${isIn?'Received':'Sent'}${feeSats?' · fee '+feeSats+' sats':''}</div>
+      </div>
+    </div>
+    ${row('Description', tx.description)}
+    ${row('Payment Hash (TXID)', tx.payment_hash, true, true)}
+    ${row('Preimage (proof of payment)', tx.preimage, true, true)}
+    ${row('Created', createdStr)}
+    ${row('Settled', settledStr)}
+    ${expiresStr?row('Expires', expiresStr):''}
+    ${row('Invoice', tx.invoice, true, true)}
+  `;
 }
 
 // ── Sending a zap (NIP-57) ─────────────────────────────────────────────────
@@ -8846,7 +10113,7 @@ async function openZapModal(evId, evPub, btn){
     openM('zap-modal'); return;
   }
   if(!nwcWallet){
-    body.innerHTML = `<div class="warn">Connect a Lightning wallet first so zaps have somewhere to send sats from.</div><div style="display:flex;justify-content:flex-end;"><button class="btn-p" onclick="closeM('zap-modal');openNwcModal()">Connect Wallet</button></div>`;
+    body.innerHTML = `<div class="warn">Connect a Lightning wallet first so zaps have somewhere to send sats from.</div><div style="display:flex;justify-content:flex-end;"><button class="btn-p" onclick="closeM('zap-modal');openWalletManage()">Connect Wallet</button></div>`;
     openM('zap-modal'); return;
   }
   if(!prof || (!prof.lud16 && !prof.lud06)){
@@ -8872,7 +10139,7 @@ function openLnAddrZapModal(addr){
   const body = document.getElementById('zap-body');
 
   if(!nwcWallet){
-    body.innerHTML = `<div class="warn">Connect a Lightning wallet first so payments have somewhere to send sats from.</div><div style="display:flex;justify-content:flex-end;"><button class="btn-p" onclick="closeM('zap-modal');openNwcModal()">Connect Wallet</button></div>`;
+    body.innerHTML = `<div class="warn">Connect a Lightning wallet first so payments have somewhere to send sats from.</div><div style="display:flex;justify-content:flex-end;"><button class="btn-p" onclick="closeM('zap-modal');openWalletManage()">Connect Wallet</button></div>`;
     openM('zap-modal'); return;
   }
 
@@ -8969,14 +10236,19 @@ async function sendZap(){
     const invRes = await fetch(`${PROXY}/proxy/${callbackUrl}${sep}${qs.toString()}`).then(r=>r.json());
     if(invRes.status==='ERROR' || !invRes.pr) throw new Error(invRes.reason||'Could not get an invoice');
 
-    if(st) st.textContent='⏳ Paying via wallet...';
-    await nwcPayInvoice(invRes.pr);
+    // Clean UI: spinner while the wallet works; on failure nwcRunUI renders a
+    // single error box with a collapsible debug log — no wall of ⏳ lines.
+    try{
+      await nwcRunUI(st, 'Paying via wallet', (onStatus)=>nwcPayInvoice(invRes.pr, null, onStatus));
+    }catch(payErr){
+      return; // error box already on screen; finally re-enables the button
+    }
 
     if(st){ st.textContent= lnAddr?'✓ Payment sent!':'✓ Zap sent!'; st.style.color='var(--green)'; }
     if(btn && btn.classList) btn.classList.add('zap-sent');
     setTimeout(()=>closeM('zap-modal'), 1200);
   }catch(e){
-    if(st){ st.textContent='❌ '+e.message; st.style.color='var(--red)'; }
+    if(st){ st.textContent = '❌ '+e.message; st.style.color='var(--red)'; }
   }finally{
     if(sendBtn) sendBtn.disabled=false;
   }
@@ -9274,6 +10546,11 @@ async function init(){
   fetch(`${PROXY}/yahoo?symbol=BTC-USD&interval=1m&range=1d`).then(()=>setStatus('ok','Proxy connected')).catch(()=>setStatus('err','Proxy not running — start proxy.py'));
   // Restore Nostr session in background — don't block page load (WebSocket handshake can take 5s)
   restoreNSession().catch(()=>{});
+  // Refresh wallet balance/budget in background if a wallet is already
+  // connected from a previous session — see nwcAutoRefreshOnLoad() for why
+  // this is needed (budget was otherwise stuck at "not reported" until the
+  // user manually hit Check Balance).
+  nwcAutoRefreshOnLoad();
   // Load miners with timeout so a slow/missing proxy never blocks the page
   const minerTimeout = new Promise(res => setTimeout(res, 2000));
   await Promise.race([loadMinersFromServer(), minerTimeout]);

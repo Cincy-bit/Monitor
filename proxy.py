@@ -53,6 +53,141 @@ def _save_date_cache():
 
 _load_date_cache()
 
+# Cache for mempool.space's hashrate/difficulty endpoints.
+#
+# ROOT CAUSE of the "Failed: The operation was aborted." chart failures:
+# mempool.space rate-limits per IP (undisclosed limits; repeat offenders get
+# soft-banned per their API docs), and a soft-blocked/throttled connection
+# does NOT time out at the socket level — it stalls while dribbling bytes.
+# urllib's timeout= is PER SOCKET OPERATION, so each arriving byte resets the
+# timer and resp.read() can hang for minutes. The proxy thread sat there
+# while the browser's AbortController fired, hence "aborted". No timeout
+# budget increase can fix that; only a hard wall-clock deadline can.
+#
+# Fixes applied here:
+#   1. _fetch_with_deadline() bounds the TOTAL fetch time (headers + body),
+#      not just per-operation gaps.
+#   2. Hashrate history is daily-candle data — it is cached for hours, not
+#      90 seconds, and persisted to disk so restarts keep a warm copy.
+#   3. On upstream failure, a stale cached copy is served instead of an
+#      error. Old hashrate history beats no hashrate history.
+#   4. /hashrate-history?span= falls back to blockchain.info's hash-rate
+#      chart when mempool.space stalls or errors (and serves 4y/10y, which
+#      mempool.space does not offer at all).
+_MEMPOOL_BASE = os.environ.get("MEMPOOL_BASE", "https://mempool.space")
+_BLOCKCHAIN_BASE = os.environ.get("BLOCKCHAIN_BASE", "https://api.blockchain.info")
+
+_mempool_cache = {}
+_mempool_cache_lock = threading.Lock()
+_MEMPOOL_CACHE_TTL = 90               # difficulty-adjustment freshness (seconds)
+_HASHRATE_HISTORY_TTL = 6 * 3600      # daily-candle history moves on hours, not seconds
+_NETWORK_HASHRATE_TTL = 120           # "current network hashrate" is a live reading — keep it fresh
+_MEMPOOL_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".mempool_cache.json")
+_mempool_cache_dirty = False
+_mempool_cache_last_save = 0.0
+
+def _mempool_cache_load():
+    global _mempool_cache
+    try:
+        if os.path.exists(_MEMPOOL_CACHE_FILE):
+            with open(_MEMPOOL_CACHE_FILE, "r") as f:
+                raw = json.load(f)
+            # Bodies are JSON text; stored as str, served as bytes
+            _mempool_cache = {k: (v[0], v[1].encode("utf-8"), v[2], v[3]) for k, v in raw.items()}
+            print(f"[mempool cache] restored {len(_mempool_cache)} entries from disk")
+    except Exception as e:
+        print(f"[mempool cache] disk load failed: {e}")
+        _mempool_cache = {}
+
+def _mempool_cache_save(force=False):
+    global _mempool_cache_dirty, _mempool_cache_last_save
+    # Throttle disk writes to at most one per 5s
+    now = _time.time()
+    if not force and (now - _mempool_cache_last_save) < 5:
+        return
+    try:
+        with _mempool_cache_lock:
+            raw = {k: [v[0], v[1].decode("utf-8", errors="replace"), v[2], v[3]] for k, v in _mempool_cache.items()}
+            _mempool_cache_dirty = False
+            _mempool_cache_last_save = now
+        with open(_MEMPOOL_CACHE_FILE, "w") as f:
+            json.dump(raw, f)
+    except Exception:
+        pass
+
+_mempool_cache_load()
+
+def _mempool_cache_get(url, ttl=_MEMPOOL_CACHE_TTL):
+    """Fresh entry only."""
+    with _mempool_cache_lock:
+        entry = _mempool_cache.get(url)
+        if entry and (_time.time() - entry[0]) < ttl:
+            return entry[1], entry[2], entry[3]
+    return None
+
+def _mempool_cache_get_stale(url):
+    """Any age — used when every live source failed. Stale data beats an error."""
+    with _mempool_cache_lock:
+        entry = _mempool_cache.get(url)
+        if entry:
+            return entry[1], entry[2], entry[3]
+    return None
+
+def _mempool_cache_set(url, data, content_type, source="mempool.space"):
+    global _mempool_cache_dirty
+    with _mempool_cache_lock:
+        _mempool_cache[url] = (_time.time(), data, content_type, source)
+        _mempool_cache_dirty = True
+        # Prune occasionally so this can't grow unbounded
+        if len(_mempool_cache) > 200:
+            oldest = sorted(_mempool_cache.items(), key=lambda kv: kv[1][0])[:100]
+            for k, _ in oldest:
+                del _mempool_cache[k]
+    _mempool_cache_save()
+
+def _fetch_with_deadline(req, ctx, per_op_timeout, deadline_s):
+    """
+    urlopen + full body read, bounded by a HARD wall-clock deadline.
+
+    urllib's timeout= only bounds each individual socket operation (connect,
+    each recv). A stalled upstream that sends one byte every few seconds —
+    which is what throttling/soft-blocking looks like — resets that timer
+    indefinitely, so resp.read() never returns and no exception ever fires.
+    Running the whole exchange in a daemon thread and joining it with a
+    deadline guarantees the caller gets control back. The abandoned thread
+    is a daemon and dies with the process; its socket is reclaimed by the OS
+    when the far end finally closes.
+    """
+    box = {}
+    def _work():
+        try:
+            with urllib.request.urlopen(req, context=ctx, timeout=per_op_timeout) as resp:
+                box['data'] = resp.read()
+                box['ct'] = resp.headers.get("Content-Type", "application/json")
+        except Exception as e:
+            box['err'] = e
+    t = threading.Thread(target=_work, daemon=True)
+    t.start()
+    t.join(deadline_s)
+    if t.is_alive():
+        raise TimeoutError(f"upstream stalled: no complete response within {deadline_s}s")
+    if 'err' in box:
+        raise box['err']
+    return box['data'], box['ct']
+
+# Timeframes the hashrate chart can request, in seconds of history.
+_HASHRATE_WINDOWS = {
+    '24h': 86400, '1w': 604800, '1m': 2592000, '3m': 7776000, '6m': 15552000,
+    '1y': 31536000, '2y': 63072000, '3y': 94608000, '4y': 126144000, '10y': 315360000,
+}
+# mempool.space natively serves at most 3y; 4y/10y go straight to the fallback.
+_MEMPOOL_SPANS = {'24h', '1w', '1m', '3m', '6m', '1y', '2y', '3y'}
+# blockchain.info charts API timespans (verified live), smallest-first.
+_BLOCKCHAIN_TIMESPANS = [
+    (2592000, '30days'), (7776000, '90days'), (15552000, '180days'),
+    (31536000, '1year'), (63072000, '2years'), (126144000, '4years'), (315360000, '10years'),
+]
+
 ALLOWED_ORIGINS = [
     "finance.yahoo.com",
     "query1.finance.yahoo.com",
@@ -120,6 +255,10 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         # Path-style proxy: /proxy/http://hostname/path  (used for local miners + external APIs)
         if self.path.startswith("/proxy/http://") or self.path.startswith("/proxy/https://"):
             self.handle_path_proxy()
+        elif self.path.startswith("/hashrate-history"):
+            self.handle_hashrate_history()
+        elif self.path.startswith("/network-hashrate"):
+            self.handle_network_hashrate()
         elif self.path.startswith("/proxy?"):
             self.handle_query_proxy()
         elif self.path.startswith("/yahoo?"):
@@ -249,6 +388,29 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         if not is_local and not is_allowed:
             # /proxy/ path only listens on 127.0.0.1 — open to all domains (needed for Nostr CDNs/avatars)
             pass
+
+        # mempool.space's hashrate/difficulty endpoints get hit repeatedly in
+        # short windows (spark poll + modal open + tab switches) — serve from
+        # cache when we have a fresh copy instead of re-hitting mempool.space
+        # every time. Hashrate history is daily-candle data and gets a long
+        # TTL; difficulty-adjustment stays short since it's the live reading.
+        is_mempool_history = netloc == "mempool.space" and "/api/v1/mining/hashrate/" in target
+        is_mempool_stats = is_mempool_history or (
+            netloc == "mempool.space" and "/api/v1/difficulty-adjustment" in target
+        )
+        if is_mempool_stats:
+            ttl = _HASHRATE_HISTORY_TTL if is_mempool_history else _MEMPOOL_CACHE_TTL
+            cached = _mempool_cache_get(target, ttl)
+            if cached:
+                data, ct, src = cached
+                self.send_response(200)
+                self.send_header("Content-Type", ct)
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("X-Hashrate-Source", src)
+                self.end_headers()
+                self.wfile.write(data)
+                return
+
         try:
             # Detect if this is an image request and use appropriate headers
             is_image = any(target.lower().endswith(ext) for ext in
@@ -272,19 +434,250 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                 }
             req = urllib.request.Request(target, headers=hdrs)
             ctx = ssl_ctx if target.startswith("https://") else None
-            # Use a longer timeout for local network devices (miners) which may respond slowly
-            fetch_timeout = 12 if is_local else 8
-            with urllib.request.urlopen(req, context=ctx, timeout=fetch_timeout) as resp:
-                data = resp.read()
-                ct = resp.headers.get("Content-Type", "application/json")
+            # Local network devices (miners) may respond slowly.
+            # IMPORTANT: urlopen's timeout= is per-socket-operation and does NOT
+            # bound a stalled/dribbling connection — _fetch_with_deadline does.
+            # That stall, not "the budget being too small", was the source of
+            # the browser's "The operation was aborted." errors.
+            fetch_timeout = 12 if is_local else 14
+            if is_mempool_stats:
+                # Single attempt with a hard 10s wall-clock deadline. If
+                # mempool.space is throttling us, a retry just waits again —
+                # the stale cache below is the real safety net.
+                try:
+                    data, ct = _fetch_with_deadline(req, ctx, 10, 10)
+                except Exception as e:
+                    print(f"[mempool] {target} failed ({e}) — serving stale cache if available")
+                    stale = _mempool_cache_get_stale(target)
+                    if stale:
+                        sdata, sct, ssrc = stale
+                        self.send_response(200)
+                        self.send_header("Content-Type", sct)
+                        self.send_header("Access-Control-Allow-Origin", "*")
+                        self.send_header("X-Hashrate-Source", "stale-cache")
+                        self.end_headers()
+                        self.wfile.write(sdata)
+                        return
+                    raise
+                _mempool_cache_set(target, data, ct, "mempool.space")
+            else:
+                try:
+                    data, ct = _fetch_with_deadline(req, ctx, fetch_timeout, 20)
+                except (urllib.error.URLError, TimeoutError) as e:
+                    # One retry for external (non-local) requests — covers
+                    # transient errors (not stalls) from upstreams.
+                    if is_local:
+                        raise
+                    print(f"Path proxy retry for {target} after: {e}")
+                    data, ct = _fetch_with_deadline(req, ctx, 8, 10)
             self.send_response(200)
             self.send_header("Content-Type", ct)
             self.send_header("Access-Control-Allow-Origin", "*")
+            if is_mempool_stats:
+                self.send_header("X-Hashrate-Source", "mempool.space")
             self.end_headers()
             self.wfile.write(data)
         except Exception as e:
             print(f"Path proxy error for {target}: {e}")
-            self.send_error(502, str(e))
+            # send_error() encodes the message as Latin-1 — keep it ASCII-only
+            self.send_error(502, str(e).encode("ascii", "replace").decode("ascii"))
+
+    def handle_hashrate_history(self):
+        """
+        GET /hashrate-history?span=1w|1m|3m|6m|1y|2y|3y|4y|10y|24h
+
+        One reliable endpoint for the BTC network hashrate chart. Order:
+          1. Fresh cache (6h TTL — this is daily-candle data)
+          2. mempool.space, with a hard 10s wall-clock deadline
+          3. blockchain.info hash-rate chart (normalized to mempool's shape)
+          4. Stale cache of any age
+          5. 502
+
+        mempool.space has no 4y/10y series, so those spans skip straight to
+        blockchain.info. The response always uses mempool.space's shape
+        ({hashrates: [{timestamp, avgHashrate}], ...}) so the client doesn't
+        care which source answered; X-Hashrate-Source says which one did.
+        """
+        qs = parse_qs(urlparse(self.path).query)
+        span = qs.get('span', ['1w'])[0]
+        if span not in _HASHRATE_WINDOWS:
+            self.send_error(400, "unknown span - use one of: " + ",".join(_HASHRATE_WINDOWS))
+            return
+
+        cache_key = f"hashrate-history:{span}"
+        cached = _mempool_cache_get(cache_key, _HASHRATE_HISTORY_TTL)
+        if cached:
+            data, ct, src = cached
+            self._send_hashrate(data, ct, src)
+            return
+
+        hdrs = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Accept": "application/json,*/*",
+        }
+
+        # ── Source 1: mempool.space (native spans only) ──
+        if span in _MEMPOOL_SPANS:
+            try:
+                url = f"{_MEMPOOL_BASE}/api/v1/mining/hashrate/{span}"
+                req = urllib.request.Request(url, headers=hdrs)
+                data, ct = _fetch_with_deadline(req, ssl_ctx if url.startswith("https://") else None, 10, 10)
+                d = json.loads(data)
+                if not d.get("hashrates"):
+                    raise ValueError("empty hashrates in mempool.space response")
+                _mempool_cache_set(cache_key, data, ct, "mempool.space")
+                self._send_hashrate(data, ct, "mempool.space")
+                return
+            except Exception as e:
+                print(f"[hashrate-history] mempool.space {span} failed: {e} — trying blockchain.info", flush=True)
+
+        # ── Source 2: blockchain.info charts (also the only source for 4y/10y) ──
+        try:
+            window = _HASHRATE_WINDOWS[span]
+            ts_param = next(tp for lim, tp in _BLOCKCHAIN_TIMESPANS if window <= lim)
+            url = f"{_BLOCKCHAIN_BASE}/charts/hash-rate?timespan={ts_param}&format=json"
+            req = urllib.request.Request(url, headers=hdrs)
+            data, ct = _fetch_with_deadline(req, ssl_ctx if url.startswith("https://") else None, 10, 12)
+            d = json.loads(data)
+            vals = d.get("values") or []
+            unit = (d.get("unit") or "").lower()
+            mult = 1e12 if "th/s" in unit else (1e9 if "gh/s" in unit else 1.0)
+            cutoff = int(_time.time()) - window - 86400  # one day of slack for chart edges
+            pts = [{"timestamp": int(v["x"]), "avgHashrate": v["y"] * mult}
+                   for v in vals if v.get("x") and v.get("y") and v["x"] >= cutoff]
+            if not pts:
+                raise ValueError("no points in blockchain.info response")
+            out = json.dumps({"hashrates": pts, "difficulty": [], "source": "blockchain.info"}).encode("utf-8")
+            print(f"[hashrate-history] {span}: served {len(pts)} pts from blockchain.info fallback", flush=True)
+            _mempool_cache_set(cache_key, out, "application/json", "blockchain.info")
+            self._send_hashrate(out, "application/json", "blockchain.info")
+            return
+        except Exception as e:
+            print(f"[hashrate-history] blockchain.info {span} failed: {e}", flush=True)
+
+        # ── Source 3: stale cache of any age — old data beats no data ──
+        stale = _mempool_cache_get_stale(cache_key)
+        if stale:
+            data, ct, src = stale
+            print(f"[hashrate-history] {span}: all live sources failed — serving stale cache", flush=True)
+            self._send_hashrate(data, ct, "stale-cache")
+            return
+
+        self.send_error(502, "all hashrate sources unavailable")
+
+    def _send_hashrate(self, data, ct, source):
+        self.send_response(200)
+        self.send_header("Content-Type", ct)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("X-Hashrate-Source", source)
+        self.end_headers()
+        self.wfile.write(data)
+
+    def handle_network_hashrate(self):
+        """
+        GET /network-hashrate
+
+        One canonical "current BTC network hashrate" reading (H/s) for the
+        whole dashboard — watchlist row, ticker item, and chart modal all
+        display THIS number, so they can never disagree with each other.
+
+        Response: {"hashrate": <H/s float>, "source": "...", "ts": <unix>}
+        X-Hashrate-Source header mirrors the source (or "stale-cache").
+
+        Order:
+          1. Fresh cache (2 min TTL — this is a live reading, not candles)
+          2. mempool.space /api/v1/mining/hashrate/24h -> currentHashrate,
+             falling back to the latest daily candle average.
+             NOTE: /api/v1/difficulty-adjustment no longer returns
+             currentHashrate (mempool.space removed the field) — the old
+             client-side chain keyed off it and silently fell through to
+             worse sources.
+          3. blockchair /bitcoin/stats -> data.hashrate_24h
+             (a STRING in H/s; hashrate_mean_1h does not exist)
+          4. blockchain.info charts/hash-rate latest daily point
+             (/q/hashrate is NOT used: it currently reads ~25% below
+             blockchain.info's own chart data and appears unmaintained)
+          5. Stale cache of any age
+          6. 502
+        """
+        cache_key = "network-hashrate:current"
+        cached = _mempool_cache_get(cache_key, _NETWORK_HASHRATE_TTL)
+        if cached:
+            data, ct, src = cached
+            self._send_hashrate(data, ct, src)
+            return
+
+        hdrs = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Accept": "application/json,*/*",
+        }
+
+        def _emit(val, source):
+            out = json.dumps({
+                "hashrate": float(val),
+                "source": source,
+                "ts": int(_time.time()),
+            }).encode("utf-8")
+            _mempool_cache_set(cache_key, out, "application/json", source)
+            print(f"[network-hashrate] {val/1e18:.2f} EH/s from {source}", flush=True)
+            self._send_hashrate(out, "application/json", source)
+
+        # ── Source 1: mempool.space ──
+        try:
+            url = f"{_MEMPOOL_BASE}/api/v1/mining/hashrate/24h"
+            req = urllib.request.Request(url, headers=hdrs)
+            data, _ct = _fetch_with_deadline(req, ssl_ctx if url.startswith("https://") else None, 10, 10)
+            d = json.loads(data)
+            val = d.get("currentHashrate")
+            if not val or val <= 0:
+                hrs = d.get("hashrates") or []
+                val = hrs[-1].get("avgHashrate") if hrs else None
+            if not val or val <= 0:
+                raise ValueError("no currentHashrate in mempool.space response")
+            _emit(val, "mempool.space")
+            return
+        except Exception as e:
+            print(f"[network-hashrate] mempool.space failed: {e} — trying blockchair", flush=True)
+
+        # ── Source 2: blockchair (hashrate_24h is a string, H/s) ──
+        try:
+            url = "https://api.blockchair.com/bitcoin/stats"
+            req = urllib.request.Request(url, headers=hdrs)
+            data, _ct = _fetch_with_deadline(req, ssl_ctx, 10, 10)
+            d = json.loads(data)
+            val = float((d.get("data") or {}).get("hashrate_24h") or 0)
+            if val <= 0:
+                raise ValueError("missing hashrate_24h in blockchair response")
+            _emit(val, "blockchair")
+            return
+        except Exception as e:
+            print(f"[network-hashrate] blockchair failed: {e} — trying blockchain.info", flush=True)
+
+        # ── Source 3: blockchain.info chart, latest daily point ──
+        try:
+            url = f"{_BLOCKCHAIN_BASE}/charts/hash-rate?timespan=30days&format=json"
+            req = urllib.request.Request(url, headers=hdrs)
+            data, _ct = _fetch_with_deadline(req, ssl_ctx if url.startswith("https://") else None, 10, 12)
+            d = json.loads(data)
+            vals = d.get("values") or []
+            unit = (d.get("unit") or "").lower()
+            mult = 1e12 if "th/s" in unit else (1e9 if "gh/s" in unit else 1.0)
+            if not vals or not vals[-1].get("y"):
+                raise ValueError("no points in blockchain.info response")
+            _emit(vals[-1]["y"] * mult, "blockchain.info")
+            return
+        except Exception as e:
+            print(f"[network-hashrate] blockchain.info failed: {e}", flush=True)
+
+        # ── Source 4: stale cache of any age — old data beats no data ──
+        stale = _mempool_cache_get_stale(cache_key)
+        if stale:
+            data, ct, src = stale
+            print("[network-hashrate] all live sources failed — serving stale cache", flush=True)
+            self._send_hashrate(data, ct, "stale-cache")
+            return
+
+        self.send_error(502, "all network hashrate sources unavailable")
 
     def handle_query_proxy(self):
         """Handle /proxy?url=https://... (query-param style)"""
