@@ -1,6 +1,6 @@
 # Monitor
 
-A personal dashboard for tracking markets, news, your portfolio, weather, and Bitcoin miners on your local network — all in one customizable view. It also doubles as a lightweight Nostr client. Enable Nostr Wallet Connect to zap posts, paste and pay invoices, or search and pay any lightning address.
+A personal dashboard for tracking markets, news, your portfolio, weather, and Bitcoin miners — all in one customizable view. It also doubles as a lightweight Nostr client. Enable Nostr Wallet Connect to zap posts, paste and pay invoices, or search and pay any lightning address.
 
 > **Platform:** macOS only (for now)
 
