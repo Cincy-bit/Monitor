@@ -1,4 +1,4 @@
-<!-- Monitor The Situation v2.9.13 — 2026-08-17 — NWC: fixed a race where two NWC requests in flight at once could make a real payment go unanswered. nwcAutoRefreshOnLoad (v2.9.10) fires a background get_balance check on every page load, which — being a full nwcRequest call — can retry for a while if its first attempt hits a flaky connection. If the user opened the wallet and hit Pay while that background check was still retrying, BOTH requests targeted the same relay, and the shared per-relay socket pool (v2.9.8) multiplexes concurrent callers onto one WebSocket by design — so the wallet service received a pay_invoice and a get_balance request interleaved on the same connection. That matches this session's exact symptom: relay accepted the request (OK true), then silence until timeout, reproducing identically across two different wallets/relays — a strong sign the trigger was on our side (timing), not the wallet's. NIP-47 is fundamentally request/reply; a wallet not built to juggle two concurrent requests over one connection can end up answering neither. nwcRequest is now serialized through a promise-chain mutex (_nwcRequestQueue) so every call — background refresh, manual balance checks, payments — runs one at a time in call order, never overlapping on the shared connection. To keep this queue from making a real payment wait behind a slow background nicety, nwcAutoRefreshOnLoad also now makes just ONE short attempt (new maxPasses param, 8s vs. the usual 16s + 2-pass retry) instead of potentially occupying the queue for up to ~35s. — v2.9.12 — 2026-08-17 — NWC: balance/budget now persists across sessions via a localStorage cache, so a hard refresh shows the last-known figures immediately instead of "Balance unknown" while waiting on (or if it fails to get) a fresh get_balance round-trip. Previously nwcBalanceSats was purely an in-memory variable, reset to null on every page load — nwcAutoRefreshOnLoad (v2.9.10) helped by kicking off a live check on startup, but that check can take several seconds or fail outright (per this file's extensive NWC-reliability history), and the panel had nothing to show in the meantime. Now _nwcApplyBalanceResult writes {sats, maxAmount, budgetRenewal, at} to localStorage (mts_nwc_last_balance) on every successful live check, and that cache is read back in synchronously at startup — before any UI renders — so the wallet-manage panel opens with real numbers right away. A new nwcBalanceIsLive flag tracks whether THIS session has actually confirmed the balance yet; until it has, the manage panel tags the figure "(last known)" so a stale cached number is never mistaken for a live-confirmed one. Cache is cleared on disconnect and on connecting a new/changed wallet (nwcSaveConnection), since a stale balance would otherwise belong to the wrong wallet. nwcAutoRefreshOnLoad also now re-renders an already-open wallet-manage panel (not just the compact balance labels) once the live check lands, since the budget line is baked into that panel's innerHTML and doesn't update from the live text-patch alone. — v2.9.11 — NWC: dropped the "Budget not reported by this wallet" fallback line entirely. The displayed sats figure is already the connection's spending budget (wallets like Alby/Zeus cap the reported "balance" to the remaining per-connection budget — see v2.9.9's note), so a separate "not reported" caveat next to it was just confusing noise, not new information. When nwcWallet.maxAmount isn't explicitly present, budgetLine now renders empty instead of a line implying something is missing. — v2.9.10 — NWC: budget/balance now auto-refreshes on page load for an already-connected wallet, instead of staying stuck at "Budget not reported" until a manual "Check Balance" click. On startup nwcWallet was only ever reconstituted by re-parsing the saved connection STRING (nwcParseUri) — the actual get_balance round-trip that populates nwcBalanceSats and nwcWallet.maxAmount/budgetRenewal (via _nwcApplyBalanceResult, added in v2.9.9) only ran from a manual balance check or from re-entering the connection string. So every fresh page load showed the wallet as connected but with a budget the wallet in fact reports — this app just hadn't asked yet. Added nwcAutoRefreshOnLoad(), fired non-blocking from init() alongside the existing restoreNSession() call, which runs one silent get_balance on startup and re-renders the wallet strip/settings/manage panes so the real figures appear without user action. — v2.9.9 — NWC: fixed "Budget not reported" showing next to a balance figure that WAS the budget. nwcWallet.maxAmount was only ever populated from the (non-standard, rarely-used) max_amount/budget query params on the connection URI. Several wallet-service implementations (e.g. Alby's NWC service, whose BalanceResponse carries max_amount/budget_renewal — and apparently Zeus's too) instead report the budget by including it directly in the get_balance RESPONSE, and cap the reported "balance" itself to the connection's remaining budget rather than the wallet's true balance — confirmed by a real case where a 507-sat wallet with a 500-sat connection budget reported "balance": 500000 msats. The panel was reading that 500 as "sats available" while separately declaring the budget "not reported," which is self-contradictory: that number effectively IS the budget. Added _nwcApplyBalanceResult() to also read max_amount/budget_renewal out of the get_balance result (msats, same as balance) in both nwcSaveConnection and nwcCheckBalance, and reworded the budget explainer text since "most wallets don't report it" is no longer accurate. — v2.9.8 — NWC: fixed excessive WebSocket churn against the wallet's own relay. — NWC: fixed excessive WebSocket churn against the wallet's own relay. A single "test connection" (nwcSaveConnection) was opening up to 5 independent raw WebSockets to the same relay within ~7s — one invisible kind:13194 info-probe socket (nwcAdvertisedSchemes -> _nwcFetchInfoEvent) to pick an encryption scheme, a fresh socket per scheme tried for get_info, and a fresh socket per pass/retry for get_balance — because _nwcAttemptOnRelay, _nwcFetchInfoEvent, and _nwcRelayControlCheck each always called `new WebSocket(relayUrl)` and tore the connection down again when done, even when the very next line of code was about to talk to the identical relay. Rapid repeat handshakes like that are a well-known trigger for transient connection resets, which presented as intermittent "Relay connection error" sitting right next to a successful reply from the SAME relay moments earlier — indistinguishable from relay flakiness unless you counted the sockets. Added a shared per-relay WebSocket pool (_nwcPoolAcquire/_nwcPoolRelease/_nwcPoolEntry/_nwcPoolRoute): the info probe, get_info, and get_balance now reuse one already-open socket per relay (kept warm for 15s after last use), with subscriptions/publishes multiplexed over it by sub-id/event-id and NIP-42 AUTH handled once per socket instead of once per request. This is the same class of fix already applied to the feed/notification relays in v2.9 (single-flight reconnects) — it just hadn't been applied to the NWC path yet. — v2.9.7 — NWC: fixed silent wrong-wallet testing + softened overconfident IP-throttling claims. (1) A password-manager-vulnerable connection-string field could have a freshly pasted string silently overridden by a saved credential, with zero indication anything was wrong — added a live "→ will test: relay(s) / lud16 / wallet suffix" preview as you type (before you even click Connect), autocomplete="new-password" to discourage autofill, and a "parsed connection: ..." line now stamped at the top of every debug log so a mismatch is undeniable after the fact too. (2) Re-applied the relay panel + a retry button to the entry/error view (was connected-view-only, so it was unreachable after a failed test) — the button is now explicitly labeled with the exact relay(s) it retries, so it can't be mistaken for testing whatever's currently pasted in the field above it. (3) Error hints no longer confidently assert relay.primal.net-specific IP throttling as the cause — now framed as "this relay/network path is unreliable for this connection right now," since the same failure pattern has now reproduced across a different wallet (Zeus) and relay (damus.io) on this connection. — v2.9.5 — NWC: user-selectable relays. Every NWC network call (request, info-event probe, control check) now routes through _nwcAllRelays(), the union of the connection string's own relay(s) with a new user-managed nwcExtraRelays list (persisted in mts_nwc_extra_relays). New relay panel in the wallet-manage pane: shows the wallet's own relay(s) read-only, lets you quick-add any of the app's current Nostr feed relays (RELAYS), or type a custom wss:// relay, with remove buttons for each extra. UI is explicit about the constraint: the wallet SERVICE only listens on relay(s) it was configured with, so an added relay only helps if the wallet happens to also listen there — it can't make a wallet that's only ever published to its own relay (e.g. Primal's custodial wallet) start answering somewhere new. — v2.9.4 — NWC liveness check now includes a control test: when the kind:13194 info-event presence probe is still inconclusive after 2 tries (relay not completing subscriptions), a new `_nwcRelayControlCheck()` fires a totally generic, wallet-unrelated subscription (REQ with just a limit, no filter) at the same relay. If that ALSO gets no EOSE, it conclusively proves the relay itself is failing to complete subscriptions for this connection right now — not the wallet. If the control succeeds, the miss is narrowed down to something specific to the wallet/connection instead. The error hint now branches on this control result instead of always giving the same "could be relay or wallet" hedge. — v2.9.3 — NWC wallet-liveness check hardened: the kind:13194 info-event presence probe (used to tell "wallet service is dead" apart from "wallet is alive but silent" on a "did not respond in time" failure) was a single 4s attempt against relay.primal.net, which under any load misses EOSE and falls back to a vague "inconclusive" hint that reads identically to "we didn't check." New `_nwcCheckWalletAlive()` retries once with a longer 8s window before giving up, and the debug log now shows exactly what each attempt found instead of silently swallowing the first miss. The "still inconclusive" hint text now says explicitly that the relay itself — not the wallet — is what's being unreliable. — v2.9.2 — NWC bugfix: v2.9.1 accidentally left TWO `openTimer = setTimeout(...)` assignments in _nwcAttemptOnRelay. Only the second (later) one was ever stored in `openTimer`, so ws.onopen's clearTimeout(openTimer) only cancelled that one — the FIRST timer (a 3-6s handshake guard) was orphaned and kept running even after the socket opened, the relay accepted the request, and the wallet was mid-reply. It fired regardless and force-failed the attempt with "Could not open relay connection (handshake timed out)", which is why retries kept dying right after "relay accepted request, waiting for wallet reply..." even on fresh IPs — it was never a relay/rate-limit issue. Removed the stray duplicate assignment; only one handshake-guard timer is created now. — v2.9.1: NWC diagnosis fix: stuck WebSocket handshakes (relay.primal.net IP rate-limit symptom) are now ACTUALLY reported as "Could not open relay connection" — v2.9's handshake guard tied with the request timer at budgets under 9s and lost the race, so every stuck handshake was mislabeled "Wallet did not respond in time" and triggered the misleading dead-connection probe. Socket-level failures also no longer spray the remaining encryption schemes at an unreachable relay (they break to the backoff pass instead), and the relay-unreachable hint now explains the rate-limit cause + remedy. — v2.9: (1) connect-error box no longer wiped 900ms after render (re-render now only fires when the wallet ACTUALLY answered), (2) kind:13194 presence probe now distinguishes "relay answered, no event" (=dead) from "relay unreachable" (=unknown) — an unreachable probe no longer cries "dead connection" on healthy strings, (3) stuck WebSocket handshakes (IP rate-limit symptom) now fail fast as a retryable socket error instead of burning the whole budget as a fake "wallet did not respond". Feed/notification relay fixes: single-flight reconnects (watchdog/CLOSED closes no longer double-spawn replacement sockets via onclose) + a feed-generation epoch so reconnectFeed()/removeRelay() teardowns can't leave ghost sockets reconnecting to removed relays — the churn that was getting the client IP rate-limited on relay.primal.net. Also: profile-fetch TDZ ReferenceError fixed (seen-but-pictureless profiles can backfill again). -->
+<!-- Monitor The Situation v2.9.14 — 2026-08-18 — Nostr images: fixed the "post has an image but it never renders" class for good. Root cause of the residual cases (after the v2.9.13 feed-signature fix, which live-browser repro confirmed working — zero post-node rebuilds under a busy event stream): an <img> whose request STALLS (upstream accepts and dribbles, or the request sits queued) never fires onerror, so the proxied→raw fallback never ran and the image sat at complete:false forever. Added _nImgWatchdog: any in/near-viewport feed or note-modal image pending >30s is force-swapped to its raw CDN URL (and logged to console if the raw URL stalls too — so the misbehaving host is finally visible in DevTools). Also removed crossorigin="anonymous" from every <img> (23 sites): nothing in the app draws remote images to canvas (all canvas use is Chart.js charts), so the attribute bought nothing and only created silent CORS-failure modes; referrerpolicy="no-referrer" is kept. Also made carousel container IDs deterministic (dropped Math.random from buildNContent) so rendered HTML is now a pure function of content+state and the feed signature can't see phantom changes. — v2.9.13 — 2026-08-17 — NWC: fixed a race where two NWC requests in flight at once could make a real payment go unanswered. nwcAutoRefreshOnLoad (v2.9.10) fires a background get_balance check on every page load, which — being a full nwcRequest call — can retry for a while if its first attempt hits a flaky connection. If the user opened the wallet and hit Pay while that background check was still retrying, BOTH requests targeted the same relay, and the shared per-relay socket pool (v2.9.8) multiplexes concurrent callers onto one WebSocket by design — so the wallet service received a pay_invoice and a get_balance request interleaved on the same connection. That matches this session's exact symptom: relay accepted the request (OK true), then silence until timeout, reproducing identically across two different wallets/relays — a strong sign the trigger was on our side (timing), not the wallet's. NIP-47 is fundamentally request/reply; a wallet not built to juggle two concurrent requests over one connection can end up answering neither. nwcRequest is now serialized through a promise-chain mutex (_nwcRequestQueue) so every call — background refresh, manual balance checks, payments — runs one at a time in call order, never overlapping on the shared connection. To keep this queue from making a real payment wait behind a slow background nicety, nwcAutoRefreshOnLoad also now makes just ONE short attempt (new maxPasses param, 8s vs. the usual 16s + 2-pass retry) instead of potentially occupying the queue for up to ~35s. — v2.9.12 — 2026-08-17 — NWC: balance/budget now persists across sessions via a localStorage cache, so a hard refresh shows the last-known figures immediately instead of "Balance unknown" while waiting on (or if it fails to get) a fresh get_balance round-trip. Previously nwcBalanceSats was purely an in-memory variable, reset to null on every page load — nwcAutoRefreshOnLoad (v2.9.10) helped by kicking off a live check on startup, but that check can take several seconds or fail outright (per this file's extensive NWC-reliability history), and the panel had nothing to show in the meantime. Now _nwcApplyBalanceResult writes {sats, maxAmount, budgetRenewal, at} to localStorage (mts_nwc_last_balance) on every successful live check, and that cache is read back in synchronously at startup — before any UI renders — so the wallet-manage panel opens with real numbers right away. A new nwcBalanceIsLive flag tracks whether THIS session has actually confirmed the balance yet; until it has, the manage panel tags the figure "(last known)" so a stale cached number is never mistaken for a live-confirmed one. Cache is cleared on disconnect and on connecting a new/changed wallet (nwcSaveConnection), since a stale balance would otherwise belong to the wrong wallet. nwcAutoRefreshOnLoad also now re-renders an already-open wallet-manage panel (not just the compact balance labels) once the live check lands, since the budget line is baked into that panel's innerHTML and doesn't update from the live text-patch alone. — v2.9.11 — NWC: dropped the "Budget not reported by this wallet" fallback line entirely. The displayed sats figure is already the connection's spending budget (wallets like Alby/Zeus cap the reported "balance" to the remaining per-connection budget — see v2.9.9's note), so a separate "not reported" caveat next to it was just confusing noise, not new information. When nwcWallet.maxAmount isn't explicitly present, budgetLine now renders empty instead of a line implying something is missing. — v2.9.10 — NWC: budget/balance now auto-refreshes on page load for an already-connected wallet, instead of staying stuck at "Budget not reported" until a manual "Check Balance" click. On startup nwcWallet was only ever reconstituted by re-parsing the saved connection STRING (nwcParseUri) — the actual get_balance round-trip that populates nwcBalanceSats and nwcWallet.maxAmount/budgetRenewal (via _nwcApplyBalanceResult, added in v2.9.9) only ran from a manual balance check or from re-entering the connection string. So every fresh page load showed the wallet as connected but with a budget the wallet in fact reports — this app just hadn't asked yet. Added nwcAutoRefreshOnLoad(), fired non-blocking from init() alongside the existing restoreNSession() call, which runs one silent get_balance on startup and re-renders the wallet strip/settings/manage panes so the real figures appear without user action. — v2.9.9 — NWC: fixed "Budget not reported" showing next to a balance figure that WAS the budget. nwcWallet.maxAmount was only ever populated from the (non-standard, rarely-used) max_amount/budget query params on the connection URI. Several wallet-service implementations (e.g. Alby's NWC service, whose BalanceResponse carries max_amount/budget_renewal — and apparently Zeus's too) instead report the budget by including it directly in the get_balance RESPONSE, and cap the reported "balance" itself to the connection's remaining budget rather than the wallet's true balance — confirmed by a real case where a 507-sat wallet with a 500-sat connection budget reported "balance": 500000 msats. The panel was reading that 500 as "sats available" while separately declaring the budget "not reported," which is self-contradictory: that number effectively IS the budget. Added _nwcApplyBalanceResult() to also read max_amount/budget_renewal out of the get_balance result (msats, same as balance) in both nwcSaveConnection and nwcCheckBalance, and reworded the budget explainer text since "most wallets don't report it" is no longer accurate. — v2.9.8 — NWC: fixed excessive WebSocket churn against the wallet's own relay. — NWC: fixed excessive WebSocket churn against the wallet's own relay. A single "test connection" (nwcSaveConnection) was opening up to 5 independent raw WebSockets to the same relay within ~7s — one invisible kind:13194 info-probe socket (nwcAdvertisedSchemes -> _nwcFetchInfoEvent) to pick an encryption scheme, a fresh socket per scheme tried for get_info, and a fresh socket per pass/retry for get_balance — because _nwcAttemptOnRelay, _nwcFetchInfoEvent, and _nwcRelayControlCheck each always called `new WebSocket(relayUrl)` and tore the connection down again when done, even when the very next line of code was about to talk to the identical relay. Rapid repeat handshakes like that are a well-known trigger for transient connection resets, which presented as intermittent "Relay connection error" sitting right next to a successful reply from the SAME relay moments earlier — indistinguishable from relay flakiness unless you counted the sockets. Added a shared per-relay WebSocket pool (_nwcPoolAcquire/_nwcPoolRelease/_nwcPoolEntry/_nwcPoolRoute): the info probe, get_info, and get_balance now reuse one already-open socket per relay (kept warm for 15s after last use), with subscriptions/publishes multiplexed over it by sub-id/event-id and NIP-42 AUTH handled once per socket instead of once per request. This is the same class of fix already applied to the feed/notification relays in v2.9 (single-flight reconnects) — it just hadn't been applied to the NWC path yet. — v2.9.7 — NWC: fixed silent wrong-wallet testing + softened overconfident IP-throttling claims. (1) A password-manager-vulnerable connection-string field could have a freshly pasted string silently overridden by a saved credential, with zero indication anything was wrong — added a live "→ will test: relay(s) / lud16 / wallet suffix" preview as you type (before you even click Connect), autocomplete="new-password" to discourage autofill, and a "parsed connection: ..." line now stamped at the top of every debug log so a mismatch is undeniable after the fact too. (2) Re-applied the relay panel + a retry button to the entry/error view (was connected-view-only, so it was unreachable after a failed test) — the button is now explicitly labeled with the exact relay(s) it retries, so it can't be mistaken for testing whatever's currently pasted in the field above it. (3) Error hints no longer confidently assert relay.primal.net-specific IP throttling as the cause — now framed as "this relay/network path is unreliable for this connection right now," since the same failure pattern has now reproduced across a different wallet (Zeus) and relay (damus.io) on this connection. — v2.9.5 — NWC: user-selectable relays. Every NWC network call (request, info-event probe, control check) now routes through _nwcAllRelays(), the union of the connection string's own relay(s) with a new user-managed nwcExtraRelays list (persisted in mts_nwc_extra_relays). New relay panel in the wallet-manage pane: shows the wallet's own relay(s) read-only, lets you quick-add any of the app's current Nostr feed relays (RELAYS), or type a custom wss:// relay, with remove buttons for each extra. UI is explicit about the constraint: the wallet SERVICE only listens on relay(s) it was configured with, so an added relay only helps if the wallet happens to also listen there — it can't make a wallet that's only ever published to its own relay (e.g. Primal's custodial wallet) start answering somewhere new. — v2.9.4 — NWC liveness check now includes a control test: when the kind:13194 info-event presence probe is still inconclusive after 2 tries (relay not completing subscriptions), a new `_nwcRelayControlCheck()` fires a totally generic, wallet-unrelated subscription (REQ with just a limit, no filter) at the same relay. If that ALSO gets no EOSE, it conclusively proves the relay itself is failing to complete subscriptions for this connection right now — not the wallet. If the control succeeds, the miss is narrowed down to something specific to the wallet/connection instead. The error hint now branches on this control result instead of always giving the same "could be relay or wallet" hedge. — v2.9.3 — NWC wallet-liveness check hardened: the kind:13194 info-event presence probe (used to tell "wallet service is dead" apart from "wallet is alive but silent" on a "did not respond in time" failure) was a single 4s attempt against relay.primal.net, which under any load misses EOSE and falls back to a vague "inconclusive" hint that reads identically to "we didn't check." New `_nwcCheckWalletAlive()` retries once with a longer 8s window before giving up, and the debug log now shows exactly what each attempt found instead of silently swallowing the first miss. The "still inconclusive" hint text now says explicitly that the relay itself — not the wallet — is what's being unreliable. — v2.9.2 — NWC bugfix: v2.9.1 accidentally left TWO `openTimer = setTimeout(...)` assignments in _nwcAttemptOnRelay. Only the second (later) one was ever stored in `openTimer`, so ws.onopen's clearTimeout(openTimer) only cancelled that one — the FIRST timer (a 3-6s handshake guard) was orphaned and kept running even after the socket opened, the relay accepted the request, and the wallet was mid-reply. It fired regardless and force-failed the attempt with "Could not open relay connection (handshake timed out)", which is why retries kept dying right after "relay accepted request, waiting for wallet reply..." even on fresh IPs — it was never a relay/rate-limit issue. Removed the stray duplicate assignment; only one handshake-guard timer is created now. — v2.9.1: NWC diagnosis fix: stuck WebSocket handshakes (relay.primal.net IP rate-limit symptom) are now ACTUALLY reported as "Could not open relay connection" — v2.9's handshake guard tied with the request timer at budgets under 9s and lost the race, so every stuck handshake was mislabeled "Wallet did not respond in time" and triggered the misleading dead-connection probe. Socket-level failures also no longer spray the remaining encryption schemes at an unreachable relay (they break to the backoff pass instead), and the relay-unreachable hint now explains the rate-limit cause + remedy. — v2.9: (1) connect-error box no longer wiped 900ms after render (re-render now only fires when the wallet ACTUALLY answered), (2) kind:13194 presence probe now distinguishes "relay answered, no event" (=dead) from "relay unreachable" (=unknown) — an unreachable probe no longer cries "dead connection" on healthy strings, (3) stuck WebSocket handshakes (IP rate-limit symptom) now fail fast as a retryable socket error instead of burning the whole budget as a fake "wallet did not respond". Feed/notification relay fixes: single-flight reconnects (watchdog/CLOSED closes no longer double-spawn replacement sockets via onclose) + a feed-generation epoch so reconnectFeed()/removeRelay() teardowns can't leave ghost sockets reconnecting to removed relays — the churn that was getting the client IP rate-limited on relay.primal.net. Also: profile-fetch TDZ ReferenceError fixed (seen-but-pictureless profiles can backfill again). -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3937,7 +3937,7 @@ function renderPeopleResults(found, resultsEl, statusEl, query){
     const pic=meta.picture||'';
     const picSrc=pic?proxyImg(pic):'';
     const avH=picSrc
-      ?`<img src="${esc(picSrc)}" style="width:100%;height:100%;object-fit:cover;border-radius:50%;" crossorigin="anonymous" referrerpolicy="no-referrer" onerror="this.parentElement.innerHTML='<div style=\\'width:100%;height:100%;background:var(--bg-4);display:flex;align-items:center;justify-content:center;font-size:14px;\\'>👤</div>'">`
+      ?`<img src="${esc(picSrc)}" style="width:100%;height:100%;object-fit:cover;border-radius:50%;" referrerpolicy="no-referrer" onerror="this.parentElement.innerHTML='<div style=\\'width:100%;height:100%;background:var(--bg-4);display:flex;align-items:center;justify-content:center;font-size:14px;\\'>👤</div>'">`
       :`<div style="width:100%;height:100%;background:var(--bg-4);display:flex;align-items:center;justify-content:center;font-size:14px;border-radius:50%;">👤</div>`;
     const pubEsc=esc(ev.pubkey);
     const isFollowing=nFollowing.includes(ev.pubkey);
@@ -3987,13 +3987,13 @@ async function openNostrProfile(pubkey){
   const pic = meta.picture||'';
   const picSrc = pic?proxyImg(pic):'';
   const avH = picSrc
-    ? `<img src="${esc(picSrc)}" style="width:100%;height:100%;object-fit:cover;" crossorigin="anonymous" referrerpolicy="no-referrer" onerror="this.style.display='none'">`
+    ? `<img src="${esc(picSrc)}" style="width:100%;height:100%;object-fit:cover;" referrerpolicy="no-referrer" onerror="this.style.display='none'">`
     : `<div style="width:100%;height:100%;background:var(--bg-4);display:flex;align-items:center;justify-content:center;font-size:24px;">👤</div>`;
 
   const isFollowing = nFollowing.includes(pubkey);
   const pubEsc = esc(pubkey);
   const bannerImgModal = meta.banner
-    ? `<img src="${esc(proxyImg(meta.banner))}" crossorigin="anonymous" referrerpolicy="no-referrer"
+    ? `<img src="${esc(proxyImg(meta.banner))}" referrerpolicy="no-referrer"
          onerror="this.style.display='none'"
          style="position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;object-position:center center;">`
     : '';
@@ -4870,7 +4870,7 @@ function renderPostResults(found, resultsEl, statusEl){
     const pic=prof?.picture||'';
     const picSrc=pic?proxyImg(pic):'';
     const avH=picSrc
-      ?`<img src="${esc(picSrc)}" style="width:100%;height:100%;object-fit:cover;border-radius:50%;" crossorigin="anonymous" referrerpolicy="no-referrer" onerror="this.style.display='none'">`
+      ?`<img src="${esc(picSrc)}" style="width:100%;height:100%;object-fit:cover;border-radius:50%;" referrerpolicy="no-referrer" onerror="this.style.display='none'">`
       :`<div style="width:100%;height:100%;background:var(--bg-4);display:flex;align-items:center;justify-content:center;font-size:10px;border-radius:50%;">👤</div>`;
     const evIdEsc=esc(ev.id);
     return`<div class="nv-reply" style="cursor:pointer;" onclick="closeSearch();openNoteView('${evIdEsc}',event)">
@@ -6286,7 +6286,7 @@ async function renderNProfilePane(){
   const pic=meta.picture||'';
   const avH=pic?`<img src="${esc(pic)}" onerror="this.onerror=null;this.src='${esc(proxyImg(pic))}'" style="width:100%;height:100%;object-fit:cover;">`:`<div style="width:100%;height:100%;background:var(--bg-4);display:flex;align-items:center;justify-content:center;font-size:24px;">👤</div>`;
   const bannerImg = meta.banner
-    ? `<img src="${esc(meta.banner)}" crossorigin="anonymous" referrerpolicy="no-referrer"
+    ? `<img src="${esc(meta.banner)}" referrerpolicy="no-referrer"
          onerror="this.onerror=null;this.src='${esc(proxyImg(meta.banner))}'"
          style="position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;object-position:center center;">`
     : '';
@@ -6544,14 +6544,14 @@ function renderNArticles(){
     const prof=nProfiles[ev.pubkey]||(ev.pubkey===nPubkey?nProfile:null);
     const name=prof?.name||trunc(ev.pubkey);
     const avSrc=prof?.picture?proxyImg(prof.picture):'';
-    const avH=avSrc?`<img src="${esc(avSrc)}" style="width:100%;height:100%;object-fit:cover;border-radius:50%;" loading="lazy" crossorigin="anonymous" referrerpolicy="no-referrer" onerror="this.style.display='none'">`
+    const avH=avSrc?`<img src="${esc(avSrc)}" style="width:100%;height:100%;object-fit:cover;border-radius:50%;" loading="lazy" referrerpolicy="no-referrer" onerror="this.style.display='none'">`
       :`<div style="width:100%;height:100%;background:var(--bg-4);display:flex;align-items:center;justify-content:center;font-size:8px;color:var(--t3);border-radius:50%;">${esc(name).slice(0,2).toUpperCase()}</div>`;
     const ago=timeAgo(new Date(ev.created_at*1000));
     const evEsc=esc(ev.id);
     const pubEsc=esc(ev.pubkey);
     const dTag=ev.tags.find(t=>t[0]==='d')?.[1]||'';
     html+=`<div class="npost" style="cursor:pointer;padding:9px 12px;" onclick="openNostrArticle('${evEsc}')">
-      ${image?`<img src="${esc(proxyImg(image))}" alt="" loading="lazy" crossorigin="anonymous" referrerpolicy="no-referrer" style="width:100%;height:92px;object-fit:cover;border-radius:6px;margin-bottom:6px;" onerror="this.style.display='none'">`:''}
+      ${image?`<img src="${esc(proxyImg(image))}" alt="" loading="lazy" referrerpolicy="no-referrer" style="width:100%;height:92px;object-fit:cover;border-radius:6px;margin-bottom:6px;" onerror="this.style.display='none'">`:''}
       <div class="npost-meta" style="margin-bottom:3px;">
         <div class="nav">${avH}</div>
         <span style="font-family:var(--fm);font-size:11px;font-weight:500;color:var(--t0);">${esc(name)}</span>
@@ -6783,7 +6783,7 @@ function renderNNotifs(){
     const name=esc(prof?.name||trunc(e.pubkey));
     const ago=timeAgo(new Date(e.created_at*1000));
     const avSrc=prof?.picture?proxyImg(prof.picture):'';
-    const avH=avSrc?`<img src="${esc(avSrc)}" alt="" loading="lazy" crossorigin="anonymous" referrerpolicy="no-referrer" style="width:26px;height:26px;border-radius:50%;object-fit:cover;flex-shrink:0;" onerror="this.style.display='none'">`
+    const avH=avSrc?`<img src="${esc(avSrc)}" alt="" loading="lazy" referrerpolicy="no-referrer" style="width:26px;height:26px;border-radius:50%;object-fit:cover;flex-shrink:0;" onerror="this.style.display='none'">`
       :`<div style="width:26px;height:26px;border-radius:50%;background:var(--bg-4);display:flex;align-items:center;justify-content:center;font-size:9px;color:var(--t3);flex-shrink:0;">${name.slice(0,2).toUpperCase()}</div>`;
     const avWrap=`<div data-navpk="${esc(e.pubkey)}" style="width:26px;height:26px;border-radius:50%;overflow:hidden;flex-shrink:0;">${avH}</div>`;
     let icon='', actionText='', detail='';
@@ -7104,6 +7104,37 @@ function fetchNProfiles(pubkeys){
   }
 }
 
+// TEMP DEBUG HELPER — not wired to any UI. Open DevTools console, find the
+// note's id (right-click the post → Inspect → look for data-evid="..." on
+// the .npost div), then run: debugNoteTags('that-id-here')
+// This dumps the exact raw event (all tags, verbatim) so we can see what
+// HODL's client actually attached the image with, instead of guessing.
+function debugNoteTags(id){
+  const ev = nEvents.find(e=>e.id===id) || nvEventCache[id];
+  if(!ev){ console.log('[debugNoteTags] not found in nEvents/nvEventCache:', id); return null; }
+  console.log('[debugNoteTags] full event:', JSON.stringify(ev, null, 2));
+  return ev;
+}
+// EASIER VERSION — no DOM inspection needed. Open DevTools console and run:
+//   debugFindNotes('Everyday we get more')
+// (any snippet of the post's visible text works, case-insensitive). It lists
+// every matching cached note's id + full tags so you can just copy the
+// output straight back into chat.
+function debugFindNotes(snippet){
+  const s=(snippet||'').toLowerCase();
+  const all=[...nEvents, ...Object.values(nvEventCache)];
+  const seen=new Set();
+  const hits=all.filter(e=>{
+    if(!e||seen.has(e.id))return false;
+    if(!(e.content||'').toLowerCase().includes(s))return false;
+    seen.add(e.id);
+    return true;
+  });
+  if(!hits.length){ console.log('[debugFindNotes] no cached note matches:', snippet); return []; }
+  hits.forEach(e=>console.log('[debugFindNotes] match:', JSON.stringify(e, null, 2)));
+  return hits;
+}
+
 function handleNEv(ev){
   if((ev.kind===1||ev.kind===6)&&!nEvents.find(e=>e.id===ev.id)){
     if(ev.kind===6){
@@ -7164,7 +7195,7 @@ function openHashtagFeed(tag){
       const name=esc(prof?.name||trunc(ev.pubkey));
       const av=prof?.picture||'';
       const avSrc=av?proxyImg(av):'';
-      const avH=avSrc?`<img src="${esc(avSrc)}" style="width:100%;height:100%;object-fit:cover;border-radius:50%;" loading="lazy" crossorigin="anonymous" referrerpolicy="no-referrer" onerror="this.style.display='none'">`:`<div style="width:100%;height:100%;background:var(--bg-4);display:flex;align-items:center;justify-content:center;font-size:10px;color:var(--t3);border-radius:50%;">${name.slice(0,2).toUpperCase()}</div>`;
+      const avH=avSrc?`<img src="${esc(avSrc)}" style="width:100%;height:100%;object-fit:cover;border-radius:50%;" loading="lazy" referrerpolicy="no-referrer" onerror="this.style.display='none'">`:`<div style="width:100%;height:100%;background:var(--bg-4);display:flex;align-items:center;justify-content:center;font-size:10px;color:var(--t3);border-radius:50%;">${name.slice(0,2).toUpperCase()}</div>`;
       const ago=timeAgo(new Date(ev.created_at*1000));
       const evId=esc(ev.id);
       return`<div class="npost" data-evid="${evId}" style="cursor:pointer;" onclick="openNoteView('${evId}',event)">
@@ -7206,6 +7237,65 @@ function openHashtagFeed(tag){
     }catch{}
   });
 }
+
+// Timestamps ("9m ago" -> "10m ago") and reaction counters change on their
+// own, constantly, with no relation to whether a post's actual content
+// changed. The re-render diff below used to hash the FULL rendered HTML
+// (including those two dynamic bits) as a "did this post change?" signature
+// — so every timestamp tick or like/reply/zap count update looked like a
+// content change, evicting the post's entire DOM node (images included) and
+// rebuilding it from scratch. In a busy feed that meant a post's <img> could
+// get torn down and its network request restarted before it ever finished
+// loading — repeatedly, forever. Strip those two spans out before measuring
+// so the signature only reflects genuine content changes (e.g. a repost
+// placeholder resolving to the real embedded note).
+function _feedSig(html){
+  if(!html) return '';
+  const stripped = html
+    .replace(/<span class="npost-ago"[^>]*>[^<]*<\/span>/g, '')
+    .replace(/<span class="nact-count"[^>]*>[^<]*<\/span>/g, '');
+  return String(stripped.length);
+}
+
+// ── Image load watchdog ────────────────────────────────────────────────────
+// The onerror fallback (proxied URL -> raw CDN URL) only fires when the
+// browser gets a definitive failure. If a request stalls instead — upstream
+// accepts the connection and dribbles, or the request sits queued at the
+// network layer — no error event EVER fires and the <img> sits at
+// complete:false indefinitely, showing the empty background box forever.
+// That is unrecoverable by any onerror-based logic, so: every 10s, find
+// images in (or near) the feed viewport that have been pending >30s and
+// force the fallback manually. Images legitimately deferred by
+// loading="lazy" (below the viewport) and zero-size/hidden images (collapsed
+// carousel filmstrips) are skipped; a stuck raw URL is just logged so the
+// console shows which CDN is actually misbehaving.
+function _nImgWatchdog(){
+  const now=Date.now();
+  const containers=[document.getElementById('nfeed'),document.getElementById('nv-body')].filter(Boolean);
+  const proxiedPrefix=PROXY+'/proxy/';
+  containers.forEach(c=>{
+    const cr=c.getBoundingClientRect();
+    c.querySelectorAll('img').forEach(im=>{
+      if(im.complete) return;                       // loaded or already errored
+      const r=im.getBoundingClientRect();
+      if(r.width===0&&r.height===0) return;         // hidden / display:none
+      if(r.bottom<cr.top-800||r.top>cr.bottom+800) return; // lazy, far below view
+      if(!im._wlSince){ im._wlSince=now; return; }  // first sighting — start clock
+      if(now-im._wlSince<30000) return;
+      if(im.src.startsWith(proxiedPrefix)){
+        const rawUrl=im.dataset.full||im.src.slice(proxiedPrefix.length);
+        console.warn('[img-watchdog] proxied image stuck >30s in view — forcing raw URL:',rawUrl);
+        im.onerror=null;                            // we are the fallback now
+        im.src=rawUrl;
+        im._wlSince=now;
+      } else {
+        console.warn('[img-watchdog] image still pending on raw URL >30s:',im.src);
+        im._wlSince=now;                            // log at most once per 30s
+      }
+    });
+  });
+}
+setInterval(_nImgWatchdog,10000);
 
 function renderNFeed(){
   if(nHashtagMode) return; // hashtag feed is active — don't overwrite it
@@ -7279,9 +7369,9 @@ function renderNFeed(){
       const origAv=origProf?.picture||'';
       const origAvSrc=origAv?proxyImg(origAv):'';
       const origAvH=origAvSrc
-        ?`<img src="${esc(origAvSrc)}" alt="" loading="lazy" crossorigin="anonymous" referrerpolicy="no-referrer" onerror="this.onerror=null;this.src='${esc(origAv)}';">`
+        ?`<img src="${esc(origAvSrc)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.onerror=null;this.src='${esc(origAv)}';">`
         :`<div style="width:100%;height:100%;background:var(--bg-4);display:flex;align-items:center;justify-content:center;font-size:9px;color:var(--t3);">${esc(origName).slice(0,2).toUpperCase()}</div>`;
-      const ct=buildNContent(origEv.content||'', origEv.id, origEv.tags?.filter(t=>t[0]==='p')||[]);
+      const ct=buildNContent(origEv.content||'', origEv.id, origEv.tags||[]);
       const origIdEsc=esc(origEv.id), origPubEsc=esc(origEv.pubkey);
       const liked=nLiked.has(origEv.id), reposted=nReposted.has(origEv.id);
       postHtmlMap[e.id]=`<div class="npost" data-evid="${esc(e.id)}" data-origid="${origIdEsc}" data-v="2" data-author="${reposterPub}" data-origauthor="${origPubEsc}" style="cursor:pointer;" onclick="openNoteView('${origIdEsc}',event)">
@@ -7314,7 +7404,7 @@ function renderNFeed(){
     const nameColor=isMe?'var(--accent)':'var(--t0)';
     const avSrc=av?proxyImg(av):'';
     const avH=avSrc
-      ?`<img src="${esc(avSrc)}" alt="" loading="lazy" crossorigin="anonymous" referrerpolicy="no-referrer" onerror="this.onerror=null;this.src='${esc(av)}';this.onerror=function(){this.style.display='none';this.nextSibling&&(this.nextSibling.style.display='flex');}">` :``;
+      ?`<img src="${esc(avSrc)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.onerror=null;this.src='${esc(av)}';this.onerror=function(){this.style.display='none';this.nextSibling&&(this.nextSibling.style.display='flex');}">` :``;
     const avFallback=`<div style="width:100%;height:100%;background:var(--bg-4);display:flex;align-items:center;justify-content:center;font-size:9px;color:var(--t3);${avSrc?'display:none':''}">${esc(name).slice(0,2).toUpperCase()}</div>`;
     const replyTo=e.tags.find(t=>t[0]==='e');
     const qTag=e.tags.find(t=>t[0]==='q');
@@ -7353,7 +7443,7 @@ function renderNFeed(){
         feedReplyHeader = `<div style="font-family:var(--fm);font-size:10px;color:var(--t3);margin-bottom:4px;">❝ Quoted note</div>`;
       }
     }
-    const ct=buildNContent(e.content||'', e.id, e.tags?.filter(t=>t[0]==='p')||[]);
+    const ct=buildNContent(e.content||'', e.id, e.tags||[]);
     const evId=esc(e.id), evPub=esc(e.pubkey);
     const liked=nLiked.has(e.id), reposted=nReposted.has(e.id);
     postHtmlMap[e.id]=`<div class="npost${nReplyTo?.id===e.id?' replying':''}" data-evid="${evId}" data-v="2" data-author="${evPub}" style="cursor:pointer;" onclick="openNoteView('${evId}',event)">
@@ -7396,7 +7486,7 @@ function renderNFeed(){
   // Evict posts whose content changed (e.g. loading placeholder -> full repost)
   f.querySelectorAll('[data-evid][data-v="2"]').forEach(el=>{
     const id=el.dataset.evid;
-    const newSig=postHtmlMap[id]?String(postHtmlMap[id].length):'';
+    const newSig=postHtmlMap[id]?_feedSig(postHtmlMap[id]):'';
     if(newSig && el.dataset.sig && el.dataset.sig!==newSig){
       toAdd.push(id);
       const elRect=el.getBoundingClientRect(), fRect=f.getBoundingClientRect();
@@ -7443,7 +7533,7 @@ function renderNFeed(){
     const tmp = document.createElement('div');
     tmp.innerHTML = html;
     const newEl = tmp.firstElementChild;
-    if(newEl) newEl.dataset.sig = String(html.length);
+    if(newEl) newEl.dataset.sig = _feedSig(html);
     const pos = sortedIds.indexOf(id);
     // Find the next existing sibling in sorted order
     let refEl = null;
@@ -7607,11 +7697,11 @@ function buildImageCarousel(urls, keyId, maxW, maxH, compact){
   const cid='ic-'+esc(keyId).replace(/[^a-zA-Z0-9_-]/g,'');
   const slides=urls.map((u,i)=>{
     const sv=nCarouselSlideVars(i, compact); // idx starts at 0, so rel===pos on first render
-    return `<img class="n-car-img" data-full="${esc(u)}" data-pos="${i}" src="${esc(proxyImg(u))}" loading="lazy" crossorigin="anonymous" referrerpolicy="no-referrer" draggable="false" style="position:absolute;top:0;left:0;width:100%;height:100%;object-fit:${sv.fit};border-radius:8px;background:var(--bg-3);box-shadow:0 4px 14px rgba(0,0,0,.4);border:${sv.bd};box-sizing:border-box;-webkit-user-drag:none;user-select:none;transition:transform .22s ease,opacity .22s ease,filter .22s ease,width .18s ease,height .18s ease;transform:${sv.tf};opacity:${sv.op};filter:${sv.fl};z-index:${sv.z};pointer-events:${sv.pe};" onerror="this.onerror=null;this.src=this.dataset.full;" onload="nCarouselResize('${cid}')" onclick="event.stopPropagation();nCarouselImgClick('${cid}',${i})">`;
+    return `<img class="n-car-img" data-full="${esc(u)}" data-pos="${i}" src="${esc(proxyImg(u))}" loading="lazy" referrerpolicy="no-referrer" draggable="false" style="position:absolute;top:0;left:0;width:100%;height:100%;object-fit:${sv.fit};border-radius:8px;background:var(--bg-3);box-shadow:0 4px 14px rgba(0,0,0,.4);border:${sv.bd};box-sizing:border-box;-webkit-user-drag:none;user-select:none;transition:transform .22s ease,opacity .22s ease,filter .22s ease,width .18s ease,height .18s ease;transform:${sv.tf};opacity:${sv.op};filter:${sv.fl};z-index:${sv.z};pointer-events:${sv.pe};" onerror="this.onerror=null;this.src=this.dataset.full;" onload="nCarouselResize('${cid}')" onclick="event.stopPropagation();nCarouselImgClick('${cid}',${i})">`;
   }).join('');
   // Filmstrip thumbnails for "Show all" — sized well above a postage stamp so
   // splitting the gallery out doesn't make every photo suddenly hard to see.
-  const rowImgs=urls.map(u=>`<img src="${esc(proxyImg(u))}" data-full="${esc(u)}" loading="lazy" crossorigin="anonymous" referrerpolicy="no-referrer" draggable="false" style="height:${MEDIA_ROW_H}px;width:auto;max-width:${MEDIA_ROW_MAX_W}px;object-fit:contain;border-radius:6px;background:var(--bg-3);flex:0 0 auto;cursor:pointer;-webkit-user-drag:none;user-select:none;" onclick="event.stopPropagation();window.open(this.dataset.full,'_blank')" onerror="this.onerror=null;this.src=this.dataset.full;">`).join('');
+  const rowImgs=urls.map(u=>`<img src="${esc(proxyImg(u))}" data-full="${esc(u)}" loading="lazy" referrerpolicy="no-referrer" draggable="false" style="height:${MEDIA_ROW_H}px;width:auto;max-width:${MEDIA_ROW_MAX_W}px;object-fit:contain;border-radius:6px;background:var(--bg-3);flex:0 0 auto;cursor:pointer;-webkit-user-drag:none;user-select:none;" onclick="event.stopPropagation();window.open(this.dataset.full,'_blank')" onerror="this.onerror=null;this.src=this.dataset.full;">`).join('');
   // Reserve a little breathing room on the right for the peeking cards' offset
   // (they overflow their own box via transform, not layout) so they don't
   // get clipped by a tight parent — matters most in the modal, where there's
@@ -7712,6 +7802,26 @@ function nCarouselToggleAll(cid){
 function buildNContent(raw, evId='', pTags=[]){
   // Tokenize raw content — image/video URLs, plain URLs, nostr: refs
   const TOKEN_RE=/(https?:\/\/\S+?\.(?:jpg|jpeg|png|gif|webp)(?:\?\S*)?(?=\s|$)|https?:\/\/\S+?\.(?:mp4|mov|webm)(?:\?\S*)?(?=\s|$)|https?:\/\/\S+|nostr:(?:npub|nprofile|nevent|note|naddr)[a-zA-Z0-9]+|\b(?:npub|nprofile|nevent|note|naddr)1[a-zA-Z0-9]{20,}\b|#[a-zA-Z][a-zA-Z0-9_]+|@[A-Za-z0-9_\-.]+)/gi;
+  // NIP-92 imeta tags — many clients (Primal included) attach a photo/video
+  // as a separate `imeta` tag instead of inlining its URL in the note text,
+  // so a caption-only note like "Everyday we get more of this" can still
+  // carry a picture that the text tokenizer above would never see, since
+  // there's no URL anywhere in `raw` to find. pTags is the event's full tag
+  // array here (callers pass ev.tags — the name predates this and is now
+  // stale, but every call site already passes the full array or a p-only
+  // subset, and filtering for 'imeta' below is a no-op on the latter).
+  const imetaEntries=(pTags||[]).filter(t=>Array.isArray(t)&&t[0]==='imeta').map(t=>{
+    let url=null,mime=null;
+    t.slice(1).forEach(p=>{
+      if(typeof p!=='string')return;
+      if(p.startsWith('url ')) url=p.slice(4).trim();
+      else if(p.startsWith('m ')) mime=p.slice(2).trim();
+    });
+    return url?{url,mime}:null;
+  }).filter(Boolean);
+  // Only ones NOT already spelled out in the note text — those already get
+  // picked up by the normal inline-image path below and would render twice.
+  const imetaOnly=imetaEntries.filter(e=>!raw.includes(e.url));
   let ct='',last=0,tm,linkUrl=null;
   const pendingMentions=[]; // {domId, pubkey, tok} to resolve after render
   let mentionIdx=0;
@@ -7750,11 +7860,11 @@ function buildNContent(raw, evId='', pTags=[]){
         // Emit the carousel once, at the position of the first image; drop the rest.
         if(!carouselDone){
           carouselDone=true;
-          ct+='<br>'+buildImageCarousel(imgUrls, (evId||'r')+'-'+Math.random().toString(36).slice(2,8), imgMaxW, imgMaxH, isModalCtx);
+          ct+='<br>'+buildImageCarousel(imgUrls, (evId||'r')+'-inline', imgMaxW, imgMaxH, isModalCtx);
         }
       } else {
         const proxied=proxyImg(tok);
-        ct+=`<br><img src="${esc(proxied)}" style="max-width:min(${imgMaxW}px,100%);width:auto;height:auto;max-height:${imgMaxH}px;border-radius:6px;margin-top:6px;cursor:pointer;display:block;object-fit:contain;background:var(--bg-3);" loading="lazy" crossorigin="anonymous" referrerpolicy="no-referrer" onerror="this.onerror=null;this.src='${esc(tok)}'" onclick="event.stopPropagation();window.open('${esc(tok)}','_blank')">`;
+        ct+=`<br><img src="${esc(proxied)}" style="max-width:min(${imgMaxW}px,100%);width:auto;height:auto;max-height:${imgMaxH}px;border-radius:6px;margin-top:6px;cursor:pointer;display:block;object-fit:contain;background:var(--bg-3);" loading="lazy" referrerpolicy="no-referrer" onerror="this.onerror=null;this.src='${esc(tok)}'" onclick="event.stopPropagation();window.open('${esc(tok)}','_blank')">`;
       }
     } else if(/\.(mp4|mov|webm)(\?|$)/i.test(tok)){
       const proxiedVid=`${PROXY}/proxy/${tok}`;
@@ -7814,7 +7924,7 @@ function buildNContent(raw, evId='', pTags=[]){
           const qav=qprof?.picture||'';
           const qavSrc=qav?proxyImg(qav):'';
           const qavH=qavSrc
-            ?`<img src="${esc(qavSrc)}" style="width:100%;height:100%;object-fit:cover;border-radius:50%;" loading="lazy" crossorigin="anonymous" referrerpolicy="no-referrer" onerror="this.style.display='none'">`
+            ?`<img src="${esc(qavSrc)}" style="width:100%;height:100%;object-fit:cover;border-radius:50%;" loading="lazy" referrerpolicy="no-referrer" onerror="this.style.display='none'">`
             :`<div style="width:100%;height:100%;background:var(--bg-4);display:flex;align-items:center;justify-content:center;font-size:8px;color:var(--t3);border-radius:50%;">${qname.slice(0,2).toUpperCase()}</div>`;
           const qtext=esc((qev.content||'').slice(0,200))+(qev.content?.length>200?'…':'');
           const qago=timeAgo(new Date(qev.created_at*1000));
@@ -7855,7 +7965,7 @@ function buildNContent(raw, evId='', pTags=[]){
               const qav=qprof?.picture||'';
               const qavSrc=qav?proxyImg(qav):'';
               const qavH=qavSrc
-                ?`<img src="${esc(qavSrc)}" style="width:100%;height:100%;object-fit:cover;border-radius:50%;" loading="lazy" crossorigin="anonymous" referrerpolicy="no-referrer" onerror="this.style.display='none'">`
+                ?`<img src="${esc(qavSrc)}" style="width:100%;height:100%;object-fit:cover;border-radius:50%;" loading="lazy" referrerpolicy="no-referrer" onerror="this.style.display='none'">`
                 :`<div style="width:100%;height:100%;background:var(--bg-4);display:flex;align-items:center;justify-content:center;font-size:8px;color:var(--t3);border-radius:50%;">${qname.slice(0,2).toUpperCase()}</div>`;
               const qtext=esc((qev.content||'').slice(0,200))+(qev.content?.length>200?'…':'');
               const qago=timeAgo(new Date(qev.created_at*1000));
@@ -7929,6 +8039,24 @@ function buildNContent(raw, evId='', pTags=[]){
   }
   ct+=esc(raw.slice(last));
   ct=ct.replace(/\n/g,'<br>');
+
+  // Append any imeta-attached media the text itself never mentioned.
+  if(imetaOnly.length){
+    const isVidEntry=e=>(e.mime||'').startsWith('video/')||/\.(mp4|mov|webm)(\?|$)/i.test(e.url);
+    const imgOnes=imetaOnly.filter(e=>!isVidEntry(e)).map(e=>e.url);
+    const vidOnes=imetaOnly.filter(isVidEntry).map(e=>e.url);
+    if(imgOnes.length>1){
+      ct+='<br>'+buildImageCarousel(imgOnes, (evId||'r')+'-imeta', imgMaxW, imgMaxH, isModalCtx);
+    } else if(imgOnes.length===1){
+      const proxied=proxyImg(imgOnes[0]);
+      ct+=`<br><img src="${esc(proxied)}" style="max-width:min(${imgMaxW}px,100%);width:auto;height:auto;max-height:${imgMaxH}px;border-radius:6px;margin-top:6px;cursor:pointer;display:block;object-fit:contain;background:var(--bg-3);" loading="lazy" referrerpolicy="no-referrer" onerror="this.onerror=null;this.src='${esc(imgOnes[0])}'" onclick="event.stopPropagation();window.open('${esc(imgOnes[0])}','_blank')">`;
+    }
+    vidOnes.forEach(v=>{
+      const proxiedVid=`${PROXY}/proxy/${v}`;
+      ct+=`<br><video class="nv-video" src="${esc(proxiedVid)}" controls preload="none" style="max-width:100%;border-radius:6px;margin-top:6px;" onerror="this.src=${JSON.stringify(v)}"></video>`;
+    });
+  }
+
   if(linkUrl && evId) ct+=`<div id="lp-${evId}" style="margin-top:4px;min-height:0;contain:layout;"></div>`;
 
   // Schedule async resolution for unresolved mentions
@@ -8091,10 +8219,10 @@ async function openNoteView(evId, evt){
   const av=prof?.picture||'';
   const avSrc=av?proxyImg(av):'';
   const avH=avSrc
-    ?`<img src="${esc(avSrc)}" loading="lazy" crossorigin="anonymous" referrerpolicy="no-referrer" onerror="this.onerror=null;this.src='${esc(av)}'" style="width:100%;height:100%;object-fit:cover;">`
+    ?`<img src="${esc(avSrc)}" loading="lazy" referrerpolicy="no-referrer" onerror="this.onerror=null;this.src='${esc(av)}'" style="width:100%;height:100%;object-fit:cover;">`
     :`<div style="width:100%;height:100%;background:var(--bg-4);display:flex;align-items:center;justify-content:center;font-size:12px;color:var(--t3);">${esc(name).slice(0,2).toUpperCase()}</div>`;
   const ts=new Date(ev.created_at*1000).toLocaleString();
-  const ct=buildNContent(ev.content||'', 'nv-'+evId, ev.tags?.filter(t=>t[0]==='p')||[]);
+  const ct=buildNContent(ev.content||'', 'nv-'+evId, ev.tags||[]);
   const liked=nLiked.has(evId), reposted=nReposted.has(evId);
   const evIdEsc=esc(evId), evPubEsc=esc(ev.pubkey);
   const cached=nvReactions[evId]||{likes:0,reposts:0,zaps:0,zapSats:0,replies:0};
@@ -8107,9 +8235,9 @@ async function openNoteView(evId, evt){
     const pav=pp?.picture||'';
     const pavSrc=pav?proxyImg(pav):'';
     const pavH=pavSrc
-      ?`<img src="${esc(pavSrc)}" loading="lazy" crossorigin="anonymous" referrerpolicy="no-referrer" onerror="this.onerror=null;this.src='${esc(pav)}'" style="width:100%;height:100%;object-fit:cover;">`
+      ?`<img src="${esc(pavSrc)}" loading="lazy" referrerpolicy="no-referrer" onerror="this.onerror=null;this.src='${esc(pav)}'" style="width:100%;height:100%;object-fit:cover;">`
       :`<div style="width:100%;height:100%;background:var(--bg-4);display:flex;align-items:center;justify-content:center;font-size:10px;color:var(--t3);">${esc(pn).slice(0,2).toUpperCase()}</div>`;
-    const pct=buildNContent(parentEv.content||'');
+    const pct=buildNContent(parentEv.content||'', parentEv.id, parentEv.tags||[]);
     const pts=timeAgo(new Date(parentEv.created_at*1000));
     const pIdEsc=esc(parentEv.id);
     parentHtml=`<div class="nv-parent" onclick="openNoteView('${pIdEsc}',event)">
@@ -8492,9 +8620,9 @@ function updateNVStats(evId,likes,reposts,zaps,zapSats,replies,likers,reposters,
     const n=prof?.name||trunc(ev.pubkey);
     const av=prof?.picture||'';
     const avSrc=av?proxyImg(av):'';
-    const avH=avSrc?`<img src="${esc(avSrc)}" loading="lazy" crossorigin="anonymous" referrerpolicy="no-referrer" onerror="this.onerror=null;this.src='${esc(av)}'" style="width:100%;height:100%;object-fit:cover;">`
+    const avH=avSrc?`<img src="${esc(avSrc)}" loading="lazy" referrerpolicy="no-referrer" onerror="this.onerror=null;this.src='${esc(av)}'" style="width:100%;height:100%;object-fit:cover;">`
       :`<div style="width:100%;height:100%;background:var(--bg-4);display:flex;align-items:center;justify-content:center;font-size:8px;color:var(--t3);">${esc(n).slice(0,2).toUpperCase()}</div>`;
-    const ct=buildNContent(ev.content||'');
+    const ct=buildNContent(ev.content||'', ev.id, ev.tags||[]);
     const evId=esc(ev.id), evPub=esc(ev.pubkey);
     const preview=ev.content.slice(0,80);
     const rLiked=nLiked.has(ev.id), rReposted=nReposted.has(ev.id);
@@ -8572,7 +8700,7 @@ function renderReactorRow(item){
   const n=prof?.name||trunc(pk);
   const av=prof?.picture||'';
   const avSrc=av?proxyImg(av):'';
-  const avH=avSrc?`<img src="${esc(avSrc)}" loading="lazy" crossorigin="anonymous" referrerpolicy="no-referrer" onerror="this.onerror=null;this.src='${esc(av)}'" style="width:100%;height:100%;object-fit:cover;">`
+  const avH=avSrc?`<img src="${esc(avSrc)}" loading="lazy" referrerpolicy="no-referrer" onerror="this.onerror=null;this.src='${esc(av)}'" style="width:100%;height:100%;object-fit:cover;">`
     :`<div style="width:100%;height:100%;background:var(--bg-4);display:flex;align-items:center;justify-content:center;font-size:8px;color:var(--t3);">${esc(n).slice(0,2).toUpperCase()}</div>`;
   const pkEsc=esc(pk);
   return `<div class="nv-reply" style="display:flex;align-items:center;gap:8px;cursor:pointer;" onclick="closeM('reactors-modal');openNostrProfile('${pkEsc}')">
@@ -8590,7 +8718,7 @@ function renderQuoteRow(ev){
   const n=prof?.name||trunc(pk);
   const av=prof?.picture||'';
   const avSrc=av?proxyImg(av):'';
-  const avH=avSrc?`<img src="${esc(avSrc)}" loading="lazy" crossorigin="anonymous" referrerpolicy="no-referrer" onerror="this.onerror=null;this.src='${esc(av)}'" style="width:100%;height:100%;object-fit:cover;">`
+  const avH=avSrc?`<img src="${esc(avSrc)}" loading="lazy" referrerpolicy="no-referrer" onerror="this.onerror=null;this.src='${esc(av)}'" style="width:100%;height:100%;object-fit:cover;">`
     :`<div style="width:100%;height:100%;background:var(--bg-4);display:flex;align-items:center;justify-content:center;font-size:8px;color:var(--t3);">${esc(n).slice(0,2).toUpperCase()}</div>`;
   const evIdEsc=esc(ev.id);
   const rawPreview=(ev.content||'').replace(/\s+/g,' ').trim();
@@ -8665,9 +8793,9 @@ function renderNVReplies(){
     const n=prof?.name||trunc(ev.pubkey);
     const av=prof?.picture||'';
     const avSrc=av?proxyImg(av):'';
-    const avH=avSrc?`<img src="${esc(avSrc)}" loading="lazy" crossorigin="anonymous" referrerpolicy="no-referrer" onerror="this.onerror=null;this.src='${esc(av)}'" style="width:100%;height:100%;object-fit:cover;">`
+    const avH=avSrc?`<img src="${esc(avSrc)}" loading="lazy" referrerpolicy="no-referrer" onerror="this.onerror=null;this.src='${esc(av)}'" style="width:100%;height:100%;object-fit:cover;">`
       :`<div style="width:100%;height:100%;background:var(--bg-4);display:flex;align-items:center;justify-content:center;font-size:8px;color:var(--t3);">${esc(n).slice(0,2).toUpperCase()}</div>`;
-    const ct=buildNContent(ev.content||'');
+    const ct=buildNContent(ev.content||'', ev.id, ev.tags||[]);
     const evId=esc(ev.id), evPub=esc(ev.pubkey);
     const preview=ev.content.slice(0,80);
     const rLiked=nLiked.has(ev.id), rReposted=nReposted.has(ev.id);

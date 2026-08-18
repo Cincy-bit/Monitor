@@ -412,13 +412,37 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                 return
 
         try:
-            # Detect if this is an image request and use appropriate headers
-            is_image = any(target.lower().endswith(ext) for ext in
-                           ('.jpg','.jpeg','.png','.gif','.webp','.svg','.avif')) or                        any(h in target.lower() for h in ('image','avatar','picture','pfp','media'))
-            if is_image:
+            # Detect if this is an image/video request and use appropriate headers.
+            # Extension/keyword match covers the common case, but a lot of Nostr
+            # media (Primal/blossom-style CDNs especially) is served from a bare
+            # content hash with NO file extension and no 'image'/'media' keyword
+            # in the path at all, e.g. https://blossom.primal.net/<sha256>. Those
+            # were falling into the JSON-API branch below and picking up
+            # Accept: application/json plus a Referer of https://mempool.space/ —
+            # a combination some media hosts silently reject, which showed up as
+            # images/videos that simply never rendered (no visible error, since
+            # the client's onerror just falls through to the raw URL).
+            target_no_qs = target.lower().split('?')[0]
+            target_host = netloc.split(':')[0].lower()
+            KNOWN_JSON_API_HOSTS = {
+                'mempool.space', 'api.blockchair.com',
+                'blockchain.info', 'api.blockchain.info',
+            }
+            is_image = target_no_qs.endswith(('.jpg','.jpeg','.png','.gif','.webp','.svg','.avif')) or \
+                       any(h in target.lower() for h in ('image','avatar','picture','pfp','media'))
+            is_video = target_no_qs.endswith(('.mp4','.mov','.webm','.m4v'))
+            # Not a recognized JSON API and not a local device (miner) — most
+            # likely a media blob served without a helpful extension/keyword.
+            is_media_by_exclusion = (
+                not is_image and not is_video and not is_local
+                and target_host not in KNOWN_JSON_API_HOSTS
+                and '/api/' not in target.lower()
+                and not target_no_qs.endswith('.json')
+            )
+            if is_image or is_video or is_media_by_exclusion:
                 hdrs = {
                     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-                    "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+                    "Accept": "image/avif,image/webp,image/apng,image/*,video/*,*/*;q=0.8",
                     "Accept-Language": "en-US,en;q=0.9",
                     "Referer": "https://www.google.com/",
                     "Sec-Fetch-Dest": "image",
@@ -430,8 +454,13 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
                     "Accept": "application/json,text/plain,*/*",
                     "Accept-Language": "en-US,en;q=0.9",
-                    "Referer": "https://mempool.space/",
                 }
+                # The mempool.space Referer was previously sent to EVERY non-image
+                # target — including miners, blockchair, blockchain.info, and LNURL
+                # callback hosts, none of which want mempool.space as their Referer.
+                # Only mempool.space itself gets it now.
+                if target_host == 'mempool.space':
+                    hdrs["Referer"] = "https://mempool.space/"
             req = urllib.request.Request(target, headers=hdrs)
             ctx = ssl_ctx if target.startswith("https://") else None
             # Local network devices (miners) may respond slowly.
@@ -2241,18 +2270,83 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         self.json_response(unique[:200])
 
     def handle_ogp(self):
-        """Fetch Open Graph metadata for link previews"""
+        """Fetch Open Graph metadata for link previews.
+
+        Two things were silently killing previews for a chunk of real-world
+        posts (notably x.com/twitter.com status links, which is exactly what
+        was reported missing):
+
+        1. UA/headers: the old request identified itself as
+           "MonitorDashboard/1.0" with no Accept-Encoding/Language/Referer —
+           a fingerprint that reads as a bot to most anti-scraping stacks and
+           gets served a stripped shell page (no og:image) or an outright
+           4xx/consent wall instead of the real markup. x.com/twitter.com in
+           particular only server-render a tweet's OG/card tags for a known
+           crawler UA (Twitterbot/…); a generic UA gets the client-side React
+           shell with none of the per-tweet meta tags. Other sites behind
+           bot-detection (Cloudflare etc.) care about a believable full
+           header set, not just the UA string.
+        2. Encoding: no Accept-Encoding was sent, but some CDNs gzip the
+           response anyway — decoding raw gzip bytes as utf-8 text silently
+           yields zero regex matches, which looks identical to "no og tags"
+           downstream and just fails closed with an empty card.
+
+        Fix: send a real browser header set (matching what already works for
+        the image path-proxy below), special-case a Twitterbot UA for
+        x.com/twitter.com, explicitly gunzip/inflate by sniffing magic bytes
+        (don't trust Content-Encoding), use the wall-clock-deadline fetcher
+        so a stalling host can't hang the request, and retry once on
+        transient failures before giving up.
+        """
         qs = parse_qs(urlparse(self.path).query)
         url = qs.get("url", [None])[0]
         if not url:
             self.send_error(400, "Missing url"); return
+        host = urlparse(url).netloc.lower()
+        is_twitter = host in ("x.com", "twitter.com", "www.x.com", "www.twitter.com") or host.endswith((".x.com", ".twitter.com"))
+
+        def _do_fetch():
+            if is_twitter:
+                # Twitter/X only server-renders per-tweet og:image/og:title for
+                # recognized crawler UAs — everyone else gets the JS app shell.
+                hdrs = {
+                    "User-Agent": "Twitterbot/1.0",
+                    "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+                }
+            else:
+                hdrs = {
+                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Accept-Encoding": "gzip, deflate",
+                    "Referer": "https://www.google.com/",
+                    "Upgrade-Insecure-Requests": "1",
+                }
+            req = urllib.request.Request(url, headers=hdrs)
+            ctx = ssl_ctx if url.startswith("https://") else None
+            return _fetch_with_deadline(req, ctx, 7, 9)
+
         try:
-            req = urllib.request.Request(url, headers={
-                "User-Agent": "Mozilla/5.0 (compatible; MonitorDashboard/1.0)",
-                "Accept": "text/html,*/*"
-            })
-            with urllib.request.urlopen(req, context=ssl_ctx, timeout=6) as resp:
-                raw = resp.read(65536).decode("utf-8", errors="replace")
+            try:
+                data, ct = _do_fetch()
+            except Exception as e:
+                print(f"[ogp] {url} failed ({e}) — retrying once")
+                data, ct = _do_fetch()
+
+            # Some hosts gzip/deflate the body even when we didn't explicitly
+            # request it — decompress by magic-byte sniffing rather than
+            # trusting Content-Encoding.
+            if data[:2] == b"\x1f\x8b":
+                import gzip as _gzip
+                try: data = _gzip.decompress(data)
+                except Exception: pass
+            elif data[:2] in (b"\x78\x9c", b"\x78\x01", b"\x78\xda"):
+                import zlib as _zlib
+                try: data = _zlib.decompress(data)
+                except Exception: pass
+
+            raw = data[:300000].decode("utf-8", errors="replace")
+
             def og(prop):
                 m = re.search(rf'<meta[^>]+property=["\']og:{prop}["\'][^>]+content=["\']([^"\']+)["\']', raw, re.I)
                 if not m:
@@ -2260,19 +2354,26 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                 return m.group(1).strip() if m else ""
             def tw(name):
                 m = re.search(rf'<meta[^>]+name=["\']twitter:{name}["\'][^>]+content=["\']([^"\']+)["\']', raw, re.I)
+                if not m:
+                    m = re.search(rf'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']twitter:{name}["\']', raw, re.I)
                 return m.group(1).strip() if m else ""
             title = og("title") or tw("title") or re.search(r"<title[^>]*>(.*?)</title>", raw, re.I|re.S)
             if hasattr(title, 'group'): title = re.sub(r"<[^>]+>","",title.group(1)).strip()
             elif not isinstance(title, str): title = ""
+            image = og("image") or tw("image") or tw("image:src") or ""
+            if image:
+                # og:image is sometimes protocol-relative or root-relative.
+                image = urljoin(url, image)
             result = {
-                "title": title[:120],
-                "description": (og("description") or tw("description"))[:200],
-                "image": og("image") or tw("image:src") or "",
-                "site": og("site_name") or "",
+                "title": html.unescape(title)[:120],
+                "description": html.unescape(og("description") or tw("description"))[:200],
+                "image": image,
+                "site": html.unescape(og("site_name") or "")[:60],
                 "url": url
             }
             self.json_response(result)
         except Exception as e:
+            print(f"[ogp] {url} failed: {e}")
             self.json_response({"title":"","description":"","image":"","site":"","url":url,"error":str(e)})
 
 
