@@ -1,4 +1,4 @@
-<!-- Monitor The Situation v2.9.14 — 2026-08-18 — Nostr images: fixed the "post has an image but it never renders" class for good. Root cause of the residual cases (after the v2.9.13 feed-signature fix, which live-browser repro confirmed working — zero post-node rebuilds under a busy event stream): an <img> whose request STALLS (upstream accepts and dribbles, or the request sits queued) never fires onerror, so the proxied→raw fallback never ran and the image sat at complete:false forever. Added _nImgWatchdog: any in/near-viewport feed or note-modal image pending >30s is force-swapped to its raw CDN URL (and logged to console if the raw URL stalls too — so the misbehaving host is finally visible in DevTools). Also removed crossorigin="anonymous" from every <img> (23 sites): nothing in the app draws remote images to canvas (all canvas use is Chart.js charts), so the attribute bought nothing and only created silent CORS-failure modes; referrerpolicy="no-referrer" is kept. Also made carousel container IDs deterministic (dropped Math.random from buildNContent) so rendered HTML is now a pure function of content+state and the feed signature can't see phantom changes. — v2.9.13 — 2026-08-17 — NWC: fixed a race where two NWC requests in flight at once could make a real payment go unanswered. nwcAutoRefreshOnLoad (v2.9.10) fires a background get_balance check on every page load, which — being a full nwcRequest call — can retry for a while if its first attempt hits a flaky connection. If the user opened the wallet and hit Pay while that background check was still retrying, BOTH requests targeted the same relay, and the shared per-relay socket pool (v2.9.8) multiplexes concurrent callers onto one WebSocket by design — so the wallet service received a pay_invoice and a get_balance request interleaved on the same connection. That matches this session's exact symptom: relay accepted the request (OK true), then silence until timeout, reproducing identically across two different wallets/relays — a strong sign the trigger was on our side (timing), not the wallet's. NIP-47 is fundamentally request/reply; a wallet not built to juggle two concurrent requests over one connection can end up answering neither. nwcRequest is now serialized through a promise-chain mutex (_nwcRequestQueue) so every call — background refresh, manual balance checks, payments — runs one at a time in call order, never overlapping on the shared connection. To keep this queue from making a real payment wait behind a slow background nicety, nwcAutoRefreshOnLoad also now makes just ONE short attempt (new maxPasses param, 8s vs. the usual 16s + 2-pass retry) instead of potentially occupying the queue for up to ~35s. — v2.9.12 — 2026-08-17 — NWC: balance/budget now persists across sessions via a localStorage cache, so a hard refresh shows the last-known figures immediately instead of "Balance unknown" while waiting on (or if it fails to get) a fresh get_balance round-trip. Previously nwcBalanceSats was purely an in-memory variable, reset to null on every page load — nwcAutoRefreshOnLoad (v2.9.10) helped by kicking off a live check on startup, but that check can take several seconds or fail outright (per this file's extensive NWC-reliability history), and the panel had nothing to show in the meantime. Now _nwcApplyBalanceResult writes {sats, maxAmount, budgetRenewal, at} to localStorage (mts_nwc_last_balance) on every successful live check, and that cache is read back in synchronously at startup — before any UI renders — so the wallet-manage panel opens with real numbers right away. A new nwcBalanceIsLive flag tracks whether THIS session has actually confirmed the balance yet; until it has, the manage panel tags the figure "(last known)" so a stale cached number is never mistaken for a live-confirmed one. Cache is cleared on disconnect and on connecting a new/changed wallet (nwcSaveConnection), since a stale balance would otherwise belong to the wrong wallet. nwcAutoRefreshOnLoad also now re-renders an already-open wallet-manage panel (not just the compact balance labels) once the live check lands, since the budget line is baked into that panel's innerHTML and doesn't update from the live text-patch alone. — v2.9.11 — NWC: dropped the "Budget not reported by this wallet" fallback line entirely. The displayed sats figure is already the connection's spending budget (wallets like Alby/Zeus cap the reported "balance" to the remaining per-connection budget — see v2.9.9's note), so a separate "not reported" caveat next to it was just confusing noise, not new information. When nwcWallet.maxAmount isn't explicitly present, budgetLine now renders empty instead of a line implying something is missing. — v2.9.10 — NWC: budget/balance now auto-refreshes on page load for an already-connected wallet, instead of staying stuck at "Budget not reported" until a manual "Check Balance" click. On startup nwcWallet was only ever reconstituted by re-parsing the saved connection STRING (nwcParseUri) — the actual get_balance round-trip that populates nwcBalanceSats and nwcWallet.maxAmount/budgetRenewal (via _nwcApplyBalanceResult, added in v2.9.9) only ran from a manual balance check or from re-entering the connection string. So every fresh page load showed the wallet as connected but with a budget the wallet in fact reports — this app just hadn't asked yet. Added nwcAutoRefreshOnLoad(), fired non-blocking from init() alongside the existing restoreNSession() call, which runs one silent get_balance on startup and re-renders the wallet strip/settings/manage panes so the real figures appear without user action. — v2.9.9 — NWC: fixed "Budget not reported" showing next to a balance figure that WAS the budget. nwcWallet.maxAmount was only ever populated from the (non-standard, rarely-used) max_amount/budget query params on the connection URI. Several wallet-service implementations (e.g. Alby's NWC service, whose BalanceResponse carries max_amount/budget_renewal — and apparently Zeus's too) instead report the budget by including it directly in the get_balance RESPONSE, and cap the reported "balance" itself to the connection's remaining budget rather than the wallet's true balance — confirmed by a real case where a 507-sat wallet with a 500-sat connection budget reported "balance": 500000 msats. The panel was reading that 500 as "sats available" while separately declaring the budget "not reported," which is self-contradictory: that number effectively IS the budget. Added _nwcApplyBalanceResult() to also read max_amount/budget_renewal out of the get_balance result (msats, same as balance) in both nwcSaveConnection and nwcCheckBalance, and reworded the budget explainer text since "most wallets don't report it" is no longer accurate. — v2.9.8 — NWC: fixed excessive WebSocket churn against the wallet's own relay. — NWC: fixed excessive WebSocket churn against the wallet's own relay. A single "test connection" (nwcSaveConnection) was opening up to 5 independent raw WebSockets to the same relay within ~7s — one invisible kind:13194 info-probe socket (nwcAdvertisedSchemes -> _nwcFetchInfoEvent) to pick an encryption scheme, a fresh socket per scheme tried for get_info, and a fresh socket per pass/retry for get_balance — because _nwcAttemptOnRelay, _nwcFetchInfoEvent, and _nwcRelayControlCheck each always called `new WebSocket(relayUrl)` and tore the connection down again when done, even when the very next line of code was about to talk to the identical relay. Rapid repeat handshakes like that are a well-known trigger for transient connection resets, which presented as intermittent "Relay connection error" sitting right next to a successful reply from the SAME relay moments earlier — indistinguishable from relay flakiness unless you counted the sockets. Added a shared per-relay WebSocket pool (_nwcPoolAcquire/_nwcPoolRelease/_nwcPoolEntry/_nwcPoolRoute): the info probe, get_info, and get_balance now reuse one already-open socket per relay (kept warm for 15s after last use), with subscriptions/publishes multiplexed over it by sub-id/event-id and NIP-42 AUTH handled once per socket instead of once per request. This is the same class of fix already applied to the feed/notification relays in v2.9 (single-flight reconnects) — it just hadn't been applied to the NWC path yet. — v2.9.7 — NWC: fixed silent wrong-wallet testing + softened overconfident IP-throttling claims. (1) A password-manager-vulnerable connection-string field could have a freshly pasted string silently overridden by a saved credential, with zero indication anything was wrong — added a live "→ will test: relay(s) / lud16 / wallet suffix" preview as you type (before you even click Connect), autocomplete="new-password" to discourage autofill, and a "parsed connection: ..." line now stamped at the top of every debug log so a mismatch is undeniable after the fact too. (2) Re-applied the relay panel + a retry button to the entry/error view (was connected-view-only, so it was unreachable after a failed test) — the button is now explicitly labeled with the exact relay(s) it retries, so it can't be mistaken for testing whatever's currently pasted in the field above it. (3) Error hints no longer confidently assert relay.primal.net-specific IP throttling as the cause — now framed as "this relay/network path is unreliable for this connection right now," since the same failure pattern has now reproduced across a different wallet (Zeus) and relay (damus.io) on this connection. — v2.9.5 — NWC: user-selectable relays. Every NWC network call (request, info-event probe, control check) now routes through _nwcAllRelays(), the union of the connection string's own relay(s) with a new user-managed nwcExtraRelays list (persisted in mts_nwc_extra_relays). New relay panel in the wallet-manage pane: shows the wallet's own relay(s) read-only, lets you quick-add any of the app's current Nostr feed relays (RELAYS), or type a custom wss:// relay, with remove buttons for each extra. UI is explicit about the constraint: the wallet SERVICE only listens on relay(s) it was configured with, so an added relay only helps if the wallet happens to also listen there — it can't make a wallet that's only ever published to its own relay (e.g. Primal's custodial wallet) start answering somewhere new. — v2.9.4 — NWC liveness check now includes a control test: when the kind:13194 info-event presence probe is still inconclusive after 2 tries (relay not completing subscriptions), a new `_nwcRelayControlCheck()` fires a totally generic, wallet-unrelated subscription (REQ with just a limit, no filter) at the same relay. If that ALSO gets no EOSE, it conclusively proves the relay itself is failing to complete subscriptions for this connection right now — not the wallet. If the control succeeds, the miss is narrowed down to something specific to the wallet/connection instead. The error hint now branches on this control result instead of always giving the same "could be relay or wallet" hedge. — v2.9.3 — NWC wallet-liveness check hardened: the kind:13194 info-event presence probe (used to tell "wallet service is dead" apart from "wallet is alive but silent" on a "did not respond in time" failure) was a single 4s attempt against relay.primal.net, which under any load misses EOSE and falls back to a vague "inconclusive" hint that reads identically to "we didn't check." New `_nwcCheckWalletAlive()` retries once with a longer 8s window before giving up, and the debug log now shows exactly what each attempt found instead of silently swallowing the first miss. The "still inconclusive" hint text now says explicitly that the relay itself — not the wallet — is what's being unreliable. — v2.9.2 — NWC bugfix: v2.9.1 accidentally left TWO `openTimer = setTimeout(...)` assignments in _nwcAttemptOnRelay. Only the second (later) one was ever stored in `openTimer`, so ws.onopen's clearTimeout(openTimer) only cancelled that one — the FIRST timer (a 3-6s handshake guard) was orphaned and kept running even after the socket opened, the relay accepted the request, and the wallet was mid-reply. It fired regardless and force-failed the attempt with "Could not open relay connection (handshake timed out)", which is why retries kept dying right after "relay accepted request, waiting for wallet reply..." even on fresh IPs — it was never a relay/rate-limit issue. Removed the stray duplicate assignment; only one handshake-guard timer is created now. — v2.9.1: NWC diagnosis fix: stuck WebSocket handshakes (relay.primal.net IP rate-limit symptom) are now ACTUALLY reported as "Could not open relay connection" — v2.9's handshake guard tied with the request timer at budgets under 9s and lost the race, so every stuck handshake was mislabeled "Wallet did not respond in time" and triggered the misleading dead-connection probe. Socket-level failures also no longer spray the remaining encryption schemes at an unreachable relay (they break to the backoff pass instead), and the relay-unreachable hint now explains the rate-limit cause + remedy. — v2.9: (1) connect-error box no longer wiped 900ms after render (re-render now only fires when the wallet ACTUALLY answered), (2) kind:13194 presence probe now distinguishes "relay answered, no event" (=dead) from "relay unreachable" (=unknown) — an unreachable probe no longer cries "dead connection" on healthy strings, (3) stuck WebSocket handshakes (IP rate-limit symptom) now fail fast as a retryable socket error instead of burning the whole budget as a fake "wallet did not respond". Feed/notification relay fixes: single-flight reconnects (watchdog/CLOSED closes no longer double-spawn replacement sockets via onclose) + a feed-generation epoch so reconnectFeed()/removeRelay() teardowns can't leave ghost sockets reconnecting to removed relays — the churn that was getting the client IP rate-limited on relay.primal.net. Also: profile-fetch TDZ ReferenceError fixed (seen-but-pictureless profiles can backfill again). -->
+<!-- Monitor The Situation v2.9.15 — 2026-08-19 — Nostr follower counts fixed + profile muting added. FOLLOWERS: four compounding causes for "the follower number is never right". (1) The in-browser Primal cache WebSocket — the most accurate source, same one primal.net itself uses — still connected to wss://cacheN.primal.net/v1; Primal moved that endpoint to /cache (the proxy had this fix, the browser code never got it), so the source silently failed every time. Now connects to /cache with a per-host /v1 fallback. (2) It also bet on ONE RANDOM cache host, so a single down host zeroed the source; now races all three and keeps the best answer. (3) The "higher count wins" updater re-parsed the ALREADY-FORMATTED display text — Number("12.5k".replace(/[^0-9]/g,'')) is 125, "1.2M" is 12 — so a partial relay scan (a strict lower bound, e.g. 2,000) happily overwrote an accurate indexer count (12,500). Displayed counts now carry their raw integer in dataset.n and can never regress; this ran in both the profile modal and the profile pane. (4) Counts are now cached in localStorage (mts_nstats_v1) and painted instantly on open, then refreshed; and when NO indexer (Primal/nostr.band) knows a profile and the number comes only from scanning kind:3 contact lists on relays, it renders as "≈N" with a lower-bound tooltip instead of posing as exact. proxy.py side: its Primal WS got the same /cache→/v1 fallback, and the NIP-45 COUNT result (relay.nostr.band's is capped at 500 — the client removed it in an earlier version for corrupting the highest-wins merge, the proxy never did) is now excluded from the merge and kept only as a diagnostic log line. MUTING: mute any profile from the profile modal (Mute button next to Follow), the 🔇 button on any feed post or repost, or the note view. Muted authors are dropped at ingest AND render for the timeline, reposts of them, hashtag feeds, notifications (badge counts recalculated), articles, and post-search results; people-search cards show a MUTED badge. Mutes persist in localStorage so they work logged-out, and when connected they merge with (union on login) and publish back to the account's standard NIP-51 kind:10000 mute list — existing encrypted/private entries and non-p tags preserved — so they sync to other clients. Unmuting re-fetches the timeline so their posts return. Manage the list in Settings → Nostr → Muted Accounts. — v2.9.14 — 2026-08-18 — Nostr images: fixed the "post has an image but it never renders" class for good. Root cause of the residual cases (after the v2.9.13 feed-signature fix, which live-browser repro confirmed working — zero post-node rebuilds under a busy event stream): an <img> whose request STALLS (upstream accepts and dribbles, or the request sits queued) never fires onerror, so the proxied→raw fallback never ran and the image sat at complete:false forever. Added _nImgWatchdog: any in/near-viewport feed or note-modal image pending >30s is force-swapped to its raw CDN URL (and logged to console if the raw URL stalls too — so the misbehaving host is finally visible in DevTools). Also removed crossorigin="anonymous" from every <img> (23 sites): nothing in the app draws remote images to canvas (all canvas use is Chart.js charts), so the attribute bought nothing and only created silent CORS-failure modes; referrerpolicy="no-referrer" is kept. Also made carousel container IDs deterministic (dropped Math.random from buildNContent) so rendered HTML is now a pure function of content+state and the feed signature can't see phantom changes. — v2.9.13 — 2026-08-17 — NWC: fixed a race where two NWC requests in flight at once could make a real payment go unanswered. nwcAutoRefreshOnLoad (v2.9.10) fires a background get_balance check on every page load, which — being a full nwcRequest call — can retry for a while if its first attempt hits a flaky connection. If the user opened the wallet and hit Pay while that background check was still retrying, BOTH requests targeted the same relay, and the shared per-relay socket pool (v2.9.8) multiplexes concurrent callers onto one WebSocket by design — so the wallet service received a pay_invoice and a get_balance request interleaved on the same connection. That matches this session's exact symptom: relay accepted the request (OK true), then silence until timeout, reproducing identically across two different wallets/relays — a strong sign the trigger was on our side (timing), not the wallet's. NIP-47 is fundamentally request/reply; a wallet not built to juggle two concurrent requests over one connection can end up answering neither. nwcRequest is now serialized through a promise-chain mutex (_nwcRequestQueue) so every call — background refresh, manual balance checks, payments — runs one at a time in call order, never overlapping on the shared connection. To keep this queue from making a real payment wait behind a slow background nicety, nwcAutoRefreshOnLoad also now makes just ONE short attempt (new maxPasses param, 8s vs. the usual 16s + 2-pass retry) instead of potentially occupying the queue for up to ~35s. — v2.9.12 — 2026-08-17 — NWC: balance/budget now persists across sessions via a localStorage cache, so a hard refresh shows the last-known figures immediately instead of "Balance unknown" while waiting on (or if it fails to get) a fresh get_balance round-trip. Previously nwcBalanceSats was purely an in-memory variable, reset to null on every page load — nwcAutoRefreshOnLoad (v2.9.10) helped by kicking off a live check on startup, but that check can take several seconds or fail outright (per this file's extensive NWC-reliability history), and the panel had nothing to show in the meantime. Now _nwcApplyBalanceResult writes {sats, maxAmount, budgetRenewal, at} to localStorage (mts_nwc_last_balance) on every successful live check, and that cache is read back in synchronously at startup — before any UI renders — so the wallet-manage panel opens with real numbers right away. A new nwcBalanceIsLive flag tracks whether THIS session has actually confirmed the balance yet; until it has, the manage panel tags the figure "(last known)" so a stale cached number is never mistaken for a live-confirmed one. Cache is cleared on disconnect and on connecting a new/changed wallet (nwcSaveConnection), since a stale balance would otherwise belong to the wrong wallet. nwcAutoRefreshOnLoad also now re-renders an already-open wallet-manage panel (not just the compact balance labels) once the live check lands, since the budget line is baked into that panel's innerHTML and doesn't update from the live text-patch alone. — v2.9.11 — NWC: dropped the "Budget not reported by this wallet" fallback line entirely. The displayed sats figure is already the connection's spending budget (wallets like Alby/Zeus cap the reported "balance" to the remaining per-connection budget — see v2.9.9's note), so a separate "not reported" caveat next to it was just confusing noise, not new information. When nwcWallet.maxAmount isn't explicitly present, budgetLine now renders empty instead of a line implying something is missing. — v2.9.10 — NWC: budget/balance now auto-refreshes on page load for an already-connected wallet, instead of staying stuck at "Budget not reported" until a manual "Check Balance" click. On startup nwcWallet was only ever reconstituted by re-parsing the saved connection STRING (nwcParseUri) — the actual get_balance round-trip that populates nwcBalanceSats and nwcWallet.maxAmount/budgetRenewal (via _nwcApplyBalanceResult, added in v2.9.9) only ran from a manual balance check or from re-entering the connection string. So every fresh page load showed the wallet as connected but with a budget the wallet in fact reports — this app just hadn't asked yet. Added nwcAutoRefreshOnLoad(), fired non-blocking from init() alongside the existing restoreNSession() call, which runs one silent get_balance on startup and re-renders the wallet strip/settings/manage panes so the real figures appear without user action. — v2.9.9 — NWC: fixed "Budget not reported" showing next to a balance figure that WAS the budget. nwcWallet.maxAmount was only ever populated from the (non-standard, rarely-used) max_amount/budget query params on the connection URI. Several wallet-service implementations (e.g. Alby's NWC service, whose BalanceResponse carries max_amount/budget_renewal — and apparently Zeus's too) instead report the budget by including it directly in the get_balance RESPONSE, and cap the reported "balance" itself to the connection's remaining budget rather than the wallet's true balance — confirmed by a real case where a 507-sat wallet with a 500-sat connection budget reported "balance": 500000 msats. The panel was reading that 500 as "sats available" while separately declaring the budget "not reported," which is self-contradictory: that number effectively IS the budget. Added _nwcApplyBalanceResult() to also read max_amount/budget_renewal out of the get_balance result (msats, same as balance) in both nwcSaveConnection and nwcCheckBalance, and reworded the budget explainer text since "most wallets don't report it" is no longer accurate. — v2.9.8 — NWC: fixed excessive WebSocket churn against the wallet's own relay. — NWC: fixed excessive WebSocket churn against the wallet's own relay. A single "test connection" (nwcSaveConnection) was opening up to 5 independent raw WebSockets to the same relay within ~7s — one invisible kind:13194 info-probe socket (nwcAdvertisedSchemes -> _nwcFetchInfoEvent) to pick an encryption scheme, a fresh socket per scheme tried for get_info, and a fresh socket per pass/retry for get_balance — because _nwcAttemptOnRelay, _nwcFetchInfoEvent, and _nwcRelayControlCheck each always called `new WebSocket(relayUrl)` and tore the connection down again when done, even when the very next line of code was about to talk to the identical relay. Rapid repeat handshakes like that are a well-known trigger for transient connection resets, which presented as intermittent "Relay connection error" sitting right next to a successful reply from the SAME relay moments earlier — indistinguishable from relay flakiness unless you counted the sockets. Added a shared per-relay WebSocket pool (_nwcPoolAcquire/_nwcPoolRelease/_nwcPoolEntry/_nwcPoolRoute): the info probe, get_info, and get_balance now reuse one already-open socket per relay (kept warm for 15s after last use), with subscriptions/publishes multiplexed over it by sub-id/event-id and NIP-42 AUTH handled once per socket instead of once per request. This is the same class of fix already applied to the feed/notification relays in v2.9 (single-flight reconnects) — it just hadn't been applied to the NWC path yet. — v2.9.7 — NWC: fixed silent wrong-wallet testing + softened overconfident IP-throttling claims. (1) A password-manager-vulnerable connection-string field could have a freshly pasted string silently overridden by a saved credential, with zero indication anything was wrong — added a live "→ will test: relay(s) / lud16 / wallet suffix" preview as you type (before you even click Connect), autocomplete="new-password" to discourage autofill, and a "parsed connection: ..." line now stamped at the top of every debug log so a mismatch is undeniable after the fact too. (2) Re-applied the relay panel + a retry button to the entry/error view (was connected-view-only, so it was unreachable after a failed test) — the button is now explicitly labeled with the exact relay(s) it retries, so it can't be mistaken for testing whatever's currently pasted in the field above it. (3) Error hints no longer confidently assert relay.primal.net-specific IP throttling as the cause — now framed as "this relay/network path is unreliable for this connection right now," since the same failure pattern has now reproduced across a different wallet (Zeus) and relay (damus.io) on this connection. — v2.9.5 — NWC: user-selectable relays. Every NWC network call (request, info-event probe, control check) now routes through _nwcAllRelays(), the union of the connection string's own relay(s) with a new user-managed nwcExtraRelays list (persisted in mts_nwc_extra_relays). New relay panel in the wallet-manage pane: shows the wallet's own relay(s) read-only, lets you quick-add any of the app's current Nostr feed relays (RELAYS), or type a custom wss:// relay, with remove buttons for each extra. UI is explicit about the constraint: the wallet SERVICE only listens on relay(s) it was configured with, so an added relay only helps if the wallet happens to also listen there — it can't make a wallet that's only ever published to its own relay (e.g. Primal's custodial wallet) start answering somewhere new. — v2.9.4 — NWC liveness check now includes a control test: when the kind:13194 info-event presence probe is still inconclusive after 2 tries (relay not completing subscriptions), a new `_nwcRelayControlCheck()` fires a totally generic, wallet-unrelated subscription (REQ with just a limit, no filter) at the same relay. If that ALSO gets no EOSE, it conclusively proves the relay itself is failing to complete subscriptions for this connection right now — not the wallet. If the control succeeds, the miss is narrowed down to something specific to the wallet/connection instead. The error hint now branches on this control result instead of always giving the same "could be relay or wallet" hedge. — v2.9.3 — NWC wallet-liveness check hardened: the kind:13194 info-event presence probe (used to tell "wallet service is dead" apart from "wallet is alive but silent" on a "did not respond in time" failure) was a single 4s attempt against relay.primal.net, which under any load misses EOSE and falls back to a vague "inconclusive" hint that reads identically to "we didn't check." New `_nwcCheckWalletAlive()` retries once with a longer 8s window before giving up, and the debug log now shows exactly what each attempt found instead of silently swallowing the first miss. The "still inconclusive" hint text now says explicitly that the relay itself — not the wallet — is what's being unreliable. — v2.9.2 — NWC bugfix: v2.9.1 accidentally left TWO `openTimer = setTimeout(...)` assignments in _nwcAttemptOnRelay. Only the second (later) one was ever stored in `openTimer`, so ws.onopen's clearTimeout(openTimer) only cancelled that one — the FIRST timer (a 3-6s handshake guard) was orphaned and kept running even after the socket opened, the relay accepted the request, and the wallet was mid-reply. It fired regardless and force-failed the attempt with "Could not open relay connection (handshake timed out)", which is why retries kept dying right after "relay accepted request, waiting for wallet reply..." even on fresh IPs — it was never a relay/rate-limit issue. Removed the stray duplicate assignment; only one handshake-guard timer is created now. — v2.9.1: NWC diagnosis fix: stuck WebSocket handshakes (relay.primal.net IP rate-limit symptom) are now ACTUALLY reported as "Could not open relay connection" — v2.9's handshake guard tied with the request timer at budgets under 9s and lost the race, so every stuck handshake was mislabeled "Wallet did not respond in time" and triggered the misleading dead-connection probe. Socket-level failures also no longer spray the remaining encryption schemes at an unreachable relay (they break to the backoff pass instead), and the relay-unreachable hint now explains the rate-limit cause + remedy. — v2.9: (1) connect-error box no longer wiped 900ms after render (re-render now only fires when the wallet ACTUALLY answered), (2) kind:13194 presence probe now distinguishes "relay answered, no event" (=dead) from "relay unreachable" (=unknown) — an unreachable probe no longer cries "dead connection" on healthy strings, (3) stuck WebSocket handshakes (IP rate-limit symptom) now fail fast as a retryable socket error instead of burning the whole budget as a fake "wallet did not respond". Feed/notification relay fixes: single-flight reconnects (watchdog/CLOSED closes no longer double-spawn replacement sockets via onclose) + a feed-generation epoch so reconnectFeed()/removeRelay() teardowns can't leave ghost sockets reconnecting to removed relays — the churn that was getting the client IP rate-limited on relay.primal.net. Also: profile-fetch TDZ ReferenceError fixed (seen-but-pictureless profiles can backfill again). -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -4012,7 +4012,9 @@ async function openNostrProfile(pubkey){
       <div class="np-banner" style="position:relative;overflow:hidden;">${bannerImgModal}</div>
       <div style="position:absolute;bottom:-32px;left:18px;width:64px;height:64px;border-radius:50%;border:3px solid var(--bg-2);overflow:hidden;background:var(--bg-4);z-index:2;flex-shrink:0;">${avH}</div>
     </div>
-    <div style="display:flex;justify-content:flex-end;padding:8px 14px 0 14px;">
+    <div style="display:flex;justify-content:flex-end;gap:8px;padding:8px 14px 0 14px;">
+      ${pubkey!==nPubkey?`<button id="np-mute-btn" class="btn" data-mute-pk="${pubEsc}" style="font-size:11px;min-width:64px;${nMuted.has(pubkey)?'color:var(--red);border-color:rgba(255,77,106,.4);':''}"
+        onclick="toggleMuteUser('${pubEsc}',this)">${nMuted.has(pubkey)?'Unmute':'Mute'}</button>`:''}
       <button id="np-follow-btn" class="btn${isFollowing?' btn-p':''}" style="font-size:11px;min-width:80px;"
         onclick="toggleFollowUser('${pubEsc}',this)">
         ${nPubkey?(isFollowing?'Following':'Follow'):'—'}
@@ -4038,6 +4040,16 @@ async function openNostrProfile(pubkey){
       <div id="np-posts"><div style="font-family:var(--fm);font-size:11px;color:var(--t2);">Loading posts…</div></div>
     </div>`;
 
+  // Seed the Following element's raw value so later updates compare numerically (v2.9.15)
+  const _fe0=document.getElementById('np-following-val');
+  if(_fe0 && typeof followingCount==='number') _fe0.dataset.n=String(followingCount);
+  // Paint last-known counts instantly — the live refresh below can only raise them
+  const _cs=_nStatsGet(pubkey);
+  if(_cs){
+    _setStatVal(document.getElementById('np-followers-val'), _cs.f, false);
+    _setStatVal(document.getElementById('np-following-val'), _cs.fw, false);
+  }
+
   // Load recent posts immediately
   fetchProfilePosts(pubkey, relays);
 
@@ -4051,29 +4063,26 @@ async function openNostrProfile(pubkey){
     let followerCount = primalStats.followers_count ?? primalStats.follower_count ?? null;
     const followersEl = document.getElementById('np-followers-val');
     if (followersEl) {
-      // Show primal stats immediately if we have it, then always run fetchFollowerCount
-      // in parallel and update with whichever is higher (primal may cap at 500)
+      // Indexer count first (exact), then the relay scan as a lower-bound check.
+      // _setStatVal compares raw integers in dataset.n — the display can never
+      // regress from an accurate count to a lower partial one (the old code
+      // re-parsed formatted text, "12.5k"→125, and let exactly that happen).
       if (followerCount != null && Number(followerCount) > 0) {
-        followersEl.textContent = fmtFollowerCount(followerCount);
+        _setStatVal(followersEl, Number(followerCount), false);
       }
-      // Always run the accurate count in parallel — updates display if it finds a higher value
       fetchFollowerCount(pubkey, relays).then(better => {
         const el = document.getElementById('np-followers-val');
         if (!el) return;
-        const current = Number(el.textContent?.replace(/[^0-9]/g,'')) || 0;
-        if (better > current) el.textContent = fmtFollowerCount(better);
-        else if (better > 0 && current === 0) el.textContent = fmtFollowerCount(better);
-        else if (better === 0 && current === 0) el.textContent = '—';
+        // If no indexer had any count for this profile, the scan result is only
+        // a lower bound — show it as "≈N" so it's not mistaken for an exact count.
+        const hasExact = el.dataset.est==='0' && Number(el.dataset.n||0)>0;
+        _setStatVal(el, better, !hasExact);
       });
     }
-    // Always update following count from Primal — more reliable than relay-counted followingPks
+    // Following count from Primal too — more reliable than relay-counted followingPks
     const fc = primalStats.follows_count ?? primalStats.following_count ?? null;
-    const followingEl = document.getElementById('np-following-val');
-    if (followingEl && fc != null && Number(fc) > 0) {
-      // Use whichever is higher: relay-counted list or Primal's count
-      const relayCount = Number(followingEl.textContent.replace(/[^0-9.kKmM]/g,''))||0;
-      const primalCount = Number(fc);
-      followingEl.textContent = fmtFollowerCount(Math.max(relayCount, primalCount));
+    if (fc != null && Number(fc) > 0) {
+      _setStatVal(document.getElementById('np-following-val'), Number(fc), false);
     }
   });
 }
@@ -4217,62 +4226,136 @@ async function fetchProfileMeta(pubkey, relays){
   });
 }
 
+// ── Profile stats cache + no-regression display (v2.9.15) ─────────────────
+// Last-known follower/following counts per pubkey, persisted across sessions so a
+// profile opens with real numbers instantly instead of "…" while sources respond.
+let _nStatsCache = {};
+try{ _nStatsCache = JSON.parse(localStorage.getItem('mts_nstats_v1')||'{}'); if(typeof _nStatsCache!=='object'||!_nStatsCache) _nStatsCache={}; }catch{ _nStatsCache={}; }
+function _nStatsGet(pk){ const e=_nStatsCache[pk]; return (e&&typeof e==='object')?e:null; }
+function _nStatsSet(pk, followers, following){
+  if(!pk) return;
+  const prev=_nStatsGet(pk)||{};
+  const entry={ t:Date.now() };
+  // Keep the highest value ever seen per field — indexers occasionally under-report
+  // on partial crawls, and a stale high watermark beats a fresh low one.
+  entry.f =Math.max(Number(prev.f)||0, Number(followers)||0);
+  entry.fw=Math.max(Number(prev.fw)||0, Number(following)||0);
+  if(!entry.f && !entry.fw) return;
+  _nStatsCache[pk]=entry;
+  const keys=Object.keys(_nStatsCache);
+  if(keys.length>300){ // prune oldest so localStorage can't grow unbounded
+    keys.sort((a,b)=>(_nStatsCache[a].t||0)-(_nStatsCache[b].t||0));
+    keys.slice(0,keys.length-300).forEach(k=>delete _nStatsCache[k]);
+  }
+  try{ localStorage.setItem('mts_nstats_v1', JSON.stringify(_nStatsCache)); }catch{}
+}
+// Write a count into a stat element WITHOUT ever regressing it.
+// The raw integer lives in el.dataset.n, so comparisons NEVER re-parse formatted
+// text — the old code did Number("12.5k".replace(/[^0-9]/g,'')) → 125 and then let a
+// partial relay-scan count (e.g. 2,000) overwrite the accurate indexer count
+// (12,500) because 2000 > 125. That was the "followers number is always wrong" bug.
+// isEstimate marks relay-scan lower bounds (rendered "≈N" with an explainer tooltip);
+// an exact indexer value always replaces an estimate, an estimate never replaces an
+// exact value, and nothing replaces a higher number with a lower one.
+function _setStatVal(el, n, isEstimate){
+  if(!el) return;
+  n=Number(n)||0;
+  const cur=Number(el.dataset.n||0);
+  const curEst=el.dataset.est==='1';
+  if(n<=0){ if(!cur) el.textContent='—'; return; }
+  if(!isEstimate && (n>=cur || curEst)){
+    el.dataset.n=String(n); el.dataset.est='0';
+    el.textContent=fmtFollowerCount(n); el.title='';
+  } else if(isEstimate && (!cur || curEst) && n>cur){
+    el.dataset.n=String(n); el.dataset.est='1';
+    el.textContent=fmtFollowerCount(n);
+    el.title='Estimate — counted from contact lists visible to your relays (a lower bound, not an exact count)';
+  }
+}
+
 async function fetchPrimalStats(pubkey){
   // Four parallel sources. The Primal cache WS is the most reliable — it's exactly
   // what primal.net web app uses. CORS isn't an issue for WS connections.
   const nbController = new AbortController();
   const nbTimer = setTimeout(()=>nbController.abort(), 8000);
 
-  // Primal cache WebSocket — same protocol as primal.net web app uses
+  // Primal cache WebSocket — same protocol as primal.net web app uses.
+  // v2.9.15: two bugs made this source (the most accurate one) silently fail in-browser:
+  //   1) It connected to wss://cacheN.primal.net/v1 — Primal moved the cache WS to /cache
+  //      (the proxy already knew this; the browser code didn't). Now tries /cache first
+  //      with an automatic /v1 fallback per host.
+  //   2) It bet on ONE RANDOM cache host — a single down/busy host killed the whole
+  //      source. Now races all three hosts and keeps the best answer.
   function primalCacheWS(pubkey){
-    return new Promise(res=>{
-      const host = ['cache0.primal.net','cache1.primal.net','cache2.primal.net'][Math.floor(Math.random()*3)];
-      const result = {};
-      let done = false;
-      const finish = ()=>{ if(!done){done=true; res(result); } };
-      const timeout = setTimeout(finish, 8000);
-      try{
-        const ws = new WebSocket(`wss://${host}/v1`);
-        const sid   = 'ps-'  + Math.random().toString(36).slice(2,8);
-        const sidFc = 'psf-' + Math.random().toString(36).slice(2,8);
-        let eoseStats = false, eoseFc = false;
-        const checkDone = ()=>{
-          if (eoseStats && eoseFc) { clearTimeout(timeout); try{ws.close();}catch{}; finish(); }
+    function attempt(host){
+      return new Promise(res=>{
+        const result = {};
+        let done = false;
+        const finish = ()=>{ if(!done){done=true; res(result); } };
+        const timeout = setTimeout(finish, 8000);
+        const connect = (path)=>{
+          let gotData = false;
+          let ws;
+          try{ ws = new WebSocket(`wss://${host}${path}`); }
+          catch(e){ if(path==='/cache') connect('/v1'); else {clearTimeout(timeout); finish();} return; }
+          const sid   = 'ps-'  + Math.random().toString(36).slice(2,8);
+          const sidFc = 'psf-' + Math.random().toString(36).slice(2,8);
+          let eoseStats = false, eoseFc = false;
+          const checkDone = ()=>{
+            if (eoseStats && eoseFc) { clearTimeout(timeout); try{ws.close();}catch{}; finish(); }
+          };
+          const retryOrFinish = ()=>{
+            if(done) return;
+            // /cache failed without delivering anything — fall back to the legacy /v1 path
+            if(path==='/cache' && !gotData){ connect('/v1'); return; }
+            clearTimeout(timeout); finish();
+          };
+          ws.onopen = ()=>{
+            // Send BOTH requests immediately so responses arrive in parallel
+            ws.send(JSON.stringify(['REQ', sid,   {'cache': ['user_profile_stats',  {pubkey}]}]));
+            ws.send(JSON.stringify(['REQ', sidFc, {'cache': ['user_follower_count', {pubkey}]}]));
+          };
+          ws.onmessage = e=>{
+            try{
+              const m = JSON.parse(e.data);
+              if(!Array.isArray(m)) return;
+              if(m[0]==='EOSE'){
+                if(m[1]===sid)   eoseStats = true;
+                if(m[1]===sidFc) eoseFc    = true;
+                checkDone(); return;
+              }
+              if(m[0]==='EVENT' && m[2]?.kind===10000133){
+                try{
+                  const c = JSON.parse(m[2].content||'{}');
+                  gotData = true;
+                  console.log(`[primalCacheWS] ${host}${path} ${m[1]} content for ${pubkey.slice(0,8)}:`, JSON.stringify(c).slice(0,200));
+                  // user_follower_count → {"count": N}
+                  if(c.count && Number(c.count) > (result.followers_count||0))
+                    result.followers_count = Number(c.count);
+                  // user_profile_stats → {"followers_count": N, "follows_count": N, ...}
+                  if(c.followers_count && Number(c.followers_count) > (result.followers_count||0))
+                    result.followers_count = Number(c.followers_count);
+                  if(c.follows_count)
+                    result.follows_count = Number(c.follows_count);
+                }catch{}
+              }
+            }catch{}
+          };
+          ws.onerror = retryOrFinish;
+          ws.onclose = retryOrFinish;
         };
-        ws.onopen = ()=>{
-          // Send BOTH requests immediately so responses arrive in parallel
-          ws.send(JSON.stringify(['REQ', sid,   {'cache': ['user_profile_stats',  {pubkey}]}]));
-          ws.send(JSON.stringify(['REQ', sidFc, {'cache': ['user_follower_count', {pubkey}]}]));
-        };
-        ws.onmessage = e=>{
-          try{
-            const m = JSON.parse(e.data);
-            if(!Array.isArray(m)) return;
-            if(m[0]==='EOSE'){
-              if(m[1]===sid)   eoseStats = true;
-              if(m[1]===sidFc) eoseFc    = true;
-              checkDone(); return;
-            }
-            if(m[0]==='EVENT' && m[2]?.kind===10000133){
-              try{
-                const c = JSON.parse(m[2].content||'{}');
-                console.log(`[primalCacheWS] ${m[1]} content for ${pubkey.slice(0,8)}:`, JSON.stringify(c).slice(0,200));
-                // user_follower_count → {"count": N}
-                if(c.count && Number(c.count) > (result.followers_count||0))
-                  result.followers_count = Number(c.count);
-                // user_profile_stats → {"followers_count": N, "follows_count": N, ...}
-                if(c.followers_count && Number(c.followers_count) > (result.followers_count||0))
-                  result.followers_count = Number(c.followers_count);
-                if(c.follows_count)
-                  result.follows_count = Number(c.follows_count);
-              }catch{}
-            }
-          }catch{}
-        };
-        ws.onerror = ()=>{ clearTimeout(timeout); finish(); };
-        ws.onclose = ()=>{ clearTimeout(timeout); finish(); };
-      }catch(e){ clearTimeout(timeout); finish(); }
-    });
+        connect('/cache');
+      });
+    }
+    return Promise.all(['cache0.primal.net','cache1.primal.net','cache2.primal.net'].map(attempt))
+      .then(results=>{
+        const merged={};
+        for(const r of results){
+          if(Number(r.followers_count||0) > Number(merged.followers_count||0)) merged.followers_count=Number(r.followers_count);
+          if(Number(r.follows_count||0)   > Number(merged.follows_count||0))   merged.follows_count=Number(r.follows_count);
+        }
+        return merged;
+      });
   }
 
   const [proxyResult, nbResult, primalDirectResult, primalWSResult, nip45Result] = await Promise.allSettled([
@@ -4332,6 +4415,8 @@ async function fetchPrimalStats(pubkey){
   const merged = {};
   if (fc)  merged.followers_count = fc;
   if (fwc) merged.follows_count   = fwc;
+  // Persist as last-known-good so the next profile open paints instantly (v2.9.15)
+  if (merged.followers_count || merged.follows_count) _nStatsSet(pubkey, merged.followers_count, merged.follows_count);
   return Object.assign({}, proxy, merged);
 }
 
@@ -6115,6 +6200,138 @@ function toggleNostr(e){
 // Nostr following timeline state
 let nFollowing = [];       // pubkeys the user follows
 let nMyFollowers = new Set(); // pubkeys that follow the logged-in user (for "Follows You" badge)
+
+// ── Muting (NIP-51) — v2.9.15 ─────────────────────────────────────────────
+// nMuted works logged-out (localStorage only). When connected, the account's
+// published kind:10000 mute list is merged in on login, and mute/unmute changes
+// are published back so they sync to other clients.
+let nMuted = new Set();
+let nMuteListEv = null;  // newest kind:10000 seen — kept so re-publishing preserves encrypted/private entries + non-p tags
+try{ nMuted = new Set(JSON.parse(localStorage.getItem('mts_nostr_muted')||'[]').filter(pk=>/^[0-9a-f]{64}$/.test(pk))); }catch{ nMuted = new Set(); }
+function _saveMutedLocal(){ try{ localStorage.setItem('mts_nostr_muted', JSON.stringify([...nMuted])); }catch{} }
+
+// Extract the ORIGINAL author's pubkey from a repost (kind:6): content JSON first, p-tag fallback
+function _nRepostOrigPk(ev){
+  if(!ev || ev.kind!==6) return null;
+  if(ev.content){ try{ const o=JSON.parse(ev.content); if(o&&/^[0-9a-f]{64}$/.test(o.pubkey||'')) return o.pubkey; }catch{} }
+  const p=(ev.tags||[]).find(t=>t[0]==='p'&&/^[0-9a-f]{64}$/.test(t[1]||''));
+  return p?p[1]:null;
+}
+// True if an event was authored by — or is a repost OF — a muted account
+function _nEvMuted(ev){
+  if(!ev || !nMuted.size) return false;
+  if(nMuted.has(ev.pubkey)) return true;
+  const op=_nRepostOrigPk(ev);
+  return op ? nMuted.has(op) : false;
+}
+
+// Pull the account's published mute list (kind:10000) and UNION it into local state.
+// Union (not replace) so lists made on other clients and local mutes both survive.
+async function fetchMuteList(){
+  if(!nPubkey) return;
+  const myPk=nPubkey;
+  const relays=[...new Set([...RELAYS,'wss://relay.damus.io','wss://nos.lol','wss://relay.primal.net'])];
+  let newest=null, responded=0;
+  await new Promise(res=>{
+    let done=false; const finish=()=>{if(!done){done=true;res();}};
+    const timeout=setTimeout(finish,8000);
+    relays.forEach(url=>{
+      try{
+        const ws=new WebSocket(url);
+        const sid='ml-'+Math.random().toString(36).slice(2,6);
+        ws.onopen=()=>ws.send(JSON.stringify(['REQ',sid,{kinds:[10000],authors:[myPk],limit:1}]));
+        ws.onmessage=(e)=>{ try{
+          const m=JSON.parse(e.data);
+          if(m[0]==='EVENT'&&m[2]?.kind===10000){ if(!newest||m[2].created_at>newest.created_at) newest=m[2]; }
+          else if(m[0]==='EOSE'){ try{ws.close();}catch{} if(++responded>=relays.length){clearTimeout(timeout);finish();} }
+        }catch{} };
+        ws.onerror=()=>{ try{ws.close();}catch{} if(++responded>=relays.length){clearTimeout(timeout);finish();} };
+        setTimeout(()=>{try{ws.close();}catch{}},7000);
+      }catch{ if(++responded>=relays.length){clearTimeout(timeout);finish();} }
+    });
+  });
+  if(newest && nPubkey===myPk){
+    nMuteListEv=newest;
+    let changed=false;
+    (newest.tags||[]).forEach(t=>{ if(t[0]==='p'&&/^[0-9a-f]{64}$/.test(t[1]||'')&&!nMuted.has(t[1])){ nMuted.add(t[1]); changed=true; } });
+    if(changed){ _saveMutedLocal(); renderNFeed(); if(nActivePane==='notifs') renderNNotifs(); }
+  }
+}
+
+// Publish the current mute list as kind:10000 (NIP-51). The previous event's
+// content is preserved VERBATIM — it may hold encrypted private mutes we can't
+// read — and non-p tags (e.g. muted words/hashtags) are kept. If signing fails
+// (e.g. NIP-46 signer without publish support), the local mute still applies.
+async function publishMuteList(){
+  if(!nPubkey) return;
+  try{
+    const pTags=[...nMuted].map(pk=>['p',pk]);
+    const otherTags=(nMuteListEv?.tags||[]).filter(t=>t[0]!=='p');
+    const signed=await nPublish({kind:10000,created_at:Math.floor(Date.now()/1000),tags:[...pTags,...otherTags],content:nMuteListEv?.content||'',pubkey:nPubkey});
+    nMuteListEv=signed;
+    console.log('[mute] published kind:10000 with',pTags.length,'muted accounts');
+  }catch(e){ console.log('[mute] publish skipped/failed (local mute still active):', e.message||e); }
+}
+
+function _paintMuteBtn(btn, isMuted){
+  btn.textContent=isMuted?'Unmute':'Mute';
+  btn.style.color=isMuted?'var(--red)':'';
+  btn.style.borderColor=isMuted?'rgba(255,77,106,.4)':'';
+}
+
+// Toggle mute on a profile. btn is optional (profile modal / note view pass one).
+async function toggleMuteUser(pubkey, btn){
+  if(!/^[0-9a-f]{64}$/.test(pubkey||'')) return;
+  if(pubkey===nPubkey) return; // can't mute yourself
+  const muting=!nMuted.has(pubkey);
+  if(muting) nMuted.add(pubkey); else nMuted.delete(pubkey);
+  _saveMutedLocal();
+  if(btn) _paintMuteBtn(btn, muting);
+  document.querySelectorAll(`[data-mute-pk="${pubkey}"]`).forEach(b=>{ if(b!==btn) _paintMuteBtn(b, muting); });
+  if(muting){
+    // Purge already-loaded content from this author everywhere
+    nEvents=nEvents.filter(e=>!_nEvMuted(e));
+    nNotifs=nNotifs.filter(e=>!_nEvMuted(e));
+    nArticles=nArticles.filter(e=>e.pubkey!==pubkey);
+    nUnreadNotifs=nNotifs.filter(n=>n.created_at>nNotifsLastReadAt).length;
+    _updateNotifBadges(); _saveNNotifsDebounced();
+    renderNFeed();
+    if(nActivePane==='notifs') renderNNotifs();
+    if(nActivePane==='articles') renderNArticles();
+  } else {
+    reconnectFeed(); // refetch the timeline so their posts come back
+  }
+  // Refresh the muted list if the settings modal is open on the Nostr pane
+  if(document.getElementById('sp-nostr')?.classList.contains('on')) renderMutedList();
+  publishMuteList(); // fire-and-forget — local state already applied
+}
+
+// Settings → Nostr → Muted Accounts management list
+function renderMutedList(){
+  const el=document.getElementById('muted-list');
+  if(!el) return;
+  if(!nMuted.size){
+    el.innerHTML='<div style="font-family:var(--fm);font-size:10px;color:var(--t3);">No muted accounts. Mute someone from their profile page or the 🔇 button on any of their posts.</div>';
+    return;
+  }
+  const pks=[...nMuted];
+  const unknown=pks.filter(pk=>!nProfiles[pk]);
+  if(unknown.length) fetchNProfiles(unknown.slice(0,50));
+  el.innerHTML=pks.map(pk=>{
+    const prof=nProfiles[pk]||{};
+    const name=esc(prof.name||prof.display_name||trunc(pk));
+    const pic=prof.picture?proxyImg(prof.picture):'';
+    const av=pic
+      ?`<img src="${esc(pic)}" style="width:100%;height:100%;object-fit:cover;" referrerpolicy="no-referrer" onerror="this.style.display='none'">`
+      :`<div style="width:100%;height:100%;background:var(--bg-4);display:flex;align-items:center;justify-content:center;font-size:11px;color:var(--t3);">👤</div>`;
+    return `<div class="ei" style="cursor:default;">
+      <div style="width:24px;height:24px;border-radius:50%;overflow:hidden;flex-shrink:0;border:1px solid var(--border-l);">${av}</div>
+      <span style="flex:1;font-size:12px;color:var(--t1);cursor:pointer;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" onclick="openNostrProfile('${pk}')">${name}</span>
+      <span style="font-family:var(--fm);font-size:9px;color:var(--t3);flex-shrink:0;">${trunc(pk)}</span>
+      <button class="btn" style="font-size:9px;padding:2px 8px;flex-shrink:0;" onclick="toggleMuteUser('${pk}',null)">Unmute</button>
+    </div>`;
+  }).join('');
+}
 let nProfiles = {};        // pubkey -> full kind-0 metadata {name, picture, banner, about, ...}
 let nFeedFilter = 'posts'; // 'posts' | 'all'
 let nArticles = []; // kind:30023 long-form articles from following
@@ -6270,7 +6487,9 @@ async function renderNProfilePane(){
   if (_nppLoadedFor === pubkey && (window._nppOwnPosts||[]).length > 0 && document.getElementById('npp-posts')) {
     const localFollowCount = Math.max(0, nFollowing.length - 1);
     const fe=document.getElementById('npp-following');
-    if(fe) fe.textContent = localFollowCount > 0 ? fmtFollowerCount(localFollowCount) : '\u2014';
+    _setStatVal(fe, localFollowCount, false);
+    const _cs=_nStatsGet(pubkey);
+    if(_cs){ _setStatVal(document.getElementById('npp-followers'),_cs.f,false); _setStatVal(fe,_cs.fw,false); }
     renderNppTab('posts');
     return;
   }
@@ -6313,10 +6532,15 @@ async function renderNProfilePane(){
       <div id="npp-posts"><div style="font-family:var(--fm);font-size:11px;color:var(--t2);">Loading posts…</div></div>
     </div>`;
 
-  // Following count from local cache immediately
+  // Following count from local cache immediately (raw integer seeded in dataset.n)
   const localFollowCount = Math.max(0, nFollowing.length - 1);
-  const feEl=document.getElementById('npp-following');
-  if(feEl){ feEl.textContent = localFollowCount > 0 ? fmtFollowerCount(localFollowCount) : '—'; }
+  _setStatVal(document.getElementById('npp-following'), localFollowCount, false);
+  // Last-known counts from the stats cache — instant paint, live fetch can only raise them
+  const _cs=_nStatsGet(pubkey);
+  if(_cs){
+    _setStatVal(document.getElementById('npp-followers'),_cs.f,false);
+    _setStatVal(document.getElementById('npp-following'),_cs.fw,false);
+  }
 
   // Primal stats for accurate follower/following counts
   fetchPrimalStats(pubkey).then(ps=>{
@@ -6324,19 +6548,17 @@ async function renderNProfilePane(){
     const fwc=ps.follows_count??ps.following_count??null;
     const flEl=document.getElementById('npp-followers');
     if(flEl){
-      if(fc!=null && Number(fc)>0) flEl.textContent=fmtFollowerCount(Number(fc));
+      if(fc!=null && Number(fc)>0) _setStatVal(flEl, Number(fc), false);
       fetchFollowerCount(pubkey,[]).then(cnt=>{
         const el2=document.getElementById('npp-followers');
         if(!el2) return;
-        const cur=Number(el2.textContent?.replace(/[^0-9]/g,''))||0;
-        if(cnt>cur) el2.textContent=fmtFollowerCount(cnt);
-        else if(cnt>0&&cur===0) el2.textContent=fmtFollowerCount(cnt);
-        else if(cnt===0&&cur===0) el2.textContent='—';
+        // Relay scan is a lower bound: shown as "≈N" only when no indexer count exists
+        const hasExact=el2.dataset.est==='0'&&Number(el2.dataset.n||0)>0;
+        _setStatVal(el2, cnt, !hasExact);
       });
     }
-    const fwEl=document.getElementById('npp-following');
-    if(fwEl&&fwc!=null&&Number(fwc)>0){
-      fwEl.textContent=fmtFollowerCount(Math.max(Number(fwc),localFollowCount));
+    if(fwc!=null&&Number(fwc)>0){
+      _setStatVal(document.getElementById('npp-following'), Number(fwc), false);
     }
   });
 
@@ -6537,7 +6759,7 @@ function renderNArticles(){
     return;
   }
   let html='';
-  nArticles.forEach(ev=>{
+  nArticles.filter(ev=>!nMuted.has(ev.pubkey)).forEach(ev=>{
     const title=ev.tags.find(t=>t[0]==='title')?.[1]||ev.tags.find(t=>t[0]==='d')?.[1]?.replace(/-/g,' ')||'Untitled';
     const image=ev.tags.find(t=>t[0]==='image')?.[1]||ev.tags.find(t=>t[0]==='banner')?.[1]||'';
     const summary=ev.tags.find(t=>t[0]==='summary')?.[1]||(ev.content||'').slice(0,180).replace(/[#*`]/g,'');
@@ -7136,6 +7358,7 @@ function debugFindNotes(snippet){
 }
 
 function handleNEv(ev){
+  if(_nEvMuted(ev)) return; // muted author (or a repost of one) — never enters the timeline
   if((ev.kind===1||ev.kind===6)&&!nEvents.find(e=>e.id===ev.id)){
     if(ev.kind===6){
       let origPubkey=null;
@@ -8273,6 +8496,7 @@ async function openNoteView(evId, evt){
         <button class="nv-act repost${reposted?' done':''}" id="nva-repost" onclick='nRepost("${evIdEsc}","${evPubEsc}",this)'>⇄ ${reposted?'reposted':'repost'}</button>
         <button class="nv-act like${liked?' done':''}" id="nva-like" onclick='nLike("${evIdEsc}","${evPubEsc}",this)'>♥ ${liked?'liked':'like'}</button>
         <button class="nv-act zap" id="nva-zap" onclick='openZapModal("${evIdEsc}","${evPubEsc}")'>⚡ zap</button>
+        ${ev.pubkey!==nPubkey?`<button class="nv-act" id="nva-mute" data-mute-pk="${evPubEsc}" onclick='toggleMuteUser("${evPubEsc}",this)'>${nMuted.has(ev.pubkey)?'🔇 unmute':'🔇 mute'}</button>`:''}
       </div>
     </div>
     <div class="nv-replies-hdr">Replies</div>
@@ -9044,7 +9268,7 @@ async function nRepost(evId, evPub, btn){
 }
 
 function nLogout(){
-  nPubkey=null;nProfile=null;nSigner=null;nEvents=[];window._nPriv=null;
+  nPubkey=null;nProfile=null;nSigner=null;nEvents=[];window._nPriv=null;nMuteListEv=null;
   nFollowing=[];nMyFollowers=new Set();nFeedReactions={};nFeedReactionsFetched=new Map();nProfiles={};nReplyTo=null;nLiked=new Set();nReposted=new Set();
   _nppLoadedFor=null; window._nppOwnPosts=undefined; window._nppOwnReplies=undefined;
   // Clear profile pane cache so it reloads on next visit

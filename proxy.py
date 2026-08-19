@@ -3301,8 +3301,23 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             import threading as _threading
 
             def try_host(host):
-                # Primal moved cache WS endpoint from /v1 to /cache
-                path = '/cache' if host.endswith('primal.net') else '/v1'
+                # Primal moved the cache WS endpoint from /v1 to /cache — but individual
+                # cache hosts have been seen answering on only one of the two paths, so
+                # try /cache first and fall back to /v1 (and vice versa) before giving
+                # up on the host. Without the fallback, one wrong-path guess silently
+                # zeroed out the most accurate follower-count source.
+                primary = '/cache' if host.endswith('primal.net') else '/v1'
+                secondary = '/v1' if primary == '/cache' else '/cache'
+                r = _try_host_path(host, primary)
+                if r.get('followers_count') or r.get('follows_count'):
+                    return r
+                r2 = _try_host_path(host, secondary)
+                for k in ('followers_count', 'follows_count'):
+                    if (r2.get(k) or 0) > (r.get(k) or 0):
+                        r[k] = r2[k]
+                return r
+
+            def _try_host_path(host, path):
                 port = 443
                 key = base64.b64encode(_os.urandom(16)).decode()
                 handshake = (
@@ -3673,10 +3688,14 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             threads[3].join(timeout=10)
             threads[4].join(timeout=8)
 
-            # Take the HIGHEST follower count from any source
+            # Take the HIGHEST follower count from any source.
+            # nip45_result is DELIBERATELY excluded from the merge: relay.nostr.band's
+            # NIP-45 COUNT response is capped (500), which corrupts a highest-wins merge
+            # — the client already removed it for the same reason. It's kept above purely
+            # as a diagnostic log line.
             def _best_count(key):
                 best = 0
-                for src in (nb_result, pr_result, pr2_result, ws_result, nip45_result):
+                for src in (nb_result, pr_result, pr2_result, ws_result):
                     try:
                         v = int(src.get(key) or 0)
                         if v > best:
