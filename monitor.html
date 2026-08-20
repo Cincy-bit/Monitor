@@ -1,4 +1,4 @@
-<!-- Monitor The Situation v2.9.15 — 2026-08-19 — Nostr follower counts fixed + profile muting added. FOLLOWERS: four compounding causes for "the follower number is never right". (1) The in-browser Primal cache WebSocket — the most accurate source, same one primal.net itself uses — still connected to wss://cacheN.primal.net/v1; Primal moved that endpoint to /cache (the proxy had this fix, the browser code never got it), so the source silently failed every time. Now connects to /cache with a per-host /v1 fallback. (2) It also bet on ONE RANDOM cache host, so a single down host zeroed the source; now races all three and keeps the best answer. (3) The "higher count wins" updater re-parsed the ALREADY-FORMATTED display text — Number("12.5k".replace(/[^0-9]/g,'')) is 125, "1.2M" is 12 — so a partial relay scan (a strict lower bound, e.g. 2,000) happily overwrote an accurate indexer count (12,500). Displayed counts now carry their raw integer in dataset.n and can never regress; this ran in both the profile modal and the profile pane. (4) Counts are now cached in localStorage (mts_nstats_v1) and painted instantly on open, then refreshed; and when NO indexer (Primal/nostr.band) knows a profile and the number comes only from scanning kind:3 contact lists on relays, it renders as "≈N" with a lower-bound tooltip instead of posing as exact. proxy.py side: its Primal WS got the same /cache→/v1 fallback, and the NIP-45 COUNT result (relay.nostr.band's is capped at 500 — the client removed it in an earlier version for corrupting the highest-wins merge, the proxy never did) is now excluded from the merge and kept only as a diagnostic log line. MUTING: mute any profile from the profile modal (Mute button next to Follow), the 🔇 button on any feed post or repost, or the note view. Muted authors are dropped at ingest AND render for the timeline, reposts of them, hashtag feeds, notifications (badge counts recalculated), articles, and post-search results; people-search cards show a MUTED badge. Mutes persist in localStorage so they work logged-out, and when connected they merge with (union on login) and publish back to the account's standard NIP-51 kind:10000 mute list — existing encrypted/private entries and non-p tags preserved — so they sync to other clients. Unmuting re-fetches the timeline so their posts return. Manage the list in Settings → Nostr → Muted Accounts. — v2.9.14 — 2026-08-18 — Nostr images: fixed the "post has an image but it never renders" class for good. Root cause of the residual cases (after the v2.9.13 feed-signature fix, which live-browser repro confirmed working — zero post-node rebuilds under a busy event stream): an <img> whose request STALLS (upstream accepts and dribbles, or the request sits queued) never fires onerror, so the proxied→raw fallback never ran and the image sat at complete:false forever. Added _nImgWatchdog: any in/near-viewport feed or note-modal image pending >30s is force-swapped to its raw CDN URL (and logged to console if the raw URL stalls too — so the misbehaving host is finally visible in DevTools). Also removed crossorigin="anonymous" from every <img> (23 sites): nothing in the app draws remote images to canvas (all canvas use is Chart.js charts), so the attribute bought nothing and only created silent CORS-failure modes; referrerpolicy="no-referrer" is kept. Also made carousel container IDs deterministic (dropped Math.random from buildNContent) so rendered HTML is now a pure function of content+state and the feed signature can't see phantom changes. — v2.9.13 — 2026-08-17 — NWC: fixed a race where two NWC requests in flight at once could make a real payment go unanswered. nwcAutoRefreshOnLoad (v2.9.10) fires a background get_balance check on every page load, which — being a full nwcRequest call — can retry for a while if its first attempt hits a flaky connection. If the user opened the wallet and hit Pay while that background check was still retrying, BOTH requests targeted the same relay, and the shared per-relay socket pool (v2.9.8) multiplexes concurrent callers onto one WebSocket by design — so the wallet service received a pay_invoice and a get_balance request interleaved on the same connection. That matches this session's exact symptom: relay accepted the request (OK true), then silence until timeout, reproducing identically across two different wallets/relays — a strong sign the trigger was on our side (timing), not the wallet's. NIP-47 is fundamentally request/reply; a wallet not built to juggle two concurrent requests over one connection can end up answering neither. nwcRequest is now serialized through a promise-chain mutex (_nwcRequestQueue) so every call — background refresh, manual balance checks, payments — runs one at a time in call order, never overlapping on the shared connection. To keep this queue from making a real payment wait behind a slow background nicety, nwcAutoRefreshOnLoad also now makes just ONE short attempt (new maxPasses param, 8s vs. the usual 16s + 2-pass retry) instead of potentially occupying the queue for up to ~35s. — v2.9.12 — 2026-08-17 — NWC: balance/budget now persists across sessions via a localStorage cache, so a hard refresh shows the last-known figures immediately instead of "Balance unknown" while waiting on (or if it fails to get) a fresh get_balance round-trip. Previously nwcBalanceSats was purely an in-memory variable, reset to null on every page load — nwcAutoRefreshOnLoad (v2.9.10) helped by kicking off a live check on startup, but that check can take several seconds or fail outright (per this file's extensive NWC-reliability history), and the panel had nothing to show in the meantime. Now _nwcApplyBalanceResult writes {sats, maxAmount, budgetRenewal, at} to localStorage (mts_nwc_last_balance) on every successful live check, and that cache is read back in synchronously at startup — before any UI renders — so the wallet-manage panel opens with real numbers right away. A new nwcBalanceIsLive flag tracks whether THIS session has actually confirmed the balance yet; until it has, the manage panel tags the figure "(last known)" so a stale cached number is never mistaken for a live-confirmed one. Cache is cleared on disconnect and on connecting a new/changed wallet (nwcSaveConnection), since a stale balance would otherwise belong to the wrong wallet. nwcAutoRefreshOnLoad also now re-renders an already-open wallet-manage panel (not just the compact balance labels) once the live check lands, since the budget line is baked into that panel's innerHTML and doesn't update from the live text-patch alone. — v2.9.11 — NWC: dropped the "Budget not reported by this wallet" fallback line entirely. The displayed sats figure is already the connection's spending budget (wallets like Alby/Zeus cap the reported "balance" to the remaining per-connection budget — see v2.9.9's note), so a separate "not reported" caveat next to it was just confusing noise, not new information. When nwcWallet.maxAmount isn't explicitly present, budgetLine now renders empty instead of a line implying something is missing. — v2.9.10 — NWC: budget/balance now auto-refreshes on page load for an already-connected wallet, instead of staying stuck at "Budget not reported" until a manual "Check Balance" click. On startup nwcWallet was only ever reconstituted by re-parsing the saved connection STRING (nwcParseUri) — the actual get_balance round-trip that populates nwcBalanceSats and nwcWallet.maxAmount/budgetRenewal (via _nwcApplyBalanceResult, added in v2.9.9) only ran from a manual balance check or from re-entering the connection string. So every fresh page load showed the wallet as connected but with a budget the wallet in fact reports — this app just hadn't asked yet. Added nwcAutoRefreshOnLoad(), fired non-blocking from init() alongside the existing restoreNSession() call, which runs one silent get_balance on startup and re-renders the wallet strip/settings/manage panes so the real figures appear without user action. — v2.9.9 — NWC: fixed "Budget not reported" showing next to a balance figure that WAS the budget. nwcWallet.maxAmount was only ever populated from the (non-standard, rarely-used) max_amount/budget query params on the connection URI. Several wallet-service implementations (e.g. Alby's NWC service, whose BalanceResponse carries max_amount/budget_renewal — and apparently Zeus's too) instead report the budget by including it directly in the get_balance RESPONSE, and cap the reported "balance" itself to the connection's remaining budget rather than the wallet's true balance — confirmed by a real case where a 507-sat wallet with a 500-sat connection budget reported "balance": 500000 msats. The panel was reading that 500 as "sats available" while separately declaring the budget "not reported," which is self-contradictory: that number effectively IS the budget. Added _nwcApplyBalanceResult() to also read max_amount/budget_renewal out of the get_balance result (msats, same as balance) in both nwcSaveConnection and nwcCheckBalance, and reworded the budget explainer text since "most wallets don't report it" is no longer accurate. — v2.9.8 — NWC: fixed excessive WebSocket churn against the wallet's own relay. — NWC: fixed excessive WebSocket churn against the wallet's own relay. A single "test connection" (nwcSaveConnection) was opening up to 5 independent raw WebSockets to the same relay within ~7s — one invisible kind:13194 info-probe socket (nwcAdvertisedSchemes -> _nwcFetchInfoEvent) to pick an encryption scheme, a fresh socket per scheme tried for get_info, and a fresh socket per pass/retry for get_balance — because _nwcAttemptOnRelay, _nwcFetchInfoEvent, and _nwcRelayControlCheck each always called `new WebSocket(relayUrl)` and tore the connection down again when done, even when the very next line of code was about to talk to the identical relay. Rapid repeat handshakes like that are a well-known trigger for transient connection resets, which presented as intermittent "Relay connection error" sitting right next to a successful reply from the SAME relay moments earlier — indistinguishable from relay flakiness unless you counted the sockets. Added a shared per-relay WebSocket pool (_nwcPoolAcquire/_nwcPoolRelease/_nwcPoolEntry/_nwcPoolRoute): the info probe, get_info, and get_balance now reuse one already-open socket per relay (kept warm for 15s after last use), with subscriptions/publishes multiplexed over it by sub-id/event-id and NIP-42 AUTH handled once per socket instead of once per request. This is the same class of fix already applied to the feed/notification relays in v2.9 (single-flight reconnects) — it just hadn't been applied to the NWC path yet. — v2.9.7 — NWC: fixed silent wrong-wallet testing + softened overconfident IP-throttling claims. (1) A password-manager-vulnerable connection-string field could have a freshly pasted string silently overridden by a saved credential, with zero indication anything was wrong — added a live "→ will test: relay(s) / lud16 / wallet suffix" preview as you type (before you even click Connect), autocomplete="new-password" to discourage autofill, and a "parsed connection: ..." line now stamped at the top of every debug log so a mismatch is undeniable after the fact too. (2) Re-applied the relay panel + a retry button to the entry/error view (was connected-view-only, so it was unreachable after a failed test) — the button is now explicitly labeled with the exact relay(s) it retries, so it can't be mistaken for testing whatever's currently pasted in the field above it. (3) Error hints no longer confidently assert relay.primal.net-specific IP throttling as the cause — now framed as "this relay/network path is unreliable for this connection right now," since the same failure pattern has now reproduced across a different wallet (Zeus) and relay (damus.io) on this connection. — v2.9.5 — NWC: user-selectable relays. Every NWC network call (request, info-event probe, control check) now routes through _nwcAllRelays(), the union of the connection string's own relay(s) with a new user-managed nwcExtraRelays list (persisted in mts_nwc_extra_relays). New relay panel in the wallet-manage pane: shows the wallet's own relay(s) read-only, lets you quick-add any of the app's current Nostr feed relays (RELAYS), or type a custom wss:// relay, with remove buttons for each extra. UI is explicit about the constraint: the wallet SERVICE only listens on relay(s) it was configured with, so an added relay only helps if the wallet happens to also listen there — it can't make a wallet that's only ever published to its own relay (e.g. Primal's custodial wallet) start answering somewhere new. — v2.9.4 — NWC liveness check now includes a control test: when the kind:13194 info-event presence probe is still inconclusive after 2 tries (relay not completing subscriptions), a new `_nwcRelayControlCheck()` fires a totally generic, wallet-unrelated subscription (REQ with just a limit, no filter) at the same relay. If that ALSO gets no EOSE, it conclusively proves the relay itself is failing to complete subscriptions for this connection right now — not the wallet. If the control succeeds, the miss is narrowed down to something specific to the wallet/connection instead. The error hint now branches on this control result instead of always giving the same "could be relay or wallet" hedge. — v2.9.3 — NWC wallet-liveness check hardened: the kind:13194 info-event presence probe (used to tell "wallet service is dead" apart from "wallet is alive but silent" on a "did not respond in time" failure) was a single 4s attempt against relay.primal.net, which under any load misses EOSE and falls back to a vague "inconclusive" hint that reads identically to "we didn't check." New `_nwcCheckWalletAlive()` retries once with a longer 8s window before giving up, and the debug log now shows exactly what each attempt found instead of silently swallowing the first miss. The "still inconclusive" hint text now says explicitly that the relay itself — not the wallet — is what's being unreliable. — v2.9.2 — NWC bugfix: v2.9.1 accidentally left TWO `openTimer = setTimeout(...)` assignments in _nwcAttemptOnRelay. Only the second (later) one was ever stored in `openTimer`, so ws.onopen's clearTimeout(openTimer) only cancelled that one — the FIRST timer (a 3-6s handshake guard) was orphaned and kept running even after the socket opened, the relay accepted the request, and the wallet was mid-reply. It fired regardless and force-failed the attempt with "Could not open relay connection (handshake timed out)", which is why retries kept dying right after "relay accepted request, waiting for wallet reply..." even on fresh IPs — it was never a relay/rate-limit issue. Removed the stray duplicate assignment; only one handshake-guard timer is created now. — v2.9.1: NWC diagnosis fix: stuck WebSocket handshakes (relay.primal.net IP rate-limit symptom) are now ACTUALLY reported as "Could not open relay connection" — v2.9's handshake guard tied with the request timer at budgets under 9s and lost the race, so every stuck handshake was mislabeled "Wallet did not respond in time" and triggered the misleading dead-connection probe. Socket-level failures also no longer spray the remaining encryption schemes at an unreachable relay (they break to the backoff pass instead), and the relay-unreachable hint now explains the rate-limit cause + remedy. — v2.9: (1) connect-error box no longer wiped 900ms after render (re-render now only fires when the wallet ACTUALLY answered), (2) kind:13194 presence probe now distinguishes "relay answered, no event" (=dead) from "relay unreachable" (=unknown) — an unreachable probe no longer cries "dead connection" on healthy strings, (3) stuck WebSocket handshakes (IP rate-limit symptom) now fail fast as a retryable socket error instead of burning the whole budget as a fake "wallet did not respond". Feed/notification relay fixes: single-flight reconnects (watchdog/CLOSED closes no longer double-spawn replacement sockets via onclose) + a feed-generation epoch so reconnectFeed()/removeRelay() teardowns can't leave ghost sockets reconnecting to removed relays — the churn that was getting the client IP rate-limited on relay.primal.net. Also: profile-fetch TDZ ReferenceError fixed (seen-but-pictureless profiles can backfill again). -->
+<!-- Monitor The Situation v2.9.22 — 2026-08-20 — News row spacing centered + hashrate sparkline recovery-visibility fix. (1) NEWS ROW SPACING: v2.9.21's margin-top:auto on .ni-time pinned the byline to the bottom of the fixed 102px row but left title+desc stacked flush at the top, so all the leftover vertical space landed in one lopsided gap between the description and the timestamp instead of reading as balanced spacing. .ni is now justify-content:center — the title+desc+time block is centered as a whole within the row, with .ni-time getting a small fixed margin-top (6px) instead of margin-top:auto, so the title→desc and desc→time gaps are even and consistent regardless of headline length. Row height (102px, unchanged) and the watchlist-alignment fix are both untouched. (2) HASHRATE SPARKLINE RECOVERY VISIBILITY: v2.9.21's tail-sync fix correctly kept the watchlist sparkline's underlying data in sync with the live reading, but the sparkline could still visually read as "cut off" during a fast recovery. Root cause: networkWeeklySpark is ~168 raw hourly points squeezed into an 88px canvas (well under 1px/point), and since mempool.space's hourly candles are trailing averages, a real recovery mostly only shows up as a jump in the single live-synced tail point — at that pixel density the jump rendered as a near-invisible sub-pixel sliver right at the canvas edge, with half its stroke hard-clipped by the canvas boundary itself (no horizontal layout padding existed, only top/bottom). Fixed two ways: added 2px left/right layout padding (matching the existing 3px top/bottom) so the tail point's full stroke renders on-canvas instead of getting edge-clipped, and the sp-NETWORK series is now run through lttbDownsample(…, 60) before drawing — matching how the fleet chart already handles this — so the same real jump renders across a visibly wider on-screen segment (verified against a simulated trough+recovery series: ~0.5px → ~1.5px for the same value delta) instead of being compressed into under a pixel. Y-axis bounds still come from the full-resolution raw series (boundsVals is unchanged), so the floor/ceiling accuracy from v2.9.20 is unaffected. — v2.9.21 — 2026-08-20 — Watchlist hashrate sparkline tail sync + news title/desc gap. (1) SPARKLINE STILL CUT OFF AT THE RECOVERY: v2.9.20 fixed the VERTICAL clipping (computeYBounds/excludeDropouts) but the watchlist sparkline's tail could still sit stuck at an old, lower value instead of the current live reading. Root cause: fetchNetworkWeeklySpark only APPENDED a live point when the last mempool.space candle was >1hr stale — but hourly candles are almost always <1hr old, so that check rarely fired, and the spark's rightmost point stayed pinned to the latest candle's average even after btcNetworkHashrate (the same number printed next to the chart) had already moved well above it during a recovery. loadHashrateChart's 1W tab already re-syncs its copy of this exact cached series against the live reading every time the modal opens (see its "Sync the chart's right edge" comment) — which is why the modal showed the recovery and the watchlist row didn't: the modal fixes it reactively at open-time, the raw cached data never did. fetchNetworkWeeklySpark now does the same sync-or-append (overwrite the last point in place if recent, append if genuinely stale) so networkWeeklySpark itself always has a live-synced tail, and the two can't disagree anymore. (2) NEWS TITLE→DESC GAP: .ni-title had an explicit height:37.7px sized for 2 lines, so a headline short enough to render as 1 line left ~19px of empty reserved space below the text before .ni-desc even started, on top of its own 4px margin — read as one big awkward gap. .ni is now a flex column; .ni-title/.ni-desc size to their actual (still line-clamped) content with a tight 2px margin between them, and .ni-time gets margin-top:auto to absorb the leftover slack at the bottom of the row instead — reads as normal footer spacing rather than a mid-card gap. .ni's own height:102px is untouched, so the row-height/watchlist-alignment fix from v2.9.20 is unaffected. — v2.9.20 — 2026-08-20 — BTC Network Hashrate chart cutoff fixed + news row alignment fixed properly + Streams emoji removed. (1) HASHRATE CHART CUTOFF: computeYBounds() (shared by the watchlist sparkline and the hashrate modal) excluded the bottom 5% of samples BY RANK from the y-axis floor calculation, meant to stop a locally-polled miner's zero-dropout blips from crushing the fleet chart into a sliver. Applied to BTC Network Hashrate too, this was a bug, not a safety net: mempool.space's network hashrate has no such sensor-dropout artifact — a "low" reading there is just normal variance — and a real multi-hour trough (like the one running from 8/18 into 8/19) easily spans more than 5% of a week's hourly samples, so genuine low points were being excluded from the floor. Confirmed against a real capture: the chart's own computed yMin landed at 800.5 EH/s while the period low was 782.11 EH/s — the trough was plotting below the visible axis and getting clipped off the bottom of both the modal chart and the watchlist sparkline (which share this function and this data). computeYBounds() now takes an excludeDropouts flag; BTC Network Hashrate charts pass false and use the period's true min/max (which can never clip, by construction, since the floor is always ≤ the true minimum), while Fleet Hashrate keeps the old percentile-exclusion behavior since it can genuinely dropout to 0 GH/s on a miner disconnect. (2) NEWS ROW ALIGNMENT: v2.9.17 claimed -webkit-line-clamp (2 lines title / 1 line description) gave every news row the same fixed height regardless of headline length, so 2 rows would exactly match 4 watchlist rows — but line-clamp only caps the MAXIMUM number of lines, it doesn't reserve a minimum, so a headline short enough to need only 1 line produced a shorter box than a 2-line headline (measured 79px vs 98px in a real render), and every row after the first short headline drifted out of alignment with the asset panel. Fixed by pinning .ni to a hard height:102px (box-sizing:border-box + overflow:hidden), mirroring a matching hard height:51px now pinned on .wli, plus explicit heights on .ni-title/.ni-desc so the space for a short headline is reserved even when line-clamp never needs to truncate anything. Verified pixel-exact with a headless-browser render: every news-row boundary now lands exactly on every second watchlist-row boundary (51, 102, 153, 204px...), for both long and short headlines. (3) Removed the 🔴 emoji from the Nostr "Streams" tab button per request — purely cosmetic, no functional change. — v2.9.19 — 2026-08-20 — Nostr live streams + fleet-hashrate wake resilience. (1) NOSTR STREAMS: new "🔴 Streams" tab next to Articles in the Nostr client. connectNStreams() subscribes to kind:30311 (NIP-53 live events) filtered to authors you follow with a '#status':['live'] tag filter, so only streams currently in progress show up — no client-side date math needed since these are replaceable events the host re-publishes as status moves planned→live→ended. Cards show the stream thumbnail, title, host, and live viewer count (current_participants tag); clicking one builds a proper naddr (via NostrTools' nip19.naddrEncode) and opens it on zap.stream — the de-facto NIP-53 web client — the same external-handoff pattern already used for njump.me elsewhere in this app, rather than building a bespoke in-app HLS player for a media format that varies by streaming platform. Falls back to the event's raw streaming URL, then to the host's njump.me profile, if naddr encoding isn't available. Not yet verified against a real live stream (nothing was live to test against this session) — the relay query and card rendering are solid, but if zap.stream's naddr link ever 404s on a real stream, that hand-off is the first place to check. (2) FLEET HASHRATE DIP-TO-ZERO: this was ALREADY substantially mitigated (MINER_OFFLINE_THRESHOLD gives 3 failed polls / ~90s grace before a miner is shown offline, so one blip doesn't zero the fleet total), but there was no proactive re-poll on wake — only refreshAll() (prices) fired on visibilitychange, not refreshMiningStats(). Local Wi-Fi/network can take a few seconds to reconnect after the Mac sleeps or the tab is backgrounded, and the miner poll landing in that gap had to wait up to 30s (the next regular interval tick) to retry. Now polls immediately on visibility + once more 5s later. This narrows the window but can't fully rule out sleep-related zeros if the local network takes longer than that to recover — worth watching the console for repeated [miner] failures right after wake if it's still happening. — v2.9.18 — 2026-08-20 — Overnight session badge added (Blue Ocean ATS, 8pm-4am ET Sun-Thu). getSessionBadge() was a two-state PRE/POST guess computed purely from wall-clock time, with the whole 4pm-to-next-9:30am span split only at midnight — so 1am-4am ET, which is still squarely inside Yahoo's real "Overnight" session (Blue Ocean ATS, confirmed live on Yahoo's own quote pages), was mislabeled "Pre-market" a full 3 hours before real pre-market (4am-9:30am, matching proxy.py's existing clock_pre window) actually starts. Added a genuine third 'OVERNIGHT' state for 8pm-4am ET Sunday evening through Thursday evening (Blue Ocean doesn't trade Fri 8pm-Sun 8pm, so that stretch still falls back to 'PRE' counting down to Sunday), with its own badge label and tooltip text. This is a client-side label/UX fix only — no change to how price data is fetched or displayed, so it doesn't touch the "always freshest price" guarantee. proxy.py: added a freshness diagnostic to the [POST-carry] debug print (the code path that serves prices during this window) — it now explicitly logs FRESH vs STALE based on how old Yahoo's own postMarketTime timestamp is, so checking the terminal during the 8pm-4am window will show definitively whether Yahoo's postMarketPrice field is actually carrying live Blue Ocean data (in which case the badge fix alone finishes the overnight-pricing feature) or frozen at the 8pm print (in which case a different Yahoo endpoint/field would be needed — genuinely can't be determined without a live check during that window, which is outside what I can run in this session). — v2.9.17 — 2026-08-20 — News panel condensed + portfolio sparkline consistency fix. (1) NEWS PANEL: removed the category tag from every article row and resized rows so one news row's height now exactly equals two watchlist rows (40px sparkline + 5px*2 padding + 1px border = 51px each = 102px per pair), top- and bottom-flush against the asset panel as requested. Headline is now clamped to 2 lines (headlines matter most and are often too long for one line) and the preview to 1 line (still a genuine preview, just shorter) — that fixed line budget is what makes every row the same height regardless of headline length, not just the first one. Also: articles with no description used to render a shorter row than ones with a description (the whole .ni-desc div was omitted), which broke the flush alignment for those specific rows — it now always renders (blank line if empty) so every row is the same height. (2) PORTFOLIO SPARKLINE: the sp-PORTFOLIO row chart never got the canvas-pixel-size pin (cv.width=88; cv.height=40) that v2.9.16 added to every other watchlist row — it was relying solely on the CSS width/height !important rule, which works but scales a blurrier 300×150-default canvas down instead of rendering crisply at the target size. Pinned for consistency with every other row. — v2.9.16 — 2026-08-20 — Two v2.9.15 items that were only half-shipped, now actually fixed. (1) MUTED NOTIFICATIONS: v2.9.15 added muting to the feed/articles/search pipelines but never wired it into notifications — the notification WebSocket handler pushed every incoming like/repost/zap/mention straight into nNotifs with no _nEvMuted() check, and renderNNotifs() didn't filter at render time either, so a muted account's activity kept showing up in the bell exactly as reported. Both are now filtered (ingest-time skip + a render-time sweep that also cleans out anything already sitting in localStorage from before the mute). (2) MISSING MUTED-ACCOUNTS PANEL: renderMutedList() (which paints Settings → Nostr → Muted Accounts) has looked for a #muted-list element since v2.9.15, but renderNS() — the function that builds the ENTIRE #nostr-settings-body innerHTML — never actually included a Muted Accounts section or that div in its template, connected or logged-out. So the manage-list code was correct but had nothing to mount into; the settings page was missing the panel entirely, as reported. Added the section + div to both renderNS() branches and renderNS() now calls renderMutedList() itself after (re)building the DOM. (3) WATCHLIST ROW CHART OVERFLOW: the small per-asset sparkline in the watchlist rows (_drawWLSparklines) never got the canvas-pixel-size pin that v2.9's hashrate sparklines use (_drawSimpleSpark: cv.width=88; cv.height=40) — an unset canvas falls back to Chart.js/HTML's default 300×150 backing size, and responsive:false renders at that size regardless of the row's CSS box, which is what let the chart overflow/clip the row. Same fix applied here. — v2.9.15 — 2026-08-19 — Nostr follower counts fixed + profile muting added. FOLLOWERS: four compounding causes for "the follower number is never right". (1) The in-browser Primal cache WebSocket — the most accurate source, same one primal.net itself uses — still connected to wss://cacheN.primal.net/v1; Primal moved that endpoint to /cache (the proxy had this fix, the browser code never got it), so the source silently failed every time. Now connects to /cache with a per-host /v1 fallback. (2) It also bet on ONE RANDOM cache host, so a single down host zeroed the source; now races all three and keeps the best answer. (3) The "higher count wins" updater re-parsed the ALREADY-FORMATTED display text — Number("12.5k".replace(/[^0-9]/g,'')) is 125, "1.2M" is 12 — so a partial relay scan (a strict lower bound, e.g. 2,000) happily overwrote an accurate indexer count (12,500). Displayed counts now carry their raw integer in dataset.n and can never regress; this ran in both the profile modal and the profile pane. (4) Counts are now cached in localStorage (mts_nstats_v1) and painted instantly on open, then refreshed; and when NO indexer (Primal/nostr.band) knows a profile and the number comes only from scanning kind:3 contact lists on relays, it renders as "≈N" with a lower-bound tooltip instead of posing as exact. proxy.py side: its Primal WS got the same /cache→/v1 fallback, and the NIP-45 COUNT result (relay.nostr.band's is capped at 500 — the client removed it in an earlier version for corrupting the highest-wins merge, the proxy never did) is now excluded from the merge and kept only as a diagnostic log line. MUTING: mute any profile from the profile modal (Mute button next to Follow), the 🔇 button on any feed post or repost, or the note view. Muted authors are dropped at ingest AND render for the timeline, reposts of them, hashtag feeds, notifications (badge counts recalculated), articles, and post-search results; people-search cards show a MUTED badge. Mutes persist in localStorage so they work logged-out, and when connected they merge with (union on login) and publish back to the account's standard NIP-51 kind:10000 mute list — existing encrypted/private entries and non-p tags preserved — so they sync to other clients. Unmuting re-fetches the timeline so their posts return. Manage the list in Settings → Nostr → Muted Accounts. — v2.9.14 — 2026-08-18 — Nostr images: fixed the "post has an image but it never renders" class for good. Root cause of the residual cases (after the v2.9.13 feed-signature fix, which live-browser repro confirmed working — zero post-node rebuilds under a busy event stream): an <img> whose request STALLS (upstream accepts and dribbles, or the request sits queued) never fires onerror, so the proxied→raw fallback never ran and the image sat at complete:false forever. Added _nImgWatchdog: any in/near-viewport feed or note-modal image pending >30s is force-swapped to its raw CDN URL (and logged to console if the raw URL stalls too — so the misbehaving host is finally visible in DevTools). Also removed crossorigin="anonymous" from every <img> (23 sites): nothing in the app draws remote images to canvas (all canvas use is Chart.js charts), so the attribute bought nothing and only created silent CORS-failure modes; referrerpolicy="no-referrer" is kept. Also made carousel container IDs deterministic (dropped Math.random from buildNContent) so rendered HTML is now a pure function of content+state and the feed signature can't see phantom changes. — v2.9.13 — 2026-08-17 — NWC: fixed a race where two NWC requests in flight at once could make a real payment go unanswered. nwcAutoRefreshOnLoad (v2.9.10) fires a background get_balance check on every page load, which — being a full nwcRequest call — can retry for a while if its first attempt hits a flaky connection. If the user opened the wallet and hit Pay while that background check was still retrying, BOTH requests targeted the same relay, and the shared per-relay socket pool (v2.9.8) multiplexes concurrent callers onto one WebSocket by design — so the wallet service received a pay_invoice and a get_balance request interleaved on the same connection. That matches this session's exact symptom: relay accepted the request (OK true), then silence until timeout, reproducing identically across two different wallets/relays — a strong sign the trigger was on our side (timing), not the wallet's. NIP-47 is fundamentally request/reply; a wallet not built to juggle two concurrent requests over one connection can end up answering neither. nwcRequest is now serialized through a promise-chain mutex (_nwcRequestQueue) so every call — background refresh, manual balance checks, payments — runs one at a time in call order, never overlapping on the shared connection. To keep this queue from making a real payment wait behind a slow background nicety, nwcAutoRefreshOnLoad also now makes just ONE short attempt (new maxPasses param, 8s vs. the usual 16s + 2-pass retry) instead of potentially occupying the queue for up to ~35s. — v2.9.12 — 2026-08-17 — NWC: balance/budget now persists across sessions via a localStorage cache, so a hard refresh shows the last-known figures immediately instead of "Balance unknown" while waiting on (or if it fails to get) a fresh get_balance round-trip. Previously nwcBalanceSats was purely an in-memory variable, reset to null on every page load — nwcAutoRefreshOnLoad (v2.9.10) helped by kicking off a live check on startup, but that check can take several seconds or fail outright (per this file's extensive NWC-reliability history), and the panel had nothing to show in the meantime. Now _nwcApplyBalanceResult writes {sats, maxAmount, budgetRenewal, at} to localStorage (mts_nwc_last_balance) on every successful live check, and that cache is read back in synchronously at startup — before any UI renders — so the wallet-manage panel opens with real numbers right away. A new nwcBalanceIsLive flag tracks whether THIS session has actually confirmed the balance yet; until it has, the manage panel tags the figure "(last known)" so a stale cached number is never mistaken for a live-confirmed one. Cache is cleared on disconnect and on connecting a new/changed wallet (nwcSaveConnection), since a stale balance would otherwise belong to the wrong wallet. nwcAutoRefreshOnLoad also now re-renders an already-open wallet-manage panel (not just the compact balance labels) once the live check lands, since the budget line is baked into that panel's innerHTML and doesn't update from the live text-patch alone. — v2.9.11 — NWC: dropped the "Budget not reported by this wallet" fallback line entirely. The displayed sats figure is already the connection's spending budget (wallets like Alby/Zeus cap the reported "balance" to the remaining per-connection budget — see v2.9.9's note), so a separate "not reported" caveat next to it was just confusing noise, not new information. When nwcWallet.maxAmount isn't explicitly present, budgetLine now renders empty instead of a line implying something is missing. — v2.9.10 — NWC: budget/balance now auto-refreshes on page load for an already-connected wallet, instead of staying stuck at "Budget not reported" until a manual "Check Balance" click. On startup nwcWallet was only ever reconstituted by re-parsing the saved connection STRING (nwcParseUri) — the actual get_balance round-trip that populates nwcBalanceSats and nwcWallet.maxAmount/budgetRenewal (via _nwcApplyBalanceResult, added in v2.9.9) only ran from a manual balance check or from re-entering the connection string. So every fresh page load showed the wallet as connected but with a budget the wallet in fact reports — this app just hadn't asked yet. Added nwcAutoRefreshOnLoad(), fired non-blocking from init() alongside the existing restoreNSession() call, which runs one silent get_balance on startup and re-renders the wallet strip/settings/manage panes so the real figures appear without user action. — v2.9.9 — NWC: fixed "Budget not reported" showing next to a balance figure that WAS the budget. nwcWallet.maxAmount was only ever populated from the (non-standard, rarely-used) max_amount/budget query params on the connection URI. Several wallet-service implementations (e.g. Alby's NWC service, whose BalanceResponse carries max_amount/budget_renewal — and apparently Zeus's too) instead report the budget by including it directly in the get_balance RESPONSE, and cap the reported "balance" itself to the connection's remaining budget rather than the wallet's true balance — confirmed by a real case where a 507-sat wallet with a 500-sat connection budget reported "balance": 500000 msats. The panel was reading that 500 as "sats available" while separately declaring the budget "not reported," which is self-contradictory: that number effectively IS the budget. Added _nwcApplyBalanceResult() to also read max_amount/budget_renewal out of the get_balance result (msats, same as balance) in both nwcSaveConnection and nwcCheckBalance, and reworded the budget explainer text since "most wallets don't report it" is no longer accurate. — v2.9.8 — NWC: fixed excessive WebSocket churn against the wallet's own relay. — NWC: fixed excessive WebSocket churn against the wallet's own relay. A single "test connection" (nwcSaveConnection) was opening up to 5 independent raw WebSockets to the same relay within ~7s — one invisible kind:13194 info-probe socket (nwcAdvertisedSchemes -> _nwcFetchInfoEvent) to pick an encryption scheme, a fresh socket per scheme tried for get_info, and a fresh socket per pass/retry for get_balance — because _nwcAttemptOnRelay, _nwcFetchInfoEvent, and _nwcRelayControlCheck each always called `new WebSocket(relayUrl)` and tore the connection down again when done, even when the very next line of code was about to talk to the identical relay. Rapid repeat handshakes like that are a well-known trigger for transient connection resets, which presented as intermittent "Relay connection error" sitting right next to a successful reply from the SAME relay moments earlier — indistinguishable from relay flakiness unless you counted the sockets. Added a shared per-relay WebSocket pool (_nwcPoolAcquire/_nwcPoolRelease/_nwcPoolEntry/_nwcPoolRoute): the info probe, get_info, and get_balance now reuse one already-open socket per relay (kept warm for 15s after last use), with subscriptions/publishes multiplexed over it by sub-id/event-id and NIP-42 AUTH handled once per socket instead of once per request. This is the same class of fix already applied to the feed/notification relays in v2.9 (single-flight reconnects) — it just hadn't been applied to the NWC path yet. — v2.9.7 — NWC: fixed silent wrong-wallet testing + softened overconfident IP-throttling claims. (1) A password-manager-vulnerable connection-string field could have a freshly pasted string silently overridden by a saved credential, with zero indication anything was wrong — added a live "→ will test: relay(s) / lud16 / wallet suffix" preview as you type (before you even click Connect), autocomplete="new-password" to discourage autofill, and a "parsed connection: ..." line now stamped at the top of every debug log so a mismatch is undeniable after the fact too. (2) Re-applied the relay panel + a retry button to the entry/error view (was connected-view-only, so it was unreachable after a failed test) — the button is now explicitly labeled with the exact relay(s) it retries, so it can't be mistaken for testing whatever's currently pasted in the field above it. (3) Error hints no longer confidently assert relay.primal.net-specific IP throttling as the cause — now framed as "this relay/network path is unreliable for this connection right now," since the same failure pattern has now reproduced across a different wallet (Zeus) and relay (damus.io) on this connection. — v2.9.5 — NWC: user-selectable relays. Every NWC network call (request, info-event probe, control check) now routes through _nwcAllRelays(), the union of the connection string's own relay(s) with a new user-managed nwcExtraRelays list (persisted in mts_nwc_extra_relays). New relay panel in the wallet-manage pane: shows the wallet's own relay(s) read-only, lets you quick-add any of the app's current Nostr feed relays (RELAYS), or type a custom wss:// relay, with remove buttons for each extra. UI is explicit about the constraint: the wallet SERVICE only listens on relay(s) it was configured with, so an added relay only helps if the wallet happens to also listen there — it can't make a wallet that's only ever published to its own relay (e.g. Primal's custodial wallet) start answering somewhere new. — v2.9.4 — NWC liveness check now includes a control test: when the kind:13194 info-event presence probe is still inconclusive after 2 tries (relay not completing subscriptions), a new `_nwcRelayControlCheck()` fires a totally generic, wallet-unrelated subscription (REQ with just a limit, no filter) at the same relay. If that ALSO gets no EOSE, it conclusively proves the relay itself is failing to complete subscriptions for this connection right now — not the wallet. If the control succeeds, the miss is narrowed down to something specific to the wallet/connection instead. The error hint now branches on this control result instead of always giving the same "could be relay or wallet" hedge. — v2.9.3 — NWC wallet-liveness check hardened: the kind:13194 info-event presence probe (used to tell "wallet service is dead" apart from "wallet is alive but silent" on a "did not respond in time" failure) was a single 4s attempt against relay.primal.net, which under any load misses EOSE and falls back to a vague "inconclusive" hint that reads identically to "we didn't check." New `_nwcCheckWalletAlive()` retries once with a longer 8s window before giving up, and the debug log now shows exactly what each attempt found instead of silently swallowing the first miss. The "still inconclusive" hint text now says explicitly that the relay itself — not the wallet — is what's being unreliable. — v2.9.2 — NWC bugfix: v2.9.1 accidentally left TWO `openTimer = setTimeout(...)` assignments in _nwcAttemptOnRelay. Only the second (later) one was ever stored in `openTimer`, so ws.onopen's clearTimeout(openTimer) only cancelled that one — the FIRST timer (a 3-6s handshake guard) was orphaned and kept running even after the socket opened, the relay accepted the request, and the wallet was mid-reply. It fired regardless and force-failed the attempt with "Could not open relay connection (handshake timed out)", which is why retries kept dying right after "relay accepted request, waiting for wallet reply..." even on fresh IPs — it was never a relay/rate-limit issue. Removed the stray duplicate assignment; only one handshake-guard timer is created now. — v2.9.1: NWC diagnosis fix: stuck WebSocket handshakes (relay.primal.net IP rate-limit symptom) are now ACTUALLY reported as "Could not open relay connection" — v2.9's handshake guard tied with the request timer at budgets under 9s and lost the race, so every stuck handshake was mislabeled "Wallet did not respond in time" and triggered the misleading dead-connection probe. Socket-level failures also no longer spray the remaining encryption schemes at an unreachable relay (they break to the backoff pass instead), and the relay-unreachable hint now explains the rate-limit cause + remedy. — v2.9: (1) connect-error box no longer wiped 900ms after render (re-render now only fires when the wallet ACTUALLY answered), (2) kind:13194 presence probe now distinguishes "relay answered, no event" (=dead) from "relay unreachable" (=unknown) — an unreachable probe no longer cries "dead connection" on healthy strings, (3) stuck WebSocket handshakes (IP rate-limit symptom) now fail fast as a retryable socket error instead of burning the whole budget as a fake "wallet did not respond". Feed/notification relay fixes: single-flight reconnects (watchdog/CLOSED closes no longer double-spawn replacement sockets via onclose) + a feed-generation epoch so reconnectFeed()/removeRelay() teardowns can't leave ghost sockets reconnecting to removed relays — the churn that was getting the client IP rate-limited on relay.primal.net. Also: profile-fetch TDZ ReferenceError fixed (seen-but-pictureless profiles can backfill again). -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -250,7 +250,7 @@ a{color:inherit;text-decoration:none;}
 .lp-desc{font-size:10px;color:var(--t2);margin-top:2px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;}
 /* Video embeds */
 .nv-video{max-width:100%;border-radius:6px;margin-top:8px;max-height:240px;}
-.wli{display:grid;grid-template-columns:1fr 90px 92px 70px;align-items:center;padding:5px 14px;border-bottom:1px solid var(--border);cursor:pointer;transition:background .12s;gap:6px;}
+.wli{display:grid;grid-template-columns:1fr 90px 92px 70px;align-items:center;padding:5px 14px;border-bottom:1px solid var(--border);cursor:pointer;transition:background .12s;gap:6px;height:51px;box-sizing:border-box;}
 .wli:hover{background:var(--bg-2);}
 .wli:last-child{border-bottom:none;}
 .wli-name{font-size:12px;font-weight:500;color:var(--t0);}
@@ -260,7 +260,7 @@ a{color:inherit;text-decoration:none;}
 .wli-chg.pos{color:var(--green);background:var(--gd);}
 .wli-chg.neg{color:var(--red);background:var(--rd);}
 .wli-chg.neu{color:var(--t2);background:var(--bg-3);}
-.wli-spark{height:40px;}
+.wli-spark{height:40px;overflow:hidden;} /* belt-and-suspenders: nothing should ever visually bleed into the row below */
 .wli-spark canvas{width:88px!important;height:40px!important;}
 /* special rows */
 .wli.portfolio-row .wli-name{color:var(--gold);}
@@ -269,19 +269,43 @@ a{color:inherit;text-decoration:none;}
 
 /* ── NEWS ── */
 #news-body{overflow-y:auto;flex:1;}
-.ni{padding:12px 14px;border-bottom:1px solid var(--border);cursor:pointer;transition:background .12s;text-decoration:none;display:block;color:inherit;}
+/* News rows: exactly two watchlist rows (.wli is pinned to a hard 51px via
+   height+box-sizing:border-box above) equal one news row's height, top- and
+   bottom-flush with the asset panel (v2.9.20). v2.9.17 tried to hit this via
+   -webkit-line-clamp alone (2 lines for the title, 1 for the description)
+   and a comment claiming that "fixed line budget...makes every row the same
+   height regardless of headline length" — but line-clamp only caps the
+   MAXIMUM lines rendered, it doesn't reserve a minimum: a headline short
+   enough to fit on one line produced a one-line-tall box, not a two-line
+   one, so short-headline rows rendered ~20px shorter than long-headline
+   ones (measured 79px vs 98px) and every row after the first short headline
+   drifted out of alignment with the asset panel. Fixed properly this time:
+   .ni itself is pinned to a hard 102px (= 51px * 2) via height+box-sizing:
+   border-box+overflow:hidden, exactly mirroring how .wli is pinned, and
+   .ni-title/.ni-desc each get an explicit height (2 and 1 lines' worth) so
+   the space for a short headline is still reserved even when line-clamp
+   never has to truncate it — that's what keeps every row's total height
+   fixed regardless of content, not merely capped. */
+.ni{padding:10px 14px;border-bottom:1px solid var(--border);cursor:pointer;transition:background .12s;text-decoration:none;display:flex;flex-direction:column;justify-content:center;color:inherit;box-sizing:border-box;height:102px;overflow:hidden;}
 .ni:hover{background:var(--bg-2);}
 .ni:hover .ni-title{color:var(--accent);}
-.ni-tag{display:inline-block;font-family:var(--fm);font-size:9px;font-weight:600;letter-spacing:.1em;padding:1px 6px;border-radius:2px;margin-bottom:5px;text-transform:uppercase;}
-.ni-tag.market{color:var(--green);background:var(--gd);}
-.ni-tag.geo{color:var(--orange);background:var(--od);}
-.ni-tag.us{color:var(--blue);background:var(--bd);}
-.ni-tag.world{color:var(--purple);background:var(--pd);}
-.ni-tag.sports{color:var(--pink);background:var(--pkd);}
-.ni-tag.general{color:var(--t2);background:var(--bg-3);}
-.ni-title{font-size:13px;font-weight:500;color:var(--t0);line-height:1.45;margin-bottom:4px;transition:color .12s;}
-.ni-desc{font-size:11px;color:var(--t2);line-height:1.5;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;}
-.ni-time{font-family:var(--fm);font-size:10px;color:var(--t3);margin-top:4px;}
+/* v2.9.22: margin-top:auto on .ni-time (previous fix) pinned the byline to
+   the very bottom of the fixed 102px row and left title+desc stacked flush
+   at the top — technically no "reserved dead space" anymore, but ALL the
+   slack still landed in one place (between .ni-desc and .ni-time), which
+   read as a big lopsided gap for any headline under 2 full lines. .ni is
+   now justify-content:center: the title+desc+time block sizes to its real
+   content and is centered as a group within the fixed 102px row, so the
+   leftover space splits evenly above and below instead of piling up in one
+   spot, and .ni-time gets a small fixed margin (matching .ni-title's own
+   margin-bottom) instead of margin-top:auto so the title→desc and
+   desc→time gaps are the same tight, consistent size regardless of
+   headline length. .ni's own height:102px (unchanged, box-sizing:border-box)
+   still pins the row's total height — row-to-watchlist alignment is
+   untouched. */
+.ni-title{font-size:13px;font-weight:500;color:var(--t0);line-height:1.45;margin-bottom:2px;transition:color .12s;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;}
+.ni-desc{font-size:11px;color:var(--t2);line-height:1.5;display:-webkit-box;-webkit-line-clamp:1;-webkit-box-orient:vertical;overflow:hidden;}
+.ni-time{font-family:var(--fm);font-size:10px;color:var(--t3);margin-top:6px;flex-shrink:0;}
 
 .nload{padding:32px;text-align:center;color:var(--t2);font-family:var(--fm);font-size:12px;}
 
@@ -660,12 +684,9 @@ a{color:inherit;text-decoration:none;}
 <!-- ═══ SEARCH MODAL ═══ -->
 <div class="mo" id="search-modal">
   <div class="md" style="width:680px;max-height:88vh;">
-    <div class="md-hdr">
-      <div>
-        <div class="md-title">Search</div>
-        <div class="md-sub" id="srch-sub">Assets &amp; Nostr</div>
-      </div>
-      <button class="md-close" onclick="closeSearch()">✕</button>
+    <div class="md-hdr" style="position:relative;">
+      <div class="md-title" style="position:absolute;left:0;right:0;text-align:center;pointer-events:none;">Search</div>
+      <button class="md-close" onclick="closeSearch()" style="margin-left:auto;position:relative;">✕</button>
     </div>
     <div class="md-body" style="padding-top:14px;">
       <!-- Tabs -->
@@ -704,16 +725,16 @@ a{color:inherit;text-decoration:none;}
           <!-- Clean add bar -->
           <div style="background:var(--bg-3);border:1px solid var(--border);border-radius:8px;padding:12px 14px;">
             <div style="font-family:var(--fm);font-size:9px;font-weight:600;letter-spacing:.12em;color:var(--t3);text-transform:uppercase;margin-bottom:10px;">Add to Dashboard</div>
-            <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
-              <div style="display:flex;align-items:center;gap:6px;flex:1;min-width:200px;">
-                <span style="font-family:var(--fm);font-size:10px;color:var(--t2);white-space:nowrap;">Ticker label:</span>
-                <input class="fin" id="srch-add-label" style="width:90px;font-family:var(--fm);font-size:11px;text-transform:uppercase;" placeholder="e.g. AAPL">
-                <button class="btn-p" onclick="addSrchToTicker()" style="font-size:11px;white-space:nowrap;">+ Ticker Bar</button>
+            <div style="display:flex;flex-direction:column;gap:10px;">
+              <div style="display:flex;align-items:center;gap:8px;">
+                <span style="font-family:var(--fm);font-size:10px;color:var(--t2);white-space:nowrap;width:78px;flex-shrink:0;">Ticker label:</span>
+                <input class="fin" id="srch-add-label" style="width:90px;flex-shrink:0;font-family:var(--fm);font-size:11px;text-transform:uppercase;" placeholder="e.g. AAPL">
+                <button class="btn-p" onclick="addSrchToTicker()" style="font-size:11px;white-space:nowrap;margin-left:auto;">+ Ticker Bar</button>
               </div>
-              <div style="display:flex;align-items:center;gap:6px;flex:1;min-width:260px;">
-                <span style="font-family:var(--fm);font-size:10px;color:var(--t2);white-space:nowrap;">Watchlist:</span>
-                <input class="fin" id="srch-add-wl-name" style="flex:1;font-family:var(--fm);font-size:11px;" placeholder="Display name">
-                <select class="fin" id="srch-add-wl-cat" style="font-family:var(--fm);font-size:11px;padding:5px 8px;background:var(--bg-4);color:var(--t1);border:1px solid var(--border-l);border-radius:4px;cursor:pointer;width:90px;">
+              <div style="display:flex;align-items:center;gap:8px;">
+                <span style="font-family:var(--fm);font-size:10px;color:var(--t2);white-space:nowrap;width:78px;flex-shrink:0;">Watchlist:</span>
+                <input class="fin" id="srch-add-wl-name" style="flex:1;min-width:0;font-family:var(--fm);font-size:11px;" placeholder="Display name">
+                <select class="fin" id="srch-add-wl-cat" style="font-family:var(--fm);font-size:11px;padding:5px 8px;background:var(--bg-4);color:var(--t1);border:1px solid var(--border-l);border-radius:4px;cursor:pointer;width:90px;flex-shrink:0;">
                   <option value="stock">Stock</option>
                   <option value="crypto">Crypto</option>
                   <option value="etf">ETF</option>
@@ -1131,6 +1152,14 @@ let portfolio = JSON.parse(localStorage.getItem('mts_port')||'[]');
 // Miners: [{ip, name}] — synced with proxy's miners.json
 let miners = [];
 let minerStats = {}; // {ip: {hashRate, bestDiff, bestSessionDiff, online}}
+// Consecutive-failure counter per miner IP, used to debounce transient
+// fetch blips (brief Wi-Fi hiccup, proxy hiccup, the box waking from sleep
+// mid-poll) so a single missed poll doesn't record a fake 0 H/s sample and
+// crater the fleet chart. A miner is only marked truly offline (0 H/s) once
+// it's failed MINER_OFFLINE_THRESHOLD polls in a row — until then we keep
+// showing its last known-good reading.
+let minerFailCounts = {};
+const MINER_OFFLINE_THRESHOLD = 3; // ~90s of sustained failure at the 30s poll interval
 
 async function loadMinersFromServer() {
   try {
@@ -1250,6 +1279,19 @@ let fleetHashratePrev = null; // for fleet % change
 // modal's longer timeframes) since mempool.space already gives us a clean
 // pre-aggregated week of points without waiting for local history to fill in.
 let networkWeeklySpark = [];
+// Ticker/watchlist "% change" badge for BTC NETWORK must use the SAME
+// period as the hashrate modal's default view (1W) — clicking the badge
+// opens that chart. It used to be computed from btcNetworkHashratePrev
+// (a 24h-ago baseline) while the modal's "Period Change" stat compared
+// against the start of the 1-week window, so the two numbers measured
+// different time spans and disagreed (e.g. +0.54% vs -0.18%) even though
+// neither calculation was individually wrong. Deriving both from the same
+// networkWeeklySpark series guarantees they always agree.
+function getNetworkWeeklyPct() {
+  if (btcNetworkHashrate == null || !networkWeeklySpark.length) return null;
+  const base = networkWeeklySpark[0]?.v;
+  return base ? (btcNetworkHashrate - base) / base * 100 : null;
+}
 // Fleet + Network hashrate history: load from localStorage on startup for persistence
 // We store downsampled history (max 1 point per 10min) to keep storage small
 const FLEET_HR_STORE_KEY = 'mts_fleet_hr_history';
@@ -1492,25 +1534,42 @@ function isNyseTradingDay(etDate) {
   if (dow === 0 || dow === 6) return false;
   return !_nyseHolidaysForYear(etDate.getUTCFullYear()).has(_ymdKey(etDate));
 }
-// Returns 'PRE', 'POST', or null (regular/live session — no badge).
+// Returns 'PRE', 'POST', 'OVERNIGHT', or null (regular/live session — no badge).
+//
+// OVERNIGHT (added — was previously just lumped into POST/PRE by wall-clock
+// alone): Yahoo's site now shows a genuine third session here, powered by
+// Blue Ocean ATS, running 8:00pm–4:00am ET, Sunday evening through Thursday
+// evening (i.e. NOT Friday 8pm–Sunday 8pm — Blue Ocean doesn't trade then).
+// Before this, the old two-state logic called the entire 4pm-to-next-9:30am
+// span either 'POST' (until midnight) or 'PRE' (from midnight on) — so the
+// 1:00am–4:00am stretch, which is still squarely inside Blue Ocean's window,
+// was mislabeled "Pre-market" a full 3 hours before pre-market actually
+// starts. Real NYSE pre-market is 4:00am–9:30am; that boundary is unchanged
+// below and matches proxy.py's own clock_pre window (240–570 min).
 function getSessionBadge() {
   const et = _nowET();
+  const dow = et.getUTCDay();               // 0=Sun..6=Sat (ET wall-clock, see _nowET)
   const hm = et.getUTCHours() * 60 + et.getUTCMinutes();
   const todayTrades = isNyseTradingDay(et);
-  if (hm >= 570 && hm < 960) return todayTrades ? null : 'PRE';   // 9:30am–4:00pm ET
-  if (hm >= 960) return todayTrades ? 'POST' : 'PRE';              // 4:00pm–midnight ET
-  if (hm < 60) {                                                    // midnight–1:00am ET
-    const yesterdayEt = new Date(et.getTime() - 86400000);
-    return isNyseTradingDay(yesterdayEt) ? 'POST' : 'PRE';
+  if (hm >= 570 && hm < 960) return todayTrades ? null : 'PRE';    // 9:30am–4:00pm ET
+  if (hm >= 960 && hm < 1200) return todayTrades ? 'POST' : 'PRE'; // 4:00pm–8:00pm ET
+  if (hm >= 1200) {                                                 // 8:00pm–midnight ET
+    return (dow >= 0 && dow <= 4) ? 'OVERNIGHT' : 'PRE';            // Sun–Thu eve = Blue Ocean; Fri/Sat eve = dead until Sunday
   }
-  return 'PRE';                                                     // 1:00am–9:30am ET
+  if (hm < 240) {                                                   // midnight–4:00am ET
+    const prevDow = (dow + 6) % 7;                                  // the evening this continues from
+    return (prevDow >= 0 && prevDow <= 4) ? 'OVERNIGHT' : 'PRE';
+  }
+  return 'PRE';                                                     // 4:00am–9:30am ET
 }
 function sessionBadgeTitle(state, hasExtendedData, asOfSec) {
-  const label = state === 'PRE' ? 'Pre-market' : state === 'POST' ? 'After-hours' : '';
+  const label = state === 'PRE' ? 'Pre-market' : state === 'POST' ? 'After-hours' : state === 'OVERNIGHT' ? 'Overnight' : '';
   if (!label) return '';
   if (!hasExtendedData) {
     return state === 'PRE'
       ? 'Pre-market — showing last available close, no live extended-hours quote yet'
+      : state === 'OVERNIGHT'
+      ? 'Overnight — showing the after-hours close, no live Blue Ocean overnight quote available yet'
       : 'After-hours — showing the regular-session close';
   }
   // BUG FIX: this used to always say "live extended-hours price" whenever we
@@ -1902,10 +1961,24 @@ async function fetchNetworkWeeklySpark() {
         if (rLive.ok) { const dLive = await rLive.json(); if (dLive?.hashrate > 0) liveVal = dLive.hashrate / 1e18; }
       }
       if (!liveVal && d.currentHashrate) liveVal = d.currentHashrate / 1e18;
-      const lastCandleTs = pts[pts.length - 1]?.t || 0;
-      const nowTs = Date.now();
-      if (liveVal && nowTs - lastCandleTs > 3600000) {
-        pts.push({t: nowTs, v: liveVal});
+      // Always sync the tail to the live canonical reading, not just append
+      // when the last candle is >1hr stale. mempool.space's hourly candles
+      // are usually LESS than an hour old, so that old "append if stale"
+      // check almost never fired — the spark's rightmost point stayed
+      // pinned to the latest hourly-candle AVERAGE even when the live
+      // reading (this same btcNetworkHashrate — what the watchlist row's
+      // text prints) had already moved well above or below it. That's what
+      // let the watchlist sparkline's tail sit at the old (e.g. trough)
+      // value and look "cut off" right where the true chart recovers, while
+      // the hashrate modal's 1W tab — which re-syncs its copy of this same
+      // cached series against the live reading every time it's opened, see
+      // loadHashrateChart — already showed the recovery. Now matches that
+      // same sync-or-append behavior here, so the two can't disagree.
+      if (liveVal) {
+        const lastCandleTs = pts[pts.length - 1]?.t || 0;
+        const nowTs = Date.now();
+        if (nowTs - lastCandleTs > 3600000) pts.push({t: nowTs, v: liveVal});
+        else pts[pts.length - 1] = {t: lastCandleTs, v: liveVal};
       }
     } catch {}
     networkWeeklySpark = pts;
@@ -1943,6 +2016,7 @@ async function fetchMinerStats(miner) {
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const d = await r.json();
     const hashRate = d.hashRate || d.hashrate || d.hash_rate || 0;
+    minerFailCounts[miner.ip] = 0;
     minerStats[miner.ip] = {
       online: true,
       hashRate,
@@ -1951,7 +2025,18 @@ async function fetchMinerStats(miner) {
       name: miner.name,
     };
   } catch {
-    minerStats[miner.ip] = { online: false, hashRate: 0, bestDiff: 'N/A', bestSessionDiff: 'N/A', name: miner.name };
+    const fails = (minerFailCounts[miner.ip] || 0) + 1;
+    minerFailCounts[miner.ip] = fails;
+    const prev = minerStats[miner.ip];
+    if (prev?.online && fails < MINER_OFFLINE_THRESHOLD) {
+      // Transient blip — keep showing the last known-good reading instead of
+      // zeroing it out. A miner that's actually online shouldn't disappear
+      // from the fleet total because of one missed poll (sleep/wake, a Wi-Fi
+      // stall, the proxy being momentarily busy, etc).
+      minerStats[miner.ip] = { ...prev, stale: true };
+    } else {
+      minerStats[miner.ip] = { online: false, hashRate: 0, bestDiff: 'N/A', bestSessionDiff: 'N/A', name: miner.name };
+    }
   }
 }
 
@@ -1990,7 +2075,13 @@ async function refreshMiningStats() {
       const diff = Math.abs(pt.t - target24h);
       if (diff < closestDiff) { closest = pt; closestDiff = diff; }
     }
-    fleetHashratePrev = closest.v;
+    // Only trust this as "the 24h-ago value" if it's reasonably close to the
+    // actual 24h mark (within 2h) — otherwise (e.g. history doesn't go back
+    // that far yet) we'd silently compare against some arbitrary older point
+    // and mislabel it as a 24h change. null means "no comparison available"
+    // and is distinct from a legitimately-recorded 0 H/s sample.
+    const TWO_HOURS = 2 * 3600000;
+    fleetHashratePrev = closestDiff <= TWO_HOURS ? closest.v : null;
   }
   renderTicker();
   renderWL();
@@ -2095,7 +2186,7 @@ function renderTicker() {
 
   // 3. BTC Network Hashrate
   if (btcNetworkHashrate !== null) {
-    const pct = btcNetworkHashratePrev ? (btcNetworkHashrate - btcNetworkHashratePrev) / btcNetworkHashratePrev * 100 : null;
+    const pct = getNetworkWeeklyPct();
     const cls = pct === null ? 'neu' : pct > 0 ? 'pos' : pct < 0 ? 'neg' : 'neu';
     const chgHtml = pct !== null ? `<span class="chg ${cls}">${pct>=0?'+':''}${pct.toFixed(2)}%</span>` : '';
     items.push(`<div class="ti hashrate-ti" onclick="openHashrateChart('network')">
@@ -2107,7 +2198,7 @@ function renderTicker() {
 
   // 4. Mining fleet stats
   if (miners.length > 0) {
-    const fleetPct = fleetHashratePrev && fleet.totalHashRate ? (fleet.totalHashRate - fleetHashratePrev) / fleetHashratePrev * 100 : null;
+    const fleetPct = fleetHashratePrev != null && fleetHashratePrev > 0 && fleet.totalHashRate ? (fleet.totalHashRate - fleetHashratePrev) / fleetHashratePrev * 100 : null;
     const fCls = fleetPct === null ? 'neu' : fleetPct > 0 ? 'pos' : fleetPct < 0 ? 'neg' : 'neu';
     const fChg = fleetPct !== null ? `<span class="chg ${fCls}">${fleetPct>=0?'+':''}${fleetPct.toFixed(2)}%</span>` : '';
     items.push(`<div class="ti mining-ti" onclick="openHashrateChart('fleet')">
@@ -2185,13 +2276,13 @@ function renderWL() {
       if (symEl) symEl.nextElementSibling?.remove();
     });
     if (btcNetworkHashrate!==null){
-      const pct=btcNetworkHashratePrev?(btcNetworkHashrate-btcNetworkHashratePrev)/btcNetworkHashratePrev*100:null;
+      const pct=getNetworkWeeklyPct();
       const row=body.querySelector('[data-wlkey="NETWORK"]');
       if(row){row.querySelector('.wli-prc').textContent=btcNetworkHashrate.toFixed(2)+' EH/s';const chEl=row.querySelector('.wli-chg');if(pct!=null){chEl.textContent=(pct>=0?'+':'')+pct.toFixed(2)+'%';chEl.className='wli-chg '+(pct>0?'pos':pct<0?'neg':'neu');}}
     }
     if (miners.length>0){
       const row=body.querySelector('[data-wlkey="MINING-fleet"]');
-      if(row){const fp2=getFleetStats();const fPct=fleetHashratePrev&&fp2.totalHashRate?(fp2.totalHashRate-fleetHashratePrev)/fleetHashratePrev*100:null;row.querySelector('.wli-prc').textContent=fmtHashrate(fp2.totalHashRate);const chEl=row.querySelector('.wli-chg');if(fPct!=null){chEl.textContent=(fPct>=0?'+':'')+fPct.toFixed(2)+'%';chEl.className='wli-chg '+(fPct>0?'pos':fPct<0?'neg':'neu');}}
+      if(row){const fp2=getFleetStats();const fPct=fleetHashratePrev!=null&&fleetHashratePrev>0&&fp2.totalHashRate?(fp2.totalHashRate-fleetHashratePrev)/fleetHashratePrev*100:null;row.querySelector('.wli-prc').textContent=fmtHashrate(fp2.totalHashRate);const chEl=row.querySelector('.wli-chg');if(fPct!=null){chEl.textContent=(fPct>=0?'+':'')+fPct.toFixed(2)+'%';chEl.className='wli-chg '+(fPct>0?'pos':fPct<0?'neg':'neu');}}
       const bRow=body.querySelector('[data-wlkey="MINING-best"]');
       if(bRow) bRow.querySelector('.wli-prc').textContent=fleet.sessionBest;
       const aRow=body.querySelector('[data-wlkey="MINING-alltime"]');
@@ -2240,7 +2331,7 @@ function renderWL() {
   });
 
   if (btcNetworkHashrate !== null) {
-    const pct = btcNetworkHashratePrev ? (btcNetworkHashrate - btcNetworkHashratePrev) / btcNetworkHashratePrev * 100 : null;
+    const pct = getNetworkWeeklyPct();
     const cls = pct === null ? 'neu' : pct > 0 ? 'pos' : pct < 0 ? 'neg' : 'neu';
     const chg = pct !== null ? `${pct>=0?'+':''}${pct.toFixed(2)}%` : '—';
     keyToHTML['NETWORK'] = `<div class="wli hashrate-row" data-wlkey="NETWORK" onclick="openHashrateChart('network')">
@@ -2252,7 +2343,7 @@ function renderWL() {
   }
 
   if (miners.length > 0) {
-    const fleetPct = fleetHashratePrev && fleet.totalHashRate ? (fleet.totalHashRate - fleetHashratePrev) / fleetHashratePrev * 100 : null;
+    const fleetPct = fleetHashratePrev != null && fleetHashratePrev > 0 && fleet.totalHashRate ? (fleet.totalHashRate - fleetHashratePrev) / fleetHashratePrev * 100 : null;
     const fCls = fleetPct === null ? 'neu' : fleetPct > 0 ? 'pos' : fleetPct < 0 ? 'neg' : 'neu';
     const fChg = fleetPct !== null ? `${fleetPct>=0?'+':''}${fleetPct.toFixed(2)}%` : '—';
     keyToHTML['MINING-fleet'] = `<div class="wli mining-row" data-wlkey="MINING-fleet" onclick="openHashrateChart('fleet')">
@@ -2321,21 +2412,41 @@ function renderWL() {
 // of the line into a flat sliver. boundsVals should be the full-resolution
 // values (before downsampling) so the bounds calc sees the real dropout
 // rate — pass the downsampled pts twice if there's nothing else to use.
-function _drawSimpleSpark(cid, pts, boundsVals) {
+function _drawSimpleSpark(cid, pts, boundsVals, excludeDropouts = true) {
   const cv = document.getElementById(cid);
   if (!cv || !pts?.length) return;
   const color = '#ff9f43';
   const sparkData = pts.map(p=>p.v);
   const sparkLabels = pts.map(p=>p.t);
-  const { min: yMin, max: yMax } = computeYBounds(boundsVals || sparkData);
+  const { min: yMin, max: yMax } = computeYBounds(boundsVals || sparkData, excludeDropouts);
   if (!sparks[cid]) {
+    // Pin the canvas's actual pixel size up front instead of relying solely
+    // on the CSS !important rule to constrain it — belt-and-suspenders so
+    // the chart never has room to paint outside the row before/regardless
+    // of CSS being applied.
+    cv.width = 88; cv.height = 40;
     const ctx = cv.getContext('2d');
     const g = ctx.createLinearGradient(0,0,0,40);
     g.addColorStop(0, 'rgba(255,159,67,.3)'); g.addColorStop(1,'rgba(0,0,0,0)');
     sparks[cid] = new Chart(cv, {
       type:'line',
       data:{labels:sparkLabels,datasets:[{data:sparkData,borderColor:color,borderWidth:1.5,fill:true,backgroundColor:g,pointRadius:0,tension:.2}]},
-      options:{animation:false,responsive:false,plugins:{legend:{display:false},tooltip:{enabled:false}},scales:{x:{display:false},y:{display:false,min:yMin,max:yMax}}}
+      options:{animation:false,responsive:false,plugins:{legend:{display:false},tooltip:{enabled:false}},
+        // A couple px of internal margin so a dropout point sitting right at
+        // (or below) the computed floor still renders with a hair of
+        // clearance instead of looking clipped flush against the row edge —
+        // full data range still fills essentially the whole 40px height.
+        // left/right (v2.9.22): with no horizontal padding, the first/last
+        // data point sits exactly at x=0/x=88 — the very edge of the canvas
+        // — so half of that point's own 1.5px stroke width falls outside
+        // the canvas and gets hard-clipped by the canvas boundary itself
+        // (not overflow:hidden, just normal canvas edge behavior). For
+        // sp-NETWORK specifically this made a genuine end-of-series
+        // recovery look like it was being chopped off rather than merely
+        // under-emphasized. A couple px of side margin keeps the full tail
+        // point on-canvas.
+        layout:{padding:{top:3,bottom:3,left:2,right:2}},
+        scales:{x:{display:false},y:{display:false,min:yMin,max:yMax}}}
     });
   } else {
     const ds = sparks[cid].data.datasets[0];
@@ -2363,6 +2474,12 @@ function _drawWLSparklines(port) {
     const needsRebuild = !sparks[cid] || existingColor !== color;
     if (needsRebuild) {
       if (sparks[cid]) { try { sparks[cid].destroy(); } catch {} }
+      // Pin the canvas's actual pixel size up front (same fix as _drawSimpleSpark) —
+      // without this, an un-set canvas falls back to its default 300x150 backing
+      // size and Chart.js's `responsive:false` renders at that size regardless of
+      // the row's CSS box, which is what let the small row chart overflow/clip
+      // (v2.9.16).
+      cv.width = 88; cv.height = 40;
       const ctx = cv.getContext('2d');
       const g = ctx.createLinearGradient(0,0,0,40);
       g.addColorStop(0, ip?'rgba(0,212,160,.3)':'rgba(255,77,106,.3)');
@@ -2370,7 +2487,12 @@ function _drawWLSparklines(port) {
       sparks[cid] = new Chart(cv, {
         type:'line',
         data:{labels:sparkLabels,datasets:[{data:sparkData,borderColor:color,borderWidth:1.5,fill:true,backgroundColor:g,pointRadius:0,tension:.3}]},
-        options:{animation:false,responsive:false,plugins:{legend:{display:false},tooltip:{enabled:false}},scales:{x:{display:false},y:{display:false}}}
+        options:{animation:false,responsive:false,plugins:{legend:{display:false},tooltip:{enabled:false}},
+          // left/right padding: same edge-clip fix as _drawSimpleSpark (v2.9.22)
+          // — without it the newest point sits exactly at the canvas's right
+          // edge and half its stroke is hard-clipped by the canvas boundary.
+          layout:{padding:{top:3,bottom:3,left:2,right:2}},
+          scales:{x:{display:false},y:{display:false}}}
       });
     } else {
       // Same color — update data in place
@@ -2383,7 +2505,27 @@ function _drawWLSparklines(port) {
 
   // Draw BTC network hashrate sparkline (weekly, from mempool.space) — bounds
   // computed from the same full-resolution series since it's already small.
-  _drawSimpleSpark('sp-NETWORK', networkWeeklySpark, networkWeeklySpark.map(p=>p.v));
+  // excludeDropouts=false: mempool.space's network hashrate doesn't have
+  // literal sensor dropouts the way a locally-polled miner does, so a real
+  // low point shouldn't be excluded from the axis floor (v2.9.20 — see the
+  // computeYBounds comment for the full "chart cut off at the bottom" story).
+  // pts arg is now lightly downsampled (v2.9.22), matching how sp-MINING_fleet
+  // already handles this below: networkWeeklySpark is ~168 raw hourly points
+  // (span=1w) squeezed into an 88px-wide canvas — Chart.js's default
+  // category x-scale spaces all 168 evenly regardless of real time gaps, so
+  // each point is under 1px apart. mempool.space's hourly candles are
+  // trailing averages, so a fast real-world recovery only shows up as a
+  // jump in the very last (live-synced) point — with 168 points that jump
+  // spans under 1px right at the canvas edge and reads as a near-invisible
+  // sliver rather than a visible upturn. LTTB always keeps the first and
+  // last raw points (so the live-synced tail value is never lost or
+  // averaged away) and picks the highest-visual-area point elsewhere in
+  // each bucket, which both spreads the tail segment across more canvas
+  // width and tends to preserve exactly the points that make a sharp
+  // recent move visible. boundsVals stays the RAW full-resolution series
+  // (per _drawSimpleSpark's own comment) so the y-axis floor/ceiling still
+  // reflect the true period min/max, not the downsampled subset.
+  _drawSimpleSpark('sp-NETWORK', lttbDownsample(networkWeeklySpark, 60), networkWeeklySpark.map(p=>p.v), false);
 
   // Draw fleet hashrate sparkline (last 24h of local history). Bounds come
   // from the full-resolution 24h window (matches the modal's 1D tab), not
@@ -2448,7 +2590,13 @@ function _drawWLSparklines(port) {
     }
 
     if (pctSeries?.length >= 2) {
-      const ip = pctSeries[pctSeries.length - 1] >= 0;
+      // Color must match the displayed day return exactly (same value the
+      // watchlist row's % text/class uses), not the sparkline's own series
+      // sign — those can disagree since _port1DReturn and the chart series
+      // are computed via different paths, causing a green line next to a
+      // red % (or vice versa). Never derive color from pctSeries itself.
+      const displayPct = window._port1DReturn != null ? window._port1DReturn : port.totalPct;
+      const ip = displayPct >= 0;
       const color = ip ? '#00d4a0' : '#ff4d6a';
       const existingInst = sparks['sp-PORTFOLIO'];
       // If color changed (positive↔negative flip), destroy and recreate so the
@@ -2457,6 +2605,13 @@ function _drawWLSparklines(port) {
       const needsRebuild = !existingInst || existingColor !== color;
       if (needsRebuild) {
         if (existingInst) { try { existingInst.destroy(); } catch {} }
+        // Pin the canvas's actual pixel size up front — same fix as the other
+        // watchlist sparklines (v2.9.16). Without this the canvas keeps its
+        // default 300x150 backing size and only gets scaled down visually by
+        // the CSS !important rule, which is blurrier and (pre-v2.9.16-style)
+        // was the root cause of row overflow elsewhere; pinning it here too
+        // for consistency now that every other row does the same.
+        portCv.width = 88; portCv.height = 40;
         const ctx = portCv.getContext('2d');
         const g = ctx.createLinearGradient(0,0,0,40);
         g.addColorStop(0, ip?'rgba(0,212,160,.3)':'rgba(255,77,106,.3)');
@@ -2643,7 +2798,12 @@ async function doSearch(){
     if(!rt) throw new Error('Symbol not found');
     const meta=rt.meta||{};
     const price=meta.regularMarketPrice||meta.previousClose||0;
-    const prev=meta.previousClose||price;
+    // Match loadSrchChart's base exactly (chartPreviousClose first) — with
+    // interval=1d&range=1d, meta.previousClose is often absent or equal to
+    // the live price, which silently produced a 0.00% "no change" reading
+    // here while the stats row below (which already preferred
+    // chartPreviousClose) showed the real return for the same symbol.
+    const prev=meta.chartPreviousClose||meta.previousClose||price;
     const chg=prev?((price-prev)/prev*100):0;
     const longName=meta.longName||meta.shortName||sym;
 
@@ -4999,11 +5159,32 @@ async function openHashrateChart(type) {
 // Robust y-axis bounds: dropout points (miner offline, host off the home
 // network, etc.) can crash to zero or near-zero. Those points are kept in
 // the data as-is — the line will still plunge toward the chart floor so the
-// outage is visible — but they're excluded from the axis range calculation
-// so a handful of zero blips don't flatten the whole chart into a sliver.
-// Percentile-based: the bottom HR_Y_LOW_PCTL fraction of samples (by rank,
-// not by value) is ignored when picking the floor. Adjust this constant if
-// dropouts happen more/less often than ~5% of samples in a typical period.
+// outage is visible — but on charts where that kind of literal-zero sensor
+// dropout is possible (the local mining fleet only), they're excluded from
+// the axis range calculation so a handful of zero blips don't flatten the
+// whole chart into a sliver.
+//
+// v2.9.20 FIX: this used to exclude the bottom HR_Y_LOW_PCTL fraction of
+// samples BY RANK (i.e. "the lowest 5% of points, whatever their value") on
+// every hashrate chart, including BTC Network Hashrate. mempool.space's
+// network hashrate never actually dropouts to a sensor-style zero/near-zero
+// the way a locally-polled miner going offline does — a "low" reading there
+// is just normal variance (block-interval luck swinging the trailing
+// average) and is completely legitimate data. But a real multi-hour dip
+// (e.g. the 1W chart trending down to a period low well below average, as
+// seen 8/18-8/19) can easily span MORE than 5% of the samples in the
+// window, so the old rank-based cutoff was excluding genuine trough points
+// from the floor calculation — not just true outliers. That pushed yMin
+// above the period's real low (confirmed against a real capture: yMin
+// landed at 800.5 while the period low was 782.11), so the trough plotted
+// below the visible axis and the line appeared to run off the bottom of
+// the chart / get cut off — on both the modal chart and the watchlist
+// sparkline, which share this same function. Network hashrate charts now
+// pass excludeDropouts=false and simply use the TRUE min/max of the
+// period, so no real data point can ever fall outside the visible range.
+// Fleet hashrate (genuinely polls to 0 GH/s on a miner/network dropout)
+// keeps the old percentile-exclusion behavior so a blip still can't crush
+// its whole chart into a sliver.
 const HR_Y_LOW_PCTL = 0.05;
 function _percentile(sortedArr, p) {
   const idx = (sortedArr.length - 1) * p;
@@ -5011,12 +5192,21 @@ function _percentile(sortedArr, p) {
   if (lo === hi) return sortedArr[lo];
   return sortedArr[lo] + (sortedArr[hi] - sortedArr[lo]) * (idx - lo);
 }
-function computeYBounds(vals) {
+function computeYBounds(vals, excludeDropouts = true) {
   const finite = vals.filter(v => Number.isFinite(v));
   if (!finite.length) return { min: undefined, max: undefined };
   const sorted = [...finite].sort((a,b)=>a-b);
-  const lo = _percentile(sorted, HR_Y_LOW_PCTL);
   const hi = sorted[sorted.length - 1]; // true max — legitimate upward spikes stay visible
+  let lo = excludeDropouts ? _percentile(sorted, HR_Y_LOW_PCTL) : sorted[0];
+  // Never let the MOST RECENT sample fall outside the visible axis range.
+  // The percentile floor is meant to stop an old dropout buried in the
+  // middle of the series from crushing the whole chart into a sliver, but
+  // if that excluded floor is above the latest reading, the current point
+  // gets mapped below the chart area and clipped off — reads as the line
+  // "swooping down and disappearing below the frame" instead of a normal
+  // dip. Always widen (never narrow) the floor to include the last point.
+  const last = finite[finite.length - 1];
+  if (last < lo) lo = last;
   const pad = (hi - lo) * 0.15 || (hi * 0.1) || 1;
   return { min: Math.max(0, lo - pad), max: hi + pad };
 }
@@ -5075,13 +5265,23 @@ async function loadHashrateChart(tf) {
     const pts = hist.filter(p=>p.t>=cutoff);
     if (!pts.length) { cl.textContent = 'Not enough history for this timeframe yet — data accumulates over time.'; cl.style.display='flex'; return; }
     const vals = pts.map(p=>p.v);
-    const lo = Math.min(...vals), hi = Math.max(...vals), cur = vals[vals.length-1], chg = ((cur-vals[0])/vals[0]*100);
+    const lo = Math.min(...vals), hi = Math.max(...vals), cur = vals[vals.length-1];
+    // BUG FIX: this used to divide by vals[0] unconditionally. The fleet
+    // regularly dips to 0 GH/s on a disconnect/dropout sample (see the
+    // dropout note above computeYBounds), and if that dropout happened to be
+    // the very first sample in the window, (cur-0)/0*100 produced Infinity —
+    // shown to the user as a literal "Infinity%" Period Change. Use the first
+    // NON-zero sample in the window as the baseline instead, matching how
+    // fleetHashratePrev (the watchlist row's day-over-day %) already treats
+    // zero samples as untrustworthy rather than as real baseline readings.
+    const baseIdx = vals.findIndex(v => v > 0);
+    const chg = (baseIdx >= 0 && cur) ? ((cur - vals[baseIdx]) / vals[baseIdx] * 100) : null;
     const avg = vals.reduce((s,v)=>s+v,0) / vals.length;
     const plotPts = lttbDownsample(pts, HR_MAX_PLOT_POINTS);
     renderHRChart(cv, cl, plotPts, 'GH/s', '#f7931a', avg, vals);
     document.getElementById('hr-stats').innerHTML=`
       <div class="sb"><div class="sl">Current</div><div class="sv">${fmtHashrate(cur)}</div></div>
-      <div class="sb"><div class="sl">Period Change</div><div class="sv" style="color:${chg>=0?'var(--green)':'var(--red)'}">${chg>=0?'+':''}${chg.toFixed(2)}%</div></div>
+      <div class="sb"><div class="sl">Period Change</div><div class="sv" style="color:${chg==null?'var(--t2)':chg>=0?'var(--green)':'var(--red)'}">${chg==null?'—':(chg>=0?'+':'')+chg.toFixed(2)+'%'}</div></div>
       <div class="sb"><div class="sl">Average</div><div class="sv">${fmtHashrate(avg)}</div></div>
       <div class="sb"><div class="sl">Period High</div><div class="sv">${fmtHashrate(hi)}</div></div>
       <div class="sb"><div class="sl">Period Low</div><div class="sv">${fmtHashrate(lo)}</div></div>`;
@@ -5171,7 +5371,11 @@ async function loadHashrateChart(tf) {
     const lo = Math.min(...vals), hi = Math.max(...vals), chg = ((liveVal-vals[0])/vals[0]*100);
     const avg = vals.reduce((s,v)=>s+v,0) / vals.length;
     const plotPts = lttbDownsample(pts, HR_MAX_PLOT_POINTS);
-    renderHRChart(cv, cl, plotPts, 'EH/s', '#ff9f43', avg, vals);
+    // excludeDropouts=false — see the computeYBounds/sp-NETWORK comments
+    // (v2.9.20): network hashrate has no literal-zero dropout artifact to
+    // guard against, and excluding real low points here was clipping the
+    // trough off the bottom of this exact chart.
+    renderHRChart(cv, cl, plotPts, 'EH/s', '#ff9f43', avg, vals, false);
     document.getElementById('hr-stats').innerHTML=`
       <div class="sb"><div class="sl">Current</div><div class="sv">${liveVal.toFixed(2)} EH/s</div></div>
       <div class="sb"><div class="sl">Period Change</div><div class="sv" style="color:${chg>=0?'var(--green)':'var(--red)'}">${chg>=0?'+':''}${chg.toFixed(2)}%</div></div>
@@ -5209,13 +5413,13 @@ const hrAvgLinePlugin = {
 };
 if (typeof Chart !== 'undefined' && !Chart.registry.plugins.get('avgLine')) Chart.register(hrAvgLinePlugin);
 
-function renderHRChart(cv, cl, pts, unit, color, avg, boundsVals) {
+function renderHRChart(cv, cl, pts, unit, color, avg, boundsVals, excludeDropouts = true) {
   cl.style.display='none'; cv.style.display='block';
   if (hrInst) hrInst.destroy();
   const ctx = cv.getContext('2d');
   const g = ctx.createLinearGradient(0,0,0,280);
   g.addColorStop(0, color+'44'); g.addColorStop(1,'rgba(0,0,0,0)');
-  const { min: yMin, max: yMax } = computeYBounds(boundsVals || pts.map(p=>p.v));
+  const { min: yMin, max: yMax } = computeYBounds(boundsVals || pts.map(p=>p.v), excludeDropouts);
   hrInst = new Chart(cv, {
     type:'line',
     data:{labels:pts.map(p=>new Date(p.t).toLocaleDateString()),datasets:[{data:pts.map(p=>p.v),borderColor:color,borderWidth:2,fill:true,backgroundColor:g,pointRadius:0,tension:.2}]},
@@ -5273,8 +5477,6 @@ async function loadNews() {
     b.innerHTML = sorted.map(a => {
       const _d = a.pubDate ? new Date(a.pubDate) : null;
       const age = (_d && !isNaN(_d.getTime())) ? timeAgo(_d) : '';
-      const tc = a.tag || curCat || 'general';
-      const tl = {market:'MARKET',geo:'GEOPOLITICAL',world:'WORLD',us:'US',sports:'SPORTS',general:'NEWS'}[tc]||'NEWS';
       const srcHost = (() => { try { return new URL(a.link).hostname.replace('www.',''); } catch { return ''; } })();
       const titleEsc = decodeEntities(a.title).replace(/"/g,'&quot;');
       const rawDesc = (a.description && a.description !== 'null') ? decodeEntities(a.description) : '';
@@ -5284,7 +5486,12 @@ async function loadNews() {
       const cleanDesc = (rawDesc && !rawDesc.trim().toLowerCase().startsWith(titleNorm)) ? rawDesc : '';
       const descEsc = cleanDesc.replace(/"/g,'&quot;');
       const linkEsc = a.link.replace(/"/g,'&quot;');
-      return `<div class="ni" data-url="${linkEsc}" data-title="${titleEsc}" data-src="${srcHost}" data-desc="${descEsc}" onclick="openReader(this.dataset.url,this.dataset.title,this.dataset.src,this.dataset.desc)"><div class="ni-tag ${tc}">${tl}</div><div class="ni-title">${decodeEntities(a.title)}</div>${cleanDesc?`<div class="ni-desc">${esc(cleanDesc)}</div>`:''}<div class="ni-time">${age}${srcHost?' · '+srcHost:''}</div></div>`;
+      // ni-desc always renders (even with no description, as a blank line)
+      // instead of being omitted — an article with no description used to
+      // produce a shorter row than one with a description, which broke the
+      // flush 1-news-row = 2-asset-rows alignment for those specific rows
+      // (v2.9.17).
+      return `<div class="ni" data-url="${linkEsc}" data-title="${titleEsc}" data-src="${srcHost}" data-desc="${descEsc}" onclick="openReader(this.dataset.url,this.dataset.title,this.dataset.src,this.dataset.desc)"><div class="ni-title">${decodeEntities(a.title)}</div><div class="ni-desc">${cleanDesc?esc(cleanDesc):'&nbsp;'}</div><div class="ni-time">${age}${srcHost?' · '+srcHost:''}</div></div>`;
     }).join('');
   } catch(e) {
     if (hasExisting) {
@@ -5995,14 +6202,19 @@ function renderNS() {
       <div id="relay-add-err" style="font-family:var(--fm);font-size:10px;color:var(--red);min-height:14px;"></div>
       <div style="display:flex;gap:6px;margin-top:6px;">
         <button class="btn" onclick="resetRelays()" style="font-size:10px;">Reset to defaults</button>
-      </div>`;
+      </div>
+      <div class="ssec" style="margin-top:14px;">Muted Accounts</div>
+      <div id="muted-list"></div>`;
   } else {
     el.innerHTML = `
       <div class="ssec">Connect Nostr Account</div>
       <div class="nm-card" onclick="openNM('nip46')"><span style="font-size:18px;">🔐</span><div style="flex:1;"><div style="font-size:12px;font-weight:600;color:var(--t0);margin-bottom:2px;">Remote Sign-in (NIP-46)</div><div style="font-size:11px;color:var(--t2);">Amber or keys.band. Key never leaves your device.</div></div><span class="nbadge bs">RECOMMENDED</span></div>
       <div class="nm-card" onclick="openNM('ext')"><span style="font-size:18px;">🧩</span><div style="flex:1;"><div style="font-size:12px;font-weight:600;color:var(--t0);margin-bottom:2px;">Browser Extension (NIP-07)</div><div style="font-size:11px;color:var(--t2);">nos2x, Alby, or compatible extension.</div></div><span class="nbadge bs">SECURE</span></div>
-      <div class="nm-card" onclick="openNM('nsec')"><span style="font-size:18px;">🔑</span><div style="flex:1;"><div style="font-size:12px;font-weight:600;color:var(--t0);margin-bottom:2px;">Paste Private Key (nsec)</div><div style="font-size:11px;color:var(--t2);">Only on trusted private devices.</div></div><span class="nbadge bb">BASIC</span></div>`;
+      <div class="nm-card" onclick="openNM('nsec')"><span style="font-size:18px;">🔑</span><div style="flex:1;"><div style="font-size:12px;font-weight:600;color:var(--t0);margin-bottom:2px;">Paste Private Key (nsec)</div><div style="font-size:11px;color:var(--t2);">Only on trusted private devices.</div></div><span class="nbadge bb">BASIC</span></div>
+      <div class="ssec" style="margin-top:14px;">Muted Accounts</div>
+      <div id="muted-list"></div>`;
   }
+  renderMutedList(); // muted-list div was just (re)created above — paint it now (v2.9.16)
 }
 
 function openNM(method) {
@@ -6396,6 +6608,7 @@ function buildNExp(){
         <button id="npane-feed-btn" class="btn ${nActivePane==='feed'?'a':''}" style="font-size:9px;padding:2px 8px;" onclick="nHashtagMode=false;switchNPane('feed');renderNFeed()">Timeline</button>
         <button id="npane-notifs-btn" class="btn ${nActivePane==='notifs'?'a':''}" style="font-size:9px;padding:2px 8px;position:relative;" onclick="switchNPane('notifs')">Notifications<span id="notif-badge" style="display:${nUnreadNotifs>0?'inline':'none'};position:absolute;top:-3px;right:-3px;background:var(--red);color:#fff;font-size:8px;font-family:var(--fm);border-radius:8px;padding:0 4px;min-width:14px;text-align:center;line-height:14px;">${nUnreadNotifs>9?'9+':nUnreadNotifs}</span></button>
         <button id="npane-articles-btn" class="btn ${nActivePane==='articles'?'a':''}" style="font-size:9px;padding:2px 8px;" onclick="switchNPane('articles')">Articles</button>
+        <button id="npane-streams-btn" class="btn ${nActivePane==='streams'?'a':''}" style="font-size:9px;padding:2px 8px;" onclick="switchNPane('streams')">Streams</button>
         <div id="nfeed-filter-btns" style="display:${nActivePane==='feed'?'flex':'none'};align-items:center;gap:4px;">
           <span style="font-family:var(--fm);font-size:9px;color:var(--t3);">·</span>
           <button id="nf-btn-posts" class="btn ${nFeedFilter==='posts'?'a':''}" style="font-size:9px;padding:2px 8px;" onclick="setNFilter('posts')">Posts</button>
@@ -6408,6 +6621,7 @@ function buildNExp(){
       <div id="nfeed" style="flex:1;overflow-y:auto;display:${nActivePane==='feed'?'block':'none'};"></div>
       <div id="nnotifs" style="flex:1;overflow-y:auto;display:${nActivePane==='notifs'?'block':'none'};"></div>
       <div id="narticles" onscroll="onArticlesScroll(this)" style="flex:1;overflow-y:auto;display:${nActivePane==='articles'?'block':'none'};"></div>
+      <div id="nstreams" style="flex:1;overflow-y:auto;display:${nActivePane==='streams'?'block':'none'};"></div>
       <div id="nprofile-pane" style="flex:1;overflow-y:auto;display:${nActivePane==='profile'?'block':'none'};"></div>
     </div>
     <div id="ncompose" style="background:var(--bg-2);display:flex;flex-direction:column;gap:8px;overflow-y:auto;">
@@ -6431,6 +6645,7 @@ function buildNExp(){
   connectNRelays();
   connectNNotifs();
   connectNArticles();
+  connectNStreams();
   // Trigger profile pane load if it's the active tab.
   // Use a longer delay (600ms) so relay connections are established before fetching.
   if(nActivePane==='profile') setTimeout(renderNProfilePane, 600);
@@ -6449,17 +6664,20 @@ function switchNPane(pane){
   const feedEl=document.getElementById('nfeed');
   const notifsEl=document.getElementById('nnotifs');
   const articlesEl=document.getElementById('narticles');
+  const streamsEl=document.getElementById('nstreams');
   const profileEl=document.getElementById('nprofile-pane');
   const filterBtns=document.getElementById('nfeed-filter-btns');
   if(!feedEl||!notifsEl)return;
   feedEl.style.display=pane==='feed'?'block':'none';
   notifsEl.style.display=pane==='notifs'?'block':'none';
   if(articlesEl) articlesEl.style.display=pane==='articles'?'block':'none';
+  if(streamsEl) streamsEl.style.display=pane==='streams'?'block':'none';
   if(profileEl) profileEl.style.display=pane==='profile'?'block':'none';
   if(filterBtns) filterBtns.style.display=pane==='feed'?'flex':'none';
   document.getElementById('npane-feed-btn')?.classList.toggle('a',pane==='feed');
   document.getElementById('npane-notifs-btn')?.classList.toggle('a',pane==='notifs');
   document.getElementById('npane-articles-btn')?.classList.toggle('a',pane==='articles');
+  document.getElementById('npane-streams-btn')?.classList.toggle('a',pane==='streams');
   document.getElementById('npane-profile-btn')?.classList.toggle('a',pane==='profile');
   if(pane==='notifs'){
     nUnreadNotifs=0;
@@ -6469,6 +6687,7 @@ function switchNPane(pane){
     renderNNotifs();
   }
   if(pane==='articles') renderNArticles();
+  if(pane==='streams') renderNStreams();
   if(pane==='profile') renderNProfilePane();
 }
 
@@ -6852,6 +7071,141 @@ async function openNostrArticle(evId){
   openM('reader-modal');
 }
 
+// ═══════════════════════════════════════════════════════
+//  NOSTR LIVE STREAMS (NIP-53, kind 30311)
+// ═══════════════════════════════════════════════════════
+// Shows live streams currently being hosted by people the user follows.
+// kind 30311 is a parameterized-replaceable "live event" — the same event
+// (keyed by pubkey+d-tag) gets re-published with an updated 'status' tag
+// (planned → live → ended) as the stream progresses, so querying with a
+// #status:['live'] filter naturally excludes streams that haven't started
+// or have already ended without any extra client-side date math.
+let nStreams = [];        // live kind:30311 events from people you follow
+let nStreamsConns = [];   // live subscription sockets
+let nStreamsLoaded = false;
+
+function connectNStreams(){
+  if(!nPubkey||!nFollowing.length) return;
+  clearTimeout(connectNStreams._poll);
+  nStreamsConns.forEach(ws=>{try{ws.close();}catch{}});
+  nStreamsConns=[];
+  const authors=[...new Set([...nFollowing,nPubkey])];
+  const relays=articleRelays(); // same broad relay set used for Articles — live events aren't guaranteed to be on every relay either
+  let eoseCount=0;
+  relays.forEach(relayUrl=>{
+    try{
+      const ws=new WebSocket(relayUrl);
+      nStreamsConns.push(ws);
+      const sid='live-'+Math.random().toString(36).slice(2,8);
+      ws.onopen=()=>ws.send(JSON.stringify(['REQ',sid,{kinds:[30311],authors,'#status':['live'],limit:100}]));
+      ws.onmessage=(e)=>{
+        try{
+          const m=JSON.parse(e.data);
+          if(m[0]==='EVENT'&&m[2]?.kind===30311){
+            const ev=m[2];
+            // Belt-and-suspenders: confirm status is actually 'live' client-side too,
+            // in case a relay ignores the '#status' tag filter and sends everything.
+            const status=ev.tags.find(t=>t[0]==='status')?.[1];
+            const dTag=ev.tags.find(t=>t[0]==='d')?.[1]||'';
+            const key=ev.pubkey+':'+dTag;
+            const existingIdx=nStreams.findIndex(s=>s.pubkey+':'+(s.tags?.find(t=>t[0]==='d')?.[1]||'')===key);
+            if(status==='live'){
+              if(existingIdx>=0){ if(ev.created_at>nStreams[existingIdx].created_at) nStreams[existingIdx]=ev; }
+              else nStreams.push(ev);
+            } else if(existingIdx>=0){
+              // Status flipped away from 'live' (e.g. ended) since we last heard about it — drop it.
+              nStreams.splice(existingIdx,1);
+            }
+            nStreams.sort((a,b)=>b.created_at-a.created_at);
+            if(nActivePane==='streams'){clearTimeout(connectNStreams._t);connectNStreams._t=setTimeout(renderNStreams,200);}
+          } else if(m[0]==='EOSE'){
+            try{ws.close();}catch{}
+            eoseCount++;
+            if(eoseCount>=relays.length){
+              nStreamsLoaded=true;
+              if(nActivePane==='streams') renderNStreams();
+              // Live status changes fairly often (streams start/end) — repoll every 2 minutes.
+              clearTimeout(connectNStreams._poll);
+              connectNStreams._poll=setTimeout(()=>connectNStreams(),2*60*1000);
+            }
+          }
+        }catch{}
+      };
+      ws.onerror=()=>{try{ws.close();}catch{}};
+      ws.onclose=()=>{nStreamsConns=nStreamsConns.filter(c=>c!==ws);};
+    }catch{}
+  });
+}
+
+function renderNStreams(){
+  const el=document.getElementById('nstreams');
+  if(!el) return;
+  if(!nPubkey){el.innerHTML='<div style="padding:20px;text-align:center;font-family:var(--fm);font-size:11px;color:var(--t2);">Connect Nostr to see live streams.</div>';return;}
+  if(!nStreamsLoaded){
+    el.innerHTML='<div style="padding:20px;text-align:center;font-family:var(--fm);font-size:11px;color:var(--t2);">Checking for live streams from people you follow…</div>';
+    if(!nStreamsConns.length) connectNStreams();
+    return;
+  }
+  const live=nStreams.filter(ev=>!nMuted.has(ev.pubkey));
+  if(!live.length){
+    el.innerHTML='<div style="padding:20px;text-align:center;font-family:var(--fm);font-size:11px;color:var(--t2);">No one you follow is streaming right now.</div>';
+    return;
+  }
+  let html='';
+  live.forEach(ev=>{
+    const title=ev.tags.find(t=>t[0]==='title')?.[1]||'Untitled stream';
+    const image=ev.tags.find(t=>t[0]==='image')?.[1]||ev.tags.find(t=>t[0]==='thumbnail')?.[1]||'';
+    const summary=ev.tags.find(t=>t[0]==='summary')?.[1]||'';
+    const dTag=ev.tags.find(t=>t[0]==='d')?.[1]||'';
+    const streamingUrl=ev.tags.find(t=>t[0]==='streaming')?.[1]||'';
+    const viewers=ev.tags.find(t=>t[0]==='current_participants')?.[1];
+    const prof=nProfiles[ev.pubkey]||(ev.pubkey===nPubkey?nProfile:null);
+    const name=prof?.name||trunc(ev.pubkey);
+    const avSrc=prof?.picture?proxyImg(prof.picture):'';
+    const avH=avSrc?`<img src="${esc(avSrc)}" style="width:100%;height:100%;object-fit:cover;border-radius:50%;" loading="lazy" referrerpolicy="no-referrer" onerror="this.style.display='none'">`
+      :`<div style="width:100%;height:100%;background:var(--bg-4);display:flex;align-items:center;justify-content:center;font-size:8px;color:var(--t3);border-radius:50%;">${esc(name).slice(0,2).toUpperCase()}</div>`;
+    const pubEsc=esc(ev.pubkey);
+    const dEsc=esc(dTag).replace(/'/g,"\\'");
+    const streamEsc=esc(streamingUrl).replace(/'/g,"\\'");
+    html+=`<div class="npost" style="cursor:pointer;padding:9px 12px;" onclick="openNStream('${pubEsc}','${dEsc}','${streamEsc}')">
+      <div style="position:relative;margin-bottom:6px;">
+        ${image?`<img src="${esc(proxyImg(image))}" alt="" loading="lazy" referrerpolicy="no-referrer" style="width:100%;height:92px;object-fit:cover;border-radius:6px;" onerror="this.style.display='none'">`:`<div style="width:100%;height:92px;border-radius:6px;background:var(--bg-3);display:flex;align-items:center;justify-content:center;font-size:22px;">🔴</div>`}
+        <span style="position:absolute;top:6px;left:6px;background:var(--red);color:#fff;font-family:var(--fm);font-size:9px;font-weight:700;letter-spacing:.06em;padding:2px 6px;border-radius:3px;">● LIVE</span>
+        ${viewers?`<span style="position:absolute;bottom:6px;right:6px;background:rgba(0,0,0,.65);color:#fff;font-family:var(--fm);font-size:9px;padding:2px 6px;border-radius:3px;">${esc(viewers)} watching</span>`:''}
+      </div>
+      <div class="npost-meta" style="margin-bottom:3px;">
+        <div class="nav">${avH}</div>
+        <span style="font-family:var(--fm);font-size:11px;font-weight:500;color:var(--t0);">${esc(name)}</span>
+      </div>
+      <div style="font-size:12.5px;font-weight:600;color:var(--t0);line-height:1.35;margin-bottom:3px;">${esc(title)}</div>
+      ${summary?`<div style="font-size:11px;color:var(--t2);line-height:1.45;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;">${esc(summary)}</div>`:''}
+      <div class="npost-actions" onclick="event.stopPropagation()">
+        <button class="nact reply" onclick="openNStream('${pubEsc}','${dEsc}','${streamEsc}')">▶ watch</button>
+      </div>
+    </div>`;
+  });
+  el.innerHTML=html;
+}
+
+// Opens a live stream in a new tab. Rather than embedding a custom HLS
+// player in-app (a stream's actual media format/CDN varies by streaming
+// platform), this hands off to zap.stream — the de-facto NIP-53 web
+// client, the same approach the app already uses for njump.me as an
+// external reader for other note types. We build a proper naddr (so
+// zap.stream can locate the event even on relays we didn't query) and
+// fall back to the raw streaming URL, then to njump.me, if that fails.
+async function openNStream(pubkey, dTag, streamingUrl){
+  try{
+    await loadNT();
+    if(window.NostrTools?.nip19?.naddrEncode){
+      const naddr=window.NostrTools.nip19.naddrEncode({kind:30311,pubkey,identifier:dTag,relays:RELAYS.slice(0,3)});
+      window.open('https://zap.stream/'+naddr,'_blank','noopener');
+      return;
+    }
+  }catch{}
+  if(streamingUrl){ window.open(streamingUrl,'_blank','noopener'); return; }
+  window.open('https://njump.me/'+pubkey,'_blank','noopener');
+}
 
 function connectNNotifs(){
   if(!nPubkey) return;
@@ -6920,6 +7274,7 @@ function connectNNotifs(){
             if(e.pubkey===nPubkey) return;
             if(seenIds.has(e.id)) return;
             seenIds.add(e.id);
+            if(_nEvMuted(e)) return; // muted author — never enters notifications (v2.9.16)
             nNotifs.push(e);
             nNotifs.sort((a,b)=>b.created_at-a.created_at);
             if(nNotifs.length>300) nNotifs.length=300;
@@ -6996,6 +7351,13 @@ async function openNotifTarget(notifId, evt){
 
 function renderNNotifs(){
   const el=document.getElementById('nnotifs');if(!el)return;
+  // Defense-in-depth: also strip muted authors here, since nNotifs can contain
+  // entries persisted to localStorage from before a mute was applied (v2.9.16).
+  if(nMuted.size){
+    const before=nNotifs.length;
+    nNotifs=nNotifs.filter(e=>!_nEvMuted(e));
+    if(nNotifs.length!==before){ nUnreadNotifs=nNotifs.filter(n=>n.created_at>nNotifsLastReadAt).length; _updateNotifBadges(); _saveNNotifsDebounced(); }
+  }
   if(!nNotifs.length){
     el.innerHTML=`<div style="padding:20px;text-align:center;font-family:var(--fm);font-size:11px;color:var(--t2);">No notifications yet</div>`;
     return;
@@ -9279,6 +9641,8 @@ function nLogout(){
   _updateNotifBadges();
   localStorage.removeItem('mts_notifs_read_at');
   nFeedWSList.forEach(ws=>{try{ws.close();}catch{}});nFeedWSList=[];
+  nStreamsConns.forEach(ws=>{try{ws.close();}catch{}});nStreamsConns=[];clearTimeout(connectNStreams._poll);
+  nStreams=[];nStreamsLoaded=false;
   if(connectNNotifs._cancel){connectNNotifs._cancel();connectNNotifs._cancel=null;}
   if(nNotifsWS){(Array.isArray(nNotifsWS)?nNotifsWS:[nNotifsWS]).forEach(ws=>{try{ws.close();}catch{}});nNotifsWS=null;}
   if(nip46WS){try{nip46WS.close();}catch{}nip46WS=null;}
@@ -10882,6 +11246,22 @@ document.addEventListener('visibilitychange',()=>{
     if(now-_lastRefresh>12000){
       refreshAll();
       _lastRefresh=now;
+    }
+    // Fleet hashrate has been seen dipping to 0 after the Mac sleeps or the
+    // tab is backgrounded for a while. Two things conspire on wake: (1) the
+    // browser fully suspends setInterval timers while asleep/hidden, so
+    // refreshMiningStats' regular 30s cycle doesn't resume until up to 30s
+    // after the tab becomes visible again, and (2) local Wi-Fi/network often
+    // needs a few seconds to reconnect post-wake, so a poll that lands in
+    // that gap can fail. A single failure is already tolerated by
+    // MINER_OFFLINE_THRESHOLD's blip protection (see fetchMinerStats), but
+    // that protection can't help until a poll actually runs — and nothing
+    // was proactively triggering one on wake for the fleet, unlike prices
+    // (refreshAll, above). Poll immediately, then once more 5s later to give
+    // a slow reconnect a second chance before the next regular 30s cycle.
+    if(miners.length){
+      refreshMiningStats();
+      setTimeout(()=>{ if(miners.length) refreshMiningStats(); }, 5000);
     }
   }
 });

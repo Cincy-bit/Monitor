@@ -493,12 +493,16 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                 try:
                     data, ct = _fetch_with_deadline(req, ctx, fetch_timeout, 20)
                 except (urllib.error.URLError, TimeoutError) as e:
-                    # One retry for external (non-local) requests — covers
-                    # transient errors (not stalls) from upstreams.
-                    if is_local:
-                        raise
+                    # One retry, for local (miner) and external requests alike.
+                    # Local miners are on the LAN and a failure is almost
+                    # always a transient Wi-Fi/ARP/DHCP blip rather than the
+                    # miner actually being down — retrying once here avoids
+                    # reporting a miner "offline" (and the client recording a
+                    # fake 0 H/s sample) for a hiccup that clears in well
+                    # under a second.
                     print(f"Path proxy retry for {target} after: {e}")
-                    data, ct = _fetch_with_deadline(req, ctx, 8, 10)
+                    retry_timeout = 4 if is_local else 8
+                    data, ct = _fetch_with_deadline(req, ctx, retry_timeout, 10)
             self.send_response(200)
             self.send_header("Content-Type", ct)
             self.send_header("Access-Control-Allow-Origin", "*")
@@ -1637,7 +1641,19 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             # headline number through the evening); `extPct` is the
             # since-4pm-close move, kept only as a secondary annotation.
             ext_pct = post_pct_vs_close or _pct(post_price, base_price) or post_pct
-            print(f"[POST-carry] {symbol}: overnight/weekend, carrying post-market price {post_price:.2f} (real ts={post_time})")
+            # DIAGNOSTIC: is this actually a live/moving Blue Ocean overnight
+            # print, or the same 8pm post-market close being carried forward
+            # unchanged? post_time is Yahoo's own postMarketTime timestamp —
+            # if it's within the last ~30 min, Yahoo IS updating this field
+            # overnight (Blue Ocean data is flowing through postMarketPrice)
+            # and a real overnight-pricing feature is just a badge/label away.
+            # If it's stuck at ~8:00pm ET no matter when you check, Yahoo's
+            # public quote fields aren't carrying Blue Ocean data at all and
+            # a genuinely different endpoint/field would be needed instead.
+            import time as _t2
+            _age_min = ((_t2.time() - post_time) / 60) if post_time else None
+            _fresh = 'FRESH (live overnight data!)' if (_age_min is not None and _age_min < 30) else f'STALE ({_age_min:.0f}min old — frozen post-market print, not live)' if _age_min is not None else 'UNKNOWN (no timestamp)'
+            print(f"[POST-carry] {symbol}: overnight/weekend, carrying post-market price {post_price:.2f} (real ts={post_time}) — {_fresh}")
             import time as _t
             real_asof = post_time or _t.time()
             send_result({'symbol': symbol, 'price': post_price, 'pct': post_pct,
