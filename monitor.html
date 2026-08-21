@@ -914,6 +914,17 @@ a{color:inherit;text-decoration:none;}
   </div>
 </div>
 
+<!-- ═══ NOSTR PASSPHRASE UNLOCK MODAL ═══ -->
+<div class="mo" id="nunlock-modal">
+  <div class="md" style="width:420px;">
+    <div class="md-hdr">
+      <div><div class="md-title">Unlock Nostr Session</div><div class="md-sub">Passphrase lock is on for this account</div></div>
+    </div>
+    <div class="md-body" id="nunlock-body"></div>
+  </div>
+</div>
+
+
 <!-- ═══ NWC LIGHTNING WALLET MODAL ═══ -->
 <div class="mo" id="nwc-modal">
   <div class="md" style="width:460px;">
@@ -6344,6 +6355,9 @@ function renderNS() {
       <div style="display:flex;gap:6px;margin-top:6px;">
         <button class="btn" onclick="resetRelays()" style="font-size:10px;">Reset to defaults</button>
       </div>
+      ${nSigner==='nsec' ? `
+      <div class="ssec" style="margin-top:14px;">Passphrase Lock</div>
+      <div id="pp-panel">${buildPPPanelHTML()}</div>` : ''}
       <div class="ssec" style="margin-top:14px;">Muted Accounts</div>
       <div id="muted-list"></div>`;
   } else {
@@ -6382,7 +6396,7 @@ function openNM(method) {
 async function nLoginExt() {
   const st=document.getElementById('ext-st');
   if(!window.nostr){st.textContent='❌ No extension found.';st.style.color='var(--red)';return;}
-  try{st.textContent='Requesting pubkey...';nPubkey=await window.nostr.getPublicKey();nSigner='extension';saveNSession();closeM('nm-modal');await onNC();renderNS();}
+  try{st.textContent='Requesting pubkey...';nPubkey=await window.nostr.getPublicKey();nSigner='extension';await saveNSession();closeM('nm-modal');await onNC();renderNS();}
   catch(e){st.textContent=`❌ ${e.message}`;st.style.color='var(--red)';}
 }
 
@@ -6398,7 +6412,7 @@ async function nLoginNsec() {
     else throw new Error('Invalid format.');
     nPubkey=window.NostrTools.getPublicKey(priv);nSigner='nsec';window._nPriv=priv;
     document.getElementById('nsec-in').value='';
-    saveNSession();closeM('nm-modal');await onNC();renderNS();
+    await saveNSession();closeM('nm-modal');await onNC();renderNS();
   } catch(e){st.textContent=`❌ ${e.message}`;st.style.color='var(--red)';}
 }
 
@@ -11180,15 +11194,258 @@ function setStatus(t,m){document.getElementById('status-lbl').textContent=m;}
 // ═══════════════════════════════════════════════════════
 //  NOSTR SESSION PERSISTENCE
 // ═══════════════════════════════════════════════════════
-function saveNSession(){
+// ═══════════════════════════════════════════════════════
+//  NOSTR SESSION KEY STORAGE (encrypted-at-rest)
+// ═══════════════════════════════════════════════════════
+// window._nPriv (raw hex) is only ever kept in memory for signing. At REST,
+// this used to be written straight to localStorage as plaintext
+// (mts_nostr_session.priv) — trivially readable by anything that can read
+// this origin's storage: other browser extensions, devtools, disk/profile
+// scans, browser-sync exports, a pasted-in support ticket, info-stealer
+// malware that specifically greps browser localStorage for exactly this
+// pattern, etc.
+//
+// Fix: the priv key is now wrapped with an AES-GCM key that lives in
+// IndexedDB as a NON-EXTRACTABLE CryptoKey. The browser will never hand out
+// that key's raw bytes to any JS — including this page's own — so a raw
+// copy of localStorage/IndexedDB by itself can't be decrypted anywhere else
+// (different profile, different machine, pasted elsewhere). "Stay logged
+// in" still works exactly as before with zero extra prompts, since the
+// wrapping key is used transparently on load.
+//
+// CAVEAT (please read before assuming this is bulletproof): this does NOT
+// defend against a live XSS attack running inside this exact page — such a
+// script can call the same _nDecryptPriv() below that this app itself uses.
+// No architecture that signs events with the raw key IN this page's JS can
+// fully close that gap. The only way to close it completely is to stop
+// putting the raw key in page JS at all — i.e. use the NIP-07 extension or
+// NIP-46 remote-signer login methods above instead of pasting an nsec,
+// since with those the key never enters this page's JS context in the
+// first place. This change meaningfully reduces the "someone/something
+// reads my storage at rest" risk; it does not change the in-page-signing
+// XSS risk, which is inherent to the nsec-login method itself.
+const _N_KS_DB='mts_keystore', _N_KS_STORE='keys', _N_KS_KEYNAME='wrapkey';
+function _nKsOpenDB(){
+  return new Promise((res,rej)=>{
+    const req=indexedDB.open(_N_KS_DB,1);
+    req.onupgradeneeded=()=>{ try{req.result.createObjectStore(_N_KS_STORE);}catch{} };
+    req.onsuccess=()=>res(req.result);
+    req.onerror=()=>rej(req.error);
+  });
+}
+async function _nGetWrapKey(){
+  const db=await _nKsOpenDB();
+  const existing=await new Promise((res,rej)=>{
+    const tx=db.transaction(_N_KS_STORE,'readonly');
+    const rq=tx.objectStore(_N_KS_STORE).get(_N_KS_KEYNAME);
+    rq.onsuccess=()=>res(rq.result); rq.onerror=()=>rej(rq.error);
+  });
+  if(existing) return existing;
+  const key=await crypto.subtle.generateKey({name:'AES-GCM',length:256},false,['encrypt','decrypt']);
+  await new Promise((res,rej)=>{
+    const tx=db.transaction(_N_KS_STORE,'readwrite');
+    tx.objectStore(_N_KS_STORE).put(key,_N_KS_KEYNAME);
+    tx.oncomplete=()=>res(); tx.onerror=()=>rej(tx.error);
+  });
+  return key;
+}
+function _abToB64(buf){ return btoa(String.fromCharCode(...new Uint8Array(buf))); }
+function _b64ToAb(b64){ const bin=atob(b64); const arr=new Uint8Array(bin.length); for(let i=0;i<bin.length;i++)arr[i]=bin.charCodeAt(i); return arr.buffer; }
+async function _nEncryptPriv(privHex){
+  const key=await _nGetWrapKey();
+  const iv=crypto.getRandomValues(new Uint8Array(12));
+  const ct=await crypto.subtle.encrypt({name:'AES-GCM',iv},key,new TextEncoder().encode(privHex));
+  return {ct:_abToB64(ct), iv:_abToB64(iv)};
+}
+async function _nDecryptPriv(enc){
+  const key=await _nGetWrapKey();
+  const pt=await crypto.subtle.decrypt({name:'AES-GCM',iv:new Uint8Array(_b64ToAb(enc.iv))},key,_b64ToAb(enc.ct));
+  return new TextDecoder().decode(pt);
+}
+
+// ── OPTIONAL PASSPHRASE LOCK ─────────────────────────────────────────────
+// Everything above (device-bound IndexedDB key) protects the stored nsec
+// at rest with zero user friction, but anything that can run JS on this
+// page — most importantly a live XSS — can call the same decrypt function
+// the app uses, with no extra secret required. A passphrase closes that
+// gap for the STORED copy: it's an entirely separate encryption layer
+// derived from something only the user knows (PBKDF2 → AES-GCM), so
+// nothing on the page — not this app's own code, not injected script —
+// can decrypt the stored key without the user typing it in.
+//
+// This is opt-in and OFF by default, because it trades away silent
+// "stay logged in": with a passphrase set, the page can no longer restore
+// the session on its own — it has to ask. Skipping the prompt just leaves
+// you logged out for that page load; nothing is lost, you can unlock or
+// log back in with your nsec any time.
+//
+// When a passphrase is active, the plaintext-reachable device-key copy
+// (encPriv/iv) is deleted — only the passphrase-wrapped copy (pp) remains,
+// so there's no silent fallback that would defeat the point.
+function _nGetRawSession(){
+  try{ return JSON.parse(localStorage.getItem('mts_nostr_session')||'null'); }catch{ return null; }
+}
+async function _nDeriveKeyFromPassphrase(passphrase, saltB64, iterations){
+  const baseKey=await crypto.subtle.importKey('raw', new TextEncoder().encode(passphrase), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey(
+    {name:'PBKDF2', salt:_b64ToAb(saltB64), iterations, hash:'SHA-256'},
+    baseKey, {name:'AES-GCM', length:256}, false, ['encrypt','decrypt']
+  );
+}
+async function _nPPEncrypt(privHex, passphrase){
+  const salt=crypto.getRandomValues(new Uint8Array(16));
+  const iterations=250000;
+  const key=await _nDeriveKeyFromPassphrase(passphrase, _abToB64(salt), iterations);
+  const iv=crypto.getRandomValues(new Uint8Array(12));
+  const ct=await crypto.subtle.encrypt({name:'AES-GCM',iv}, key, new TextEncoder().encode(privHex));
+  return {salt:_abToB64(salt), iterations, ct:_abToB64(ct), iv:_abToB64(iv)};
+}
+async function _nPPDecrypt(pp, passphrase){
+  const key=await _nDeriveKeyFromPassphrase(passphrase, pp.salt, pp.iterations);
+  // Wrong passphrase => wrong key => AES-GCM auth tag check fails => this throws.
+  const pt=await crypto.subtle.decrypt({name:'AES-GCM',iv:new Uint8Array(_b64ToAb(pp.iv))}, key, _b64ToAb(pp.ct));
+  return new TextDecoder().decode(pt);
+}
+
+function buildPPPanelHTML(){
+  const sess=_nGetRawSession();
+  const enabled=!!(sess&&sess.pp);
+  if(!enabled){
+    return `<div style="font-family:var(--fm);font-size:11px;color:var(--t2);margin-bottom:8px;">Off — your key unlocks automatically when this page loads (device-only protection). Add a passphrase for stronger protection; you'll enter it once each time you open this page.</div>
+      <button class="btn" onclick="_nPPShowSetForm()">Set a Passphrase</button>
+      <div id="pp-form"></div>
+      <div id="pp-status" style="font-family:var(--fm);font-size:10px;color:var(--t2);min-height:14px;margin-top:6px;"></div>`;
+  }
+  return `<div style="font-family:var(--fm);font-size:11px;color:var(--green);margin-bottom:8px;">🔒 On — you'll be asked for your passphrase each time you open this page.</div>
+      <div style="display:flex;gap:6px;">
+        <button class="btn" onclick="_nPPShowChangeForm()">Change Passphrase</button>
+        <button class="btn" onclick="_nPPShowRemoveForm()">Remove Passphrase</button>
+      </div>
+      <div id="pp-form"></div>
+      <div id="pp-status" style="font-family:var(--fm);font-size:10px;color:var(--t2);min-height:14px;margin-top:6px;"></div>`;
+}
+function _nPPRefresh(){
+  const el=document.getElementById('pp-panel');
+  if(el) el.innerHTML=buildPPPanelHTML();
+}
+function _nPPShowSetForm(){
+  const f=document.getElementById('pp-form'); if(!f)return;
+  f.innerHTML=`<div class="fgrp" style="margin-top:8px;"><label class="flbl">New Passphrase (min 8 characters)</label><input class="fin" type="password" id="pp-new1" style="font-family:var(--fm);"></div>
+    <div class="fgrp"><label class="flbl">Confirm Passphrase</label><input class="fin" type="password" id="pp-new2" style="font-family:var(--fm);"></div>
+    <div class="warn">⚠️ If you forget this passphrase there's no way to recover the key from it — you'd need to log out and log back in with your nsec.</div>
+    <div style="display:flex;gap:8px;justify-content:flex-end;"><button class="btn" onclick="document.getElementById('pp-form').innerHTML=''">Cancel</button><button class="btn-p" onclick="nSetPassphrase()">Save</button></div>`;
+}
+function _nPPShowChangeForm(){
+  const f=document.getElementById('pp-form'); if(!f)return;
+  f.innerHTML=`<div class="fgrp" style="margin-top:8px;"><label class="flbl">Current Passphrase</label><input class="fin" type="password" id="pp-cur" style="font-family:var(--fm);"></div>
+    <div class="fgrp"><label class="flbl">New Passphrase (min 8 characters)</label><input class="fin" type="password" id="pp-new1" style="font-family:var(--fm);"></div>
+    <div class="fgrp"><label class="flbl">Confirm New Passphrase</label><input class="fin" type="password" id="pp-new2" style="font-family:var(--fm);"></div>
+    <div style="display:flex;gap:8px;justify-content:flex-end;"><button class="btn" onclick="document.getElementById('pp-form').innerHTML=''">Cancel</button><button class="btn-p" onclick="nChangePassphrase()">Save</button></div>`;
+}
+function _nPPShowRemoveForm(){
+  const f=document.getElementById('pp-form'); if(!f)return;
+  f.innerHTML=`<div class="fgrp" style="margin-top:8px;"><label class="flbl">Current Passphrase</label><input class="fin" type="password" id="pp-cur" style="font-family:var(--fm);"></div>
+    <div style="display:flex;gap:8px;justify-content:flex-end;"><button class="btn" onclick="document.getElementById('pp-form').innerHTML=''">Cancel</button><button class="btn-p" onclick="nRemovePassphrase()">Remove</button></div>`;
+}
+async function nSetPassphrase(){
+  const st=document.getElementById('pp-status');
+  const p1=document.getElementById('pp-new1').value, p2=document.getElementById('pp-new2').value;
+  if(p1.length<8){st.textContent='❌ Passphrase must be at least 8 characters.';st.style.color='var(--red)';return;}
+  if(p1!==p2){st.textContent='❌ Passphrases do not match.';st.style.color='var(--red)';return;}
+  if(!window._nPriv||nSigner!=='nsec'){st.textContent='❌ Not signed in with a private key.';st.style.color='var(--red)';return;}
+  try{
+    st.textContent='Encrypting...';st.style.color='var(--t2)';
+    const privHex=typeof window._nPriv==='string'?window._nPriv:Array.from(window._nPriv).map(b=>b.toString(16).padStart(2,'0')).join('');
+    const pp=await _nPPEncrypt(privHex,p1);
+    const sess=_nGetRawSession()||{pubkey:nPubkey,signer:'nsec'};
+    delete sess.encPriv; delete sess.iv; delete sess.priv;
+    sess.pp=pp;
+    localStorage.setItem('mts_nostr_session',JSON.stringify(sess));
+    document.getElementById('pp-form').innerHTML='';
+    _nPPRefresh();
+    const st2=document.getElementById('pp-status'); if(st2){st2.textContent='✓ Passphrase set.';st2.style.color='var(--green)';}
+  }catch(e){st.textContent='❌ '+e.message;st.style.color='var(--red)';}
+}
+async function nChangePassphrase(){
+  const st=document.getElementById('pp-status');
+  const cur=document.getElementById('pp-cur').value, p1=document.getElementById('pp-new1').value, p2=document.getElementById('pp-new2').value;
+  const sess=_nGetRawSession();
+  if(!sess||!sess.pp){st.textContent='❌ No passphrase is set.';st.style.color='var(--red)';return;}
+  if(p1.length<8){st.textContent='❌ New passphrase must be at least 8 characters.';st.style.color='var(--red)';return;}
+  if(p1!==p2){st.textContent='❌ New passphrases do not match.';st.style.color='var(--red)';return;}
+  try{
+    st.textContent='Verifying...';st.style.color='var(--t2)';
+    const privHex=await _nPPDecrypt(sess.pp,cur);
+    const pp=await _nPPEncrypt(privHex,p1);
+    sess.pp=pp;
+    localStorage.setItem('mts_nostr_session',JSON.stringify(sess));
+    document.getElementById('pp-form').innerHTML='';
+    st.textContent='✓ Passphrase changed.';st.style.color='var(--green)';
+  }catch(e){st.textContent='❌ Incorrect current passphrase.';st.style.color='var(--red)';}
+}
+async function nRemovePassphrase(){
+  const st=document.getElementById('pp-status');
+  const cur=document.getElementById('pp-cur').value;
+  const sess=_nGetRawSession();
+  if(!sess||!sess.pp){st.textContent='❌ No passphrase is set.';st.style.color='var(--red)';return;}
+  try{
+    st.textContent='Verifying...';st.style.color='var(--t2)';
+    const privHex=await _nPPDecrypt(sess.pp,cur);
+    const enc=await _nEncryptPriv(privHex); // fall back to silent device-key protection
+    delete sess.pp;
+    sess.encPriv=enc.ct; sess.iv=enc.iv;
+    localStorage.setItem('mts_nostr_session',JSON.stringify(sess));
+    document.getElementById('pp-form').innerHTML='';
+    _nPPRefresh();
+    const st2=document.getElementById('pp-status'); if(st2){st2.textContent='✓ Passphrase removed.';st2.style.color='var(--green)';}
+  }catch(e){st.textContent='❌ Incorrect passphrase.';st.style.color='var(--red)';}
+}
+
+// Shown at page load in place of a silent restore, only when the saved
+// session is passphrase-protected (sess.pp present).
+function _nShowUnlockModal(s){
+  const body=document.getElementById('nunlock-body');
+  if(!body)return;
+  body.innerHTML=`<div style="font-family:var(--fm);font-size:11px;color:var(--t2);margin-bottom:10px;">Enter your passphrase to unlock your Nostr session, or skip to stay logged out.</div>
+    <div class="fgrp"><label class="flbl">Passphrase</label><input class="fin" type="password" id="nunlock-in" style="font-family:var(--fm);" onkeydown="if(event.key==='Enter')_nAttemptUnlock()"></div>
+    <div style="display:flex;gap:8px;justify-content:flex-end;"><button class="btn" onclick="_nSkipUnlock()">Skip / Stay Logged Out</button><button class="btn-p" onclick="_nAttemptUnlock()">Unlock</button></div>
+    <div id="nunlock-st" style="margin-top:10px;font-family:var(--fm);font-size:11px;color:var(--red);min-height:14px;"></div>`;
+  openM('nunlock-modal');
+  setTimeout(()=>document.getElementById('nunlock-in')?.focus(),50);
+}
+async function _nAttemptUnlock(){
+  const st=document.getElementById('nunlock-st');
+  const passphrase=document.getElementById('nunlock-in').value;
+  const s=_nGetRawSession();
+  if(!s||!s.pp){closeM('nunlock-modal');return;}
+  try{
+    st.textContent='Unlocking...';st.style.color='var(--t2)';
+    const privHex=await _nPPDecrypt(s.pp,passphrase);
+    await loadNT();
+    window._nPriv=privHex;
+    nPubkey=s.pubkey;nSigner='nsec';
+    closeM('nunlock-modal');
+    await onNC();renderNS();
+  }catch(e){
+    st.textContent='❌ Incorrect passphrase.';st.style.color='var(--red)';
+  }
+}
+function _nSkipUnlock(){
+  closeM('nunlock-modal');
+}
+
+
+async function saveNSession(){
   try{
     const sess={pubkey:nPubkey,signer:nSigner};
     if(nSigner==='nsec'&&window._nPriv){
       const priv=window._nPriv;
-      sess.priv=typeof priv==='string'?priv:Array.from(priv).map(b=>b.toString(16).padStart(2,'0')).join('');
+      const privHex=typeof priv==='string'?priv:Array.from(priv).map(b=>b.toString(16).padStart(2,'0')).join('');
+      const enc=await _nEncryptPriv(privHex);
+      sess.encPriv=enc.ct; sess.iv=enc.iv;
     }
     localStorage.setItem('mts_nostr_session',JSON.stringify(sess));
-  }catch{}
+  }catch(e){ console.error('saveNSession failed:',e); }
 }
 async function restoreNSession(){
   try{
@@ -11202,12 +11459,24 @@ async function restoreNSession(){
       }catch{}
     } else if(s.signer==='nip46'){
       nPubkey=s.pubkey;nSigner='nip46';await onNC();renderNS();
+    } else if(s.signer==='nsec'&&s.pp){
+      // Passphrase-protected: no silent decrypt possible (by design). Ask.
+      _nShowUnlockModal(s);
+    } else if(s.signer==='nsec'&&s.encPriv&&s.iv){
+      await loadNT();
+      window._nPriv=await _nDecryptPriv({ct:s.encPriv, iv:s.iv});
+      nPubkey=s.pubkey;nSigner='nsec';await onNC();renderNS();
     } else if(s.signer==='nsec'&&s.priv){
+      // One-time migration: a session saved before this fix still has the
+      // key in plaintext. Log in with it as usual, then immediately
+      // re-save (encrypted) so the plaintext copy is overwritten on disk.
       await loadNT();
       window._nPriv=s.priv;
-      nPubkey=s.pubkey;nSigner='nsec';await onNC();renderNS();
+      nPubkey=s.pubkey;nSigner='nsec';
+      await saveNSession();
+      await onNC();renderNS();
     }
-  }catch{}
+  }catch(e){ console.error('restoreNSession failed:',e); }
 }
 
 // ═══════════════════════════════════════════════════════
