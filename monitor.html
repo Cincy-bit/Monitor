@@ -8148,11 +8148,17 @@ function renderNFeed(){
     const avFallback=`<div style="width:100%;height:100%;background:var(--bg-4);display:flex;align-items:center;justify-content:center;font-size:9px;color:var(--t3);${avSrc?'display:none':''}">${esc(name).slice(0,2).toUpperCase()}</div>`;
     const replyTo=e.tags.find(t=>t[0]==='e');
     const qTag=e.tags.find(t=>t[0]==='q');
-    // Build "Replying to @username" (true replies) or "Quoted @username" (quote-posts)
-    // header. isNostrReplyEvent() is the same NIP-10 classifier used by the Posts/Replies
-    // tabs elsewhere — without it, any single unmarked e-tag (which is actually just a
-    // quote reference, not a reply) was being shown as "↩ Replying to", mislabeling quotes.
-    let feedReplyHeader = '';
+    // Build "Replying to @username" (true replies, shown above the post) or
+    // "Quoted username" (quote-posts, shown inline next to the poster's own
+    // name) header. isNostrReplyEvent() is the same NIP-10 classifier used by
+    // the Posts/Replies tabs elsewhere — without it, any single unmarked
+    // e-tag (which is actually just a quote reference, not a reply) was being
+    // shown as "↩ Replying to", mislabeling quotes.
+    let feedReplyHeader = '';   // reply-only: rendered above the post
+    let feedQuoteInline = '';  // quote-only: rendered inline in the meta row
+    let quoteRefId = null;     // set when this post quotes another note, so we
+                                // can backfill a preview card after buildNContent
+                                // runs, for quotes with no inline nostr: URI
     if (isNostrReplyEvent(e)) {
       if (replyTo) {
         const pTag = e.tags.find(t=>t[0]==='p');
@@ -8172,28 +8178,65 @@ function renderNFeed(){
       }
     } else if (replyTo || qTag) {
       const refId = qTag?.[1] || replyTo?.[1];
-      const refEv = refId ? nvEventCache[refId] : null;
+      quoteRefId = refId || null;
+      const refEv = refId ? (nvEventCache[refId] || nEvents.find(ev=>ev.id===refId)) : null;
       const refPub = refEv?.pubkey || null;
       if (refPub) {
         const qProf = nProfiles[refPub];
         const qName = qProf?.name || qProf?.display_name || trunc(refPub);
         const qPubEsc = esc(refPub);
-        feedReplyHeader = `<div style="font-family:var(--fm);font-size:10px;color:var(--t3);margin-bottom:4px;">❝ Quoted <span style="color:var(--accent);cursor:pointer;" onclick="event.stopPropagation();openNostrProfile('${qPubEsc}')">@${esc(qName)}</span></div>`;
+        feedQuoteInline = `<span style="font-family:var(--fm);font-size:10px;color:var(--t3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;">❝ Quoted <span data-npk="${qPubEsc}" style="color:var(--accent);cursor:pointer;" onclick="event.stopPropagation();openNostrProfile('${qPubEsc}')">${esc(qName)}</span></span>`;
       } else {
-        feedReplyHeader = `<div style="font-family:var(--fm);font-size:10px;color:var(--t3);margin-bottom:4px;">❝ Quoted note</div>`;
+        // Referenced note isn't cached yet — show a placeholder, then resolve
+        // it (event + profile) in the background and patch this exact header
+        // in place once we know who was quoted. Without this, quote-posts
+        // whose target note hadn't already been fetched permanently showed
+        // the generic "Quoted note" instead of the original author's name.
+        const qhId = `qh-${esc(e.id)}`;
+        feedQuoteInline = `<span id="${qhId}" style="font-family:var(--fm);font-size:10px;color:var(--t3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;">❝ Quoted note</span>`;
+        if (refId) {
+          (async()=>{
+            let rEv = nvEventCache[refId] || nEvents.find(ev=>ev.id===refId);
+            if (!rEv) {
+              rEv = await fetchEventById(refId).catch(()=>null);
+              if (rEv) nvEventCache[rEv.id] = rEv;
+            }
+            if (!rEv) return; // couldn't resolve — leave the generic label as-is
+            const el = document.getElementById(qhId);
+            if (!el) return; // post scrolled off / feed re-rendered since
+            const rPubEsc = esc(rEv.pubkey);
+            const rProf = nProfiles[rEv.pubkey] || (rEv.pubkey===nPubkey?nProfile:null);
+            const rName = esc(rProf?.name || rProf?.display_name || trunc(rEv.pubkey));
+            el.innerHTML = `❝ Quoted <span data-npk="${rPubEsc}" style="color:var(--accent);cursor:pointer;" onclick="event.stopPropagation();openNostrProfile('${rPubEsc}')">${rName}</span>`;
+            // If we didn't have the profile yet, kick off a fetch — fetchNProfiles
+            // patches any [data-npk] element for this pubkey in place once it lands,
+            // so the name above upgrades itself automatically from trunc(pubkey).
+            if (!nProfiles[rEv.pubkey] && rEv.pubkey!==nPubkey) fetchNProfiles([rEv.pubkey]);
+          })();
+        }
       }
     }
     const ct=buildNContent(e.content||'', e.id, e.tags||[]);
+    // Some quote-posts carry only a `q`/`e` tag reference to the quoted note,
+    // with no inline nostr:note/nevent URI in the text itself — buildNContent
+    // has nothing to scan for in that case, so the note referenced by the
+    // header above would otherwise never actually be shown. Append a preview
+    // card for it manually when that happens.
+    let extraQuoteCard = '';
+    if (quoteRefId && !/nostr:(?:nevent|note)/i.test(e.content||'')) {
+      extraQuoteCard = renderQuotedNoteCard(quoteRefId, `qnf-${esc(e.id)}`);
+    }
     const evId=esc(e.id), evPub=esc(e.pubkey);
     const liked=nLiked.has(e.id), reposted=nReposted.has(e.id);
     postHtmlMap[e.id]=`<div class="npost${nReplyTo?.id===e.id?' replying':''}" data-evid="${evId}" data-v="2" data-author="${evPub}" style="cursor:pointer;" onclick="openNoteView('${evId}',event)">
       ${feedReplyHeader}
       <div class="npost-meta">
         <div class="nav" data-navpk="${evPub}" style="cursor:pointer;" onclick="event.stopPropagation();openNostrProfile('${evPub}')">${avH}${avFallback}</div>
-        <span data-npk="${evPub}" style="font-family:var(--fm);font-size:11px;font-weight:500;color:${nameColor};cursor:pointer;" onclick="event.stopPropagation();openNostrProfile('${evPub}')">${esc(name)}</span>
-        <span class="npost-ago" style="font-family:var(--fm);font-size:10px;color:var(--t3);margin-left:auto;">${ago}</span>
+        <span data-npk="${evPub}" style="font-family:var(--fm);font-size:11px;font-weight:500;color:${nameColor};cursor:pointer;flex-shrink:0;" onclick="event.stopPropagation();openNostrProfile('${evPub}')">${esc(name)}</span>
+        ${feedQuoteInline}
+        <span class="npost-ago" style="font-family:var(--fm);font-size:10px;color:var(--t3);margin-left:auto;flex-shrink:0;">${ago}</span>
       </div>
-      <div style="font-size:12px;color:var(--t1);line-height:1.55;word-break:break-word;">${ct}</div>
+      <div style="font-size:12px;color:var(--t1);line-height:1.55;word-break:break-word;">${ct}${extraQuoteCard}</div>
       <div class="npost-actions" onclick="event.stopPropagation()">
         <button class="nact reply" onclick='startReply("${evId}","${evPub}",${JSON.stringify(e.content.slice(0,80))})'>↩ reply<span class="nact-count" data-type="replies" style="color:var(--t3);margin-left:3px;">${nFeedReactions[e.id]?.replies>0?fmtReactCount(nFeedReactions[e.id].replies):''}</span></button>
         <button class="nact repost${reposted?' done':''}" onclick='nRepost("${evId}","${evPub}",this)'>⇄ repost<span class="nact-count" data-type="reposts" style="color:var(--t3);margin-left:3px;">${nFeedReactions[e.id]?.reposts>0?fmtReactCount(nFeedReactions[e.id].reposts):''}</span></button>
@@ -8539,6 +8582,73 @@ function nCarouselToggleAll(cid){
   }
 }
 
+// Renders a quoted-note preview card for `noteId`. If the event is already
+// cached, renders it synchronously; otherwise renders a loading placeholder
+// and resolves + patches it in place once fetched. Shared by buildNContent
+// (for inline nostr:note/nevent mentions in post text) and the feed's
+// quote-tag fallback below (quote-posts that reference a note via a `q`/`e`
+// tag only, with no inline nostr: URI in the text for the tokenizer to find
+// — without this, those quotes rendered a header naming who was quoted but
+// no visible preview of the note itself).
+function renderQuotedNoteCard(noteId, cardId, extraRelays){
+  const qev = nvEventCache[noteId] || nEvents.find(e=>e.id===noteId) || null;
+  const noteIdEsc = esc(noteId);
+  if(qev){
+    const qprof=nProfiles[qev.pubkey]||(qev.pubkey===nPubkey?nProfile:null);
+    const qname=esc(qprof?.name||trunc(qev.pubkey));
+    const qav=qprof?.picture||'';
+    const qavSrc=qav?proxyImg(qav):'';
+    const qavH=qavSrc
+      ?`<img src="${esc(qavSrc)}" style="width:100%;height:100%;object-fit:cover;border-radius:50%;" loading="lazy" referrerpolicy="no-referrer" onerror="this.style.display='none'">`
+      :`<div style="width:100%;height:100%;background:var(--bg-4);display:flex;align-items:center;justify-content:center;font-size:8px;color:var(--t3);border-radius:50%;">${qname.slice(0,2).toUpperCase()}</div>`;
+    const qtext=esc((qev.content||'').slice(0,200))+(qev.content?.length>200?'…':'');
+    const qago=timeAgo(new Date(qev.created_at*1000));
+    if(!nProfiles[qev.pubkey]&&qev.pubkey!==nPubkey) setTimeout(()=>fetchNProfiles([qev.pubkey]),0);
+    return `<div class="quoted-note-card" onclick="event.stopPropagation();openNoteView('${noteIdEsc}',event)" title="View quoted note">
+      <div style="display:flex;align-items:center;gap:5px;margin-bottom:3px;">
+        <div style="width:16px;height:16px;flex-shrink:0;overflow:hidden;">${qavH}</div>
+        <span style="font-family:var(--fm);font-size:10px;font-weight:600;color:var(--t1);">${qname}</span>
+        <span style="font-family:var(--fm);font-size:9px;color:var(--t3);margin-left:auto;">${qago}</span>
+      </div>
+      <div style="font-size:11px;color:var(--t2);line-height:1.45;word-break:break-word;">${qtext}</div>
+    </div>`;
+  }
+  // Not cached yet — render placeholder, then fetch and patch in place
+  const idAttr = cardId ? ` id="${esc(cardId)}"` : '';
+  if(cardId){
+    fetchEventById(noteId, extraRelays).then(fetchedEv=>{
+      const el=document.getElementById(cardId);
+      if(!fetchedEv){
+        // Previously this left "Loading quoted note…" showing forever on
+        // failure. Show a clear end-state instead so it doesn't look stuck.
+        if(el) el.innerHTML=`<div style="font-family:var(--fm);font-size:10px;color:var(--t3);">📝 Quoted note unavailable</div>`;
+        return;
+      }
+      nvEventCache[fetchedEv.id]=fetchedEv;
+      if(!el) return; // post scrolled off / feed re-rendered since
+      if(!nProfiles[fetchedEv.pubkey]&&fetchedEv.pubkey!==nPubkey) fetchNProfiles([fetchedEv.pubkey]);
+      const qprof=nProfiles[fetchedEv.pubkey]||(fetchedEv.pubkey===nPubkey?nProfile:null);
+      const qname=esc(qprof?.name||trunc(fetchedEv.pubkey));
+      const qav=qprof?.picture||'';
+      const qavSrc=qav?proxyImg(qav):'';
+      const qavH=qavSrc
+        ?`<img src="${esc(qavSrc)}" style="width:100%;height:100%;object-fit:cover;border-radius:50%;" loading="lazy" referrerpolicy="no-referrer" onerror="this.style.display='none'">`
+        :`<div style="width:100%;height:100%;background:var(--bg-4);display:flex;align-items:center;justify-content:center;font-size:8px;color:var(--t3);border-radius:50%;">${qname.slice(0,2).toUpperCase()}</div>`;
+      const qtext=esc((fetchedEv.content||'').slice(0,200))+(fetchedEv.content?.length>200?'…':'');
+      const qago=timeAgo(new Date(fetchedEv.created_at*1000));
+      el.innerHTML=`<div style="display:flex;align-items:center;gap:5px;margin-bottom:3px;">
+        <div style="width:16px;height:16px;flex-shrink:0;overflow:hidden;">${qavH}</div>
+        <span style="font-family:var(--fm);font-size:10px;font-weight:600;color:var(--t1);">${qname}</span>
+        <span style="font-family:var(--fm);font-size:9px;color:var(--t3);margin-left:auto;">${qago}</span>
+      </div>
+      <div style="font-size:11px;color:var(--t2);line-height:1.45;word-break:break-word;">${qtext}</div>`;
+    });
+  }
+  return `<div class="quoted-note-card"${idAttr} onclick="event.stopPropagation();openNoteView('${noteIdEsc}',event)" title="View quoted note">
+    <div style="font-family:var(--fm);font-size:10px;color:var(--t3);">📝 Loading quoted note…</div>
+  </div>`;
+}
+
 function buildNContent(raw, evId='', pTags=[]){
   // Tokenize raw content — image/video URLs, plain URLs, nostr: refs
   const TOKEN_RE=/(https?:\/\/\S+?\.(?:jpg|jpeg|png|gif|webp)(?:\?\S*)?(?=\s|$)|https?:\/\/\S+?\.(?:mp4|mov|webm)(?:\?\S*)?(?=\s|$)|https?:\/\/\S+|nostr:(?:npub|nprofile|nevent|note|naddr)[a-zA-Z0-9]+|\b(?:npub|nprofile|nevent|note|naddr)1[a-zA-Z0-9]{20,}\b|#[a-zA-Z][a-zA-Z0-9_]+|@[A-Za-z0-9_\-.]+)/gi;
@@ -8655,69 +8765,10 @@ function buildNContent(raw, evId='', pTags=[]){
         // Fully resolved — render clickable mention pill immediately
         ct+=`<span class="nostr-mention" data-pubkey="${esc(pubkey)}" onclick="event.stopPropagation();openNostrProfile('${esc(pubkey)}')" title="${esc(pubkey)}">${esc(label)}</span>`;
       } else if(noteId){
-        // Quoted note — render inline preview card if we have it, else fetch and patch
-        const qev=nvEventCache[noteId]||nEvents.find(e=>e.id===noteId)||null;
+        // Quoted note — render inline preview card (cached synchronously, or a
+        // placeholder that resolves+patches itself once fetched).
         const cardId=evId?`qn-${evId}-${mentionIdx}`:'';
-        if(qev){
-          const qprof=nProfiles[qev.pubkey]||(qev.pubkey===nPubkey?nProfile:null);
-          const qname=esc(qprof?.name||trunc(qev.pubkey));
-          const qav=qprof?.picture||'';
-          const qavSrc=qav?proxyImg(qav):'';
-          const qavH=qavSrc
-            ?`<img src="${esc(qavSrc)}" style="width:100%;height:100%;object-fit:cover;border-radius:50%;" loading="lazy" referrerpolicy="no-referrer" onerror="this.style.display='none'">`
-            :`<div style="width:100%;height:100%;background:var(--bg-4);display:flex;align-items:center;justify-content:center;font-size:8px;color:var(--t3);border-radius:50%;">${qname.slice(0,2).toUpperCase()}</div>`;
-          const qtext=esc((qev.content||'').slice(0,200))+(qev.content?.length>200?'…':'');
-          const qago=timeAgo(new Date(qev.created_at*1000));
-          const noteIdEsc=esc(noteId);
-          ct+=`<div class="quoted-note-card" onclick="event.stopPropagation();openNoteView('${noteIdEsc}',event)" title="View quoted note">
-            <div style="display:flex;align-items:center;gap:5px;margin-bottom:3px;">
-              <div style="width:16px;height:16px;flex-shrink:0;overflow:hidden;">${qavH}</div>
-              <span style="font-family:var(--fm);font-size:10px;font-weight:600;color:var(--t1);">${qname}</span>
-              <span style="font-family:var(--fm);font-size:9px;color:var(--t3);margin-left:auto;">${qago}</span>
-            </div>
-            <div style="font-size:11px;color:var(--t2);line-height:1.45;word-break:break-word;">${qtext}</div>
-          </div>`;
-          // Queue profile fetch for quoted author if missing
-          if(!nProfiles[qev.pubkey]&&qev.pubkey!==nPubkey) setTimeout(()=>fetchNProfiles([qev.pubkey]),0);
-        } else {
-          // Not cached yet — render placeholder and fetch async
-          ct+=`<div class="quoted-note-card" id="${esc(cardId)}" onclick="event.stopPropagation();openNoteView('${esc(noteId)}',event)" title="View quoted note">
-            <div style="font-family:var(--fm);font-size:10px;color:var(--t3);">📝 Loading quoted note…</div>
-          </div>`;
-          if(cardId){
-            // Pass along any relay hints from the nevent so we can find the quoted
-            // note even when it isn't on the viewer's own relay list (the note was
-            // very likely posted by someone else, on different relays).
-            fetchEventById(noteId, noteRelays).then(qev=>{
-              if(!qev){
-                // Previously this left "Loading quoted note…" showing forever on
-                // failure. Show a clear end-state instead so it doesn't look stuck.
-                const failEl=document.getElementById(cardId);
-                if(failEl) failEl.innerHTML=`<div style="font-family:var(--fm);font-size:10px;color:var(--t3);">📝 Quoted note unavailable</div>`;
-                return;
-              }
-              nvEventCache[qev.id]=qev;
-              const el=document.getElementById(cardId);
-              if(!el) return;
-              if(!nProfiles[qev.pubkey]&&qev.pubkey!==nPubkey) fetchNProfiles([qev.pubkey]);
-              const qprof=nProfiles[qev.pubkey]||(qev.pubkey===nPubkey?nProfile:null);
-              const qname=esc(qprof?.name||trunc(qev.pubkey));
-              const qav=qprof?.picture||'';
-              const qavSrc=qav?proxyImg(qav):'';
-              const qavH=qavSrc
-                ?`<img src="${esc(qavSrc)}" style="width:100%;height:100%;object-fit:cover;border-radius:50%;" loading="lazy" referrerpolicy="no-referrer" onerror="this.style.display='none'">`
-                :`<div style="width:100%;height:100%;background:var(--bg-4);display:flex;align-items:center;justify-content:center;font-size:8px;color:var(--t3);border-radius:50%;">${qname.slice(0,2).toUpperCase()}</div>`;
-              const qtext=esc((qev.content||'').slice(0,200))+(qev.content?.length>200?'…':'');
-              const qago=timeAgo(new Date(qev.created_at*1000));
-              el.innerHTML=`<div style="display:flex;align-items:center;gap:5px;margin-bottom:3px;">
-                <div style="width:16px;height:16px;flex-shrink:0;overflow:hidden;">${qavH}</div>
-                <span style="font-family:var(--fm);font-size:10px;font-weight:600;color:var(--t1);">${qname}</span>
-                <span style="font-family:var(--fm);font-size:9px;color:var(--t3);margin-left:auto;">${qago}</span>
-              </div>
-              <div style="font-size:11px;color:var(--t2);line-height:1.45;word-break:break-word;">${qtext}</div>`;
-            });
-          }
-        }
+        ct+=renderQuotedNoteCard(noteId, cardId, noteRelays);
         mentionIdx++;
       } else {
         // Pubkey known but name not cached yet — show truncated pubkey immediately
@@ -9031,7 +9082,15 @@ async function openNoteView(evId, evt){
 // since a quoted/parent note is frequently authored by someone else and may simply not
 // exist on the viewer's own relay list. relay.nostr.band/nostr.wine are wide-coverage
 // indexers included as a last-resort fallback for the same reason.
+const _fetchEventByIdInFlight = {}; // evId -> Promise; dedupes concurrent fetchEventById calls for the same id (e.g. quote header + inline quote card both wanting the same note) so we don't open duplicate relay connections
 async function fetchEventById(evId, extraRelays){
+  if(_fetchEventByIdInFlight[evId]) return _fetchEventByIdInFlight[evId];
+  const p = _fetchEventByIdImpl(evId, extraRelays);
+  _fetchEventByIdInFlight[evId] = p;
+  p.finally(()=>{ delete _fetchEventByIdInFlight[evId]; });
+  return p;
+}
+async function _fetchEventByIdImpl(evId, extraRelays){
   const baseRelays=RELAYS.length?[...RELAYS]:['wss://relay.damus.io','wss://eden.nostr.land','wss://nos.lol','wss://relay.primal.net'];
   const relays=[...new Set([...(extraRelays||[]), ...baseRelays, 'wss://relay.nostr.band', 'wss://nostr.wine'])].slice(0,8);
   return new Promise(res=>{
