@@ -1615,11 +1615,41 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                              'isFutures': False, 'futuresSym': futures_sym,
                              'hasExtendedData': True, 'asOf': real_asof})
                 return
-            # Pre-market gap: no pre-market trades yet (low-volume ETFs, early morning).
-            # Show last regular-session close labeled PRE so the UI badge appears
-            # and the sparkline fetches includePrePost candles if/when they exist.
+            # BUG FIX: this used to fall straight through to the "PRE gap"
+            # block below whenever pre_price was 0 — which is the NORMAL
+            # case for most symbols from 4:00am right up until real
+            # pre-market volume picks up (often not until ~6-7am ET). That
+            # block showed base_price (=regularMarketPrice = YESTERDAY's
+            # already-known close, since today's regular session hasn't
+            # opened yet), silently discarding the entire evening/overnight
+            # move and resetting the displayed %/badge to a misleading
+            # flat "Pre-market" state hours before any real pre-market data
+            # exists. Keep carrying last night's post-market/overnight close
+            # (post_price — same value shown all night) and keep
+            # marketState='POST' until real pre-market trades actually
+            # appear (pre_price>0 above). The client badge now reads
+            # marketState directly (see getSessionBadge in monitor.html)
+            # instead of guessing off wall-clock alone, so this keeps the
+            # UI correctly on "Post-Market" through the whole dead zone.
+            if post_price > 0:
+                ext_pct = post_pct_vs_close or _pct(post_price, base_price) or post_pct
+                import time as _t
+                real_asof = post_time or _t.time()
+                print(f"[PRE-carry] {symbol}: past 4am, no real pre-market print yet — "
+                      f"keeping post-market close {post_price:.2f} tagged POST (real ts={post_time})")
+                send_result({'symbol': symbol, 'price': post_price, 'pct': post_pct,
+                             'extPct': ext_pct, 'extPrice': post_price,
+                             'prev': base_prev, 'marketState': 'POST',
+                             'isFutures': False, 'futuresSym': futures_sym,
+                             'hasExtendedData': True, 'asOf': real_asof})
+                return
+            # Genuine pre-market gap: no pre-market AND no post-market/overnight
+            # data at all (e.g. brand-new listing, or a symbol that never had a
+            # post-market print). Show last regular-session close labeled PRE
+            # so the UI badge still appears and the sparkline fetches
+            # includePrePost candles if/when real data shows up.
             if base_price > 0:
-                print(f"[PRE gap] {symbol}: no pre-market data yet, showing last close {base_price:.2f}")
+                print(f"[PRE gap] {symbol}: no pre-market or post-market data at all, showing last close {base_price:.2f}")
                 send_result({'symbol': symbol, 'price': base_price, 'pct': base_pct,
                              'prev': base_prev, 'marketState': 'PRE',
                              'isFutures': False, 'futuresSym': futures_sym,
