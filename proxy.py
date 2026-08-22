@@ -29,6 +29,11 @@ ssl_ctx = ssl.create_default_context()
 ssl_ctx.check_hostname = False
 ssl_ctx.verify_mode = ssl.CERT_NONE
 
+# Radar time-extent cache: base URL -> (fetched_at, (start_ms, end_ms))
+# Tiny and short-lived — just avoids hitting NOAA's metadata endpoint on every
+# single /radar-meta poll when the underlying window barely moves.
+_RADAR_META_CACHE = {}
+
 # Article date cache: url -> first-seen ISO pubDate
 # Prevents re-stamped podcast/feature articles from always appearing as "just now"
 _article_date_cache = {}
@@ -273,6 +278,12 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             self.handle_news()
         elif self.path.startswith("/weather"):
             self.handle_weather()
+        elif self.path.startswith("/radar-meta"):
+            self.handle_radar_meta()
+        elif self.path.startswith("/radar-frame"):
+            self.handle_radar_frame()
+        elif self.path.startswith("/radar-basemap"):
+            self.handle_radar_basemap()
         elif self.path.startswith("/reader?"):
             self.handle_reader()
         elif self.path.startswith("/financials"):
@@ -2699,6 +2710,246 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             self.wfile.write(json.dumps({"error": str(e)}).encode())
 
 
+    # ── Live radar (NOAA MRMS composite reflectivity — free, no API key) ──
+    #
+    # NOAA's public time-enabled radar mosaic keeps a rolling ~4-hour window
+    # of frames, refreshed roughly every 10 minutes. That's the largest
+    # window any free/no-key radar source reliably provides — RainViewer's
+    # free tier was restricted to a ~2h past-only window at low zoom as of
+    # Jan 2026, and going further back (e.g. a true 12h loop) would require
+    # either a paid archive or our own long-running snapshot cache, which
+    # isn't worth the complexity here. Two mirror hosts are tried in order
+    # in case one is down. US coverage only (CONUS/AK/HI/PR/Guam).
+    _RADAR_BASES = [
+        "https://mapservices.weather.noaa.gov/eventdriven/rest/services/radar/radar_base_reflectivity_time/ImageServer",
+        "https://idpgis.ncep.noaa.gov/arcgis/rest/services/radar/radar_base_reflectivity_time/ImageServer",
+    ]
+    _RADAR_HEADERS = {"User-Agent": "personal-dashboard contact@example.com", "Accept": "*/*"}
+
+    def _radar_time_extent(self):
+        """Return (start_ms, end_ms) for the live mosaic's current moving
+        window, trying each mirror. Cached ~3 minutes since it barely moves
+        between successive polls."""
+        now = _time.time()
+        cached = _RADAR_META_CACHE.get('extent')
+        if cached and (now - cached[0]) < 180:
+            return cached[1]
+        last_err = None
+        for base in self._RADAR_BASES:
+            try:
+                info = self._fetch_json(f"{base}?f=json", headers=self._RADAR_HEADERS)
+                ext = (info.get("timeInfo") or {}).get("timeExtent")
+                if ext and len(ext) == 2:
+                    result = (int(ext[0]), int(ext[1]))
+                    _RADAR_META_CACHE['extent'] = (now, result)
+                    return result
+            except Exception as e:
+                last_err = e
+                continue
+        raise last_err or RuntimeError("no radar time extent available from any mirror")
+
+    @staticmethod
+    def _radar_bbox(lat, lon, w, h, half_miles=140.0):
+        """Lat/lon bbox centered on (lat, lon), sized so the physical
+        ground distance matches the requested image aspect ratio (no
+        north-south/east-west stretch)."""
+        import math
+        aspect = w / float(h)
+        lat_half = half_miles / 69.0
+        lon_half = (half_miles * aspect) / (69.0 * max(math.cos(math.radians(lat)), 0.15))
+        return (lon - lon_half, lat - lat_half, lon + lon_half, lat + lat_half)
+
+    def handle_radar_meta(self):
+        """Return the list of available frame timestamps (~15 min apart)
+        across the live mosaic's reliable window (up to ~4h)."""
+        params = parse_qs(urlparse(self.path).query)
+        try:
+            lat = float(params.get('lat', [None])[0])
+            lon = float(params.get('lon', [None])[0])
+        except (TypeError, ValueError):
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "lat and lon are required"}).encode())
+            return
+        try:
+            start_ms, end_ms = self._radar_time_extent()
+            step_ms = 15 * 60 * 1000
+            frames = []
+            t = end_ms
+            while t >= start_ms and len(frames) < 17:
+                frames.append(t)
+                t -= step_ms
+            frames.reverse()
+            self.json_response({
+                "frames": frames,
+                "lat": lat,
+                "lon": lon,
+                "half_miles": 140,
+                "source": "NOAA MRMS composite reflectivity",
+                "coverage": "US only (CONUS/AK/HI/PR/Guam)",
+            })
+        except Exception as e:
+            self.send_response(502)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": f"radar metadata unavailable: {e}"}).encode())
+
+    def handle_radar_frame(self):
+        """Proxy a single radar reflectivity PNG frame for a given
+        location/time. Frames are cached (reusing the mempool disk cache
+        helpers) since a past frame never changes — only the newest one is
+        ever re-requested against a moving timestamp."""
+        params = parse_qs(urlparse(self.path).query)
+        try:
+            lat = float(params.get('lat', [None])[0])
+            lon = float(params.get('lon', [None])[0])
+            t_ms = int(params.get('t', [None])[0])
+        except (TypeError, ValueError):
+            self.send_error(400, "lat, lon and t are required")
+            return
+        try:
+            w = max(60, min(int(params.get('w', ['300'])[0] or 300), 900))
+            h = max(60, min(int(params.get('h', ['220'])[0] or 220), 700))
+        except ValueError:
+            w, h = 300, 220
+
+        cache_key = f"radar-frame:{round(lat,2)}:{round(lon,2)}:{t_ms}:{w}x{h}"
+        cached = _mempool_cache_get(cache_key, ttl=900)
+        if cached:
+            data, ct, _src = cached
+            self.send_response(200)
+            self.send_header("Content-Type", ct or "image/png")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Cache-Control", "public, max-age=300")
+            self.end_headers()
+            self.wfile.write(data)
+            return
+
+        bbox = self._radar_bbox(lat, lon, w, h)
+        last_err = None
+        for base in self._RADAR_BASES:
+            try:
+                url = (f"{base}/exportImage?bbox={bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]}"
+                       f"&bboxSR=4326&imageSR=4326&size={w},{h}&format=png&transparent=true"
+                       f"&time={t_ms}&f=image")
+                req = urllib.request.Request(url, headers=self._RADAR_HEADERS)
+                data, ct = _fetch_with_deadline(req, ssl_ctx, 6, 9)
+                if not data or len(data) < 100:
+                    raise ValueError("empty radar image response")
+                _mempool_cache_set(cache_key, data, ct or "image/png", "noaa-mrms")
+                self.send_response(200)
+                self.send_header("Content-Type", ct or "image/png")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Cache-Control", "public, max-age=300")
+                self.end_headers()
+                self.wfile.write(data)
+                return
+            except Exception as e:
+                last_err = e
+                continue
+        self.send_response(502)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(json.dumps({"error": f"radar frame unavailable: {last_err}"}).encode())
+
+    # ── Radar basemap (Esri — free, no API key) ──
+    #
+    # Gives the radar loop visual context (city names, roads, water) instead
+    # of storm cells floating on a flat background. Uses the same
+    # bbox/bboxSR/imageSR "export" REST convention as the NOAA ImageServer
+    # above (Esri MapServer supports the identical parameter set), and
+    # reuses _radar_bbox with the SAME lat/lon/w/h a caller passes to
+    # /radar-frame so the two images line up pixel-for-pixel with no extra
+    # alignment math needed client-side. Unlike radar frames, a basemap tile
+    # for a given location doesn't change, so it's cached far longer (24h).
+    #
+    # Two styles, selected by ?style=:
+    #   (default)  World_Street_Map — full labels (city/state names, roads),
+    #              used by the modal's larger Live Radar view where the
+    #              context is actually legible and useful.
+    #   plain      Canvas/World_Dark_Gray_Base — Esri's label-free "canvas"
+    #              basemap (paired with a separate Reference layer for
+    #              labels, which we deliberately don't add here), used by
+    #              the small header preview where any text just renders as
+    #              illegible clutter at that size.
+    _BASEMAP_URL = "https://services.arcgisonline.com/arcgis/rest/services/World_Street_Map/MapServer/export"
+    _BASEMAP_PLAIN_URL = "https://services.arcgisonline.com/arcgis/rest/services/Canvas/World_Dark_Gray_Base/MapServer/export"
+    _BASEMAP_HEADERS = {"User-Agent": "personal-dashboard contact@example.com", "Accept": "*/*"}
+
+    def handle_radar_basemap(self):
+        """Proxy a static basemap image for the same location/size a radar
+        frame is requested at, so it can be layered underneath."""
+        params = parse_qs(urlparse(self.path).query)
+        try:
+            lat = float(params.get('lat', [None])[0])
+            lon = float(params.get('lon', [None])[0])
+        except (TypeError, ValueError):
+            self.send_error(400, "lat and lon are required")
+            return
+        try:
+            w = max(60, min(int(params.get('w', ['300'])[0] or 300), 900))
+            h = max(60, min(int(params.get('h', ['220'])[0] or 220), 700))
+        except ValueError:
+            w, h = 300, 220
+        style = (params.get('style', [''])[0] or '').strip().lower()
+        plain = style == 'plain'
+        base_url = self._BASEMAP_PLAIN_URL if plain else self._BASEMAP_URL
+        source_tag = "esri-dark-gray-canvas" if plain else "esri-world-street-map"
+
+        cache_key = f"radar-basemap:{'plain' if plain else 'street'}:{round(lat,2)}:{round(lon,2)}:{w}x{h}"
+        cached = _mempool_cache_get(cache_key, ttl=86400)
+        if cached:
+            data, ct, _src = cached
+            self.send_response(200)
+            self.send_header("Content-Type", ct or "image/png")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Cache-Control", "public, max-age=86400")
+            self.end_headers()
+            self.wfile.write(data)
+            return
+
+        bbox = self._radar_bbox(lat, lon, w, h)
+        try:
+            url = (f"{base_url}?bbox={bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]}"
+                   f"&bboxSR=4326&imageSR=4326&size={w},{h}&format=png&f=image")
+            req = urllib.request.Request(url, headers=self._BASEMAP_HEADERS)
+            data, ct = _fetch_with_deadline(req, ssl_ctx, 6, 9)
+            if not data or len(data) < 100:
+                raise ValueError("empty basemap image response")
+            _mempool_cache_set(cache_key, data, ct or "image/png", source_tag)
+            self.send_response(200)
+            self.send_header("Content-Type", ct or "image/png")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Cache-Control", "public, max-age=86400")
+            self.end_headers()
+            self.wfile.write(data)
+        except Exception as e:
+            # Stale cache beats an error — a day-old street map is still
+            # correct (streets don't move), unlike a stale radar frame.
+            stale = _mempool_cache_get_stale(cache_key)
+            if stale:
+                data, ct, _src = stale
+                self.send_response(200)
+                self.send_header("Content-Type", ct or "image/png")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Cache-Control", "public, max-age=86400")
+                self.end_headers()
+                self.wfile.write(data)
+                return
+            self.send_response(502)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": f"basemap unavailable: {e}"}).encode())
 
 
     # ── Yahoo Finance quoteSummary (no-crumb approach, works from home IPs) ──
