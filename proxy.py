@@ -8,21 +8,56 @@ import http.server
 import urllib.request
 import urllib.error
 import json
+import base64
 import os
 import ssl
 import re
 import html
 import threading
+import io
 import time as _time
 from socketserver import ThreadingMixIn
 import urllib.parse
 from urllib.parse import urlparse, parse_qs, urljoin
 import http.client
 from email.utils import parsedate_to_datetime
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 PORT = 8082
 SERVE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def _load_carto_api_key():
+    """Resolve the CARTO API key: the CARTO_API_KEY environment variable
+    first (unchanged, existing behavior), then a local carto_api_key.txt
+    file living next to this script as a fallback.
+
+    Added because getting an env var into the *specific* shell that ends up
+    running `python3 proxy.py` has repeatedly tripped up on this project —
+    appending to ~/.zshrc (or ~/.bash_profile) only takes effect in a NEW
+    shell session (a fresh terminal window/tab, or after `source`-ing that
+    file); a terminal window that was already open when the profile was
+    edited keeps its old (keyless) environment no matter how many times the
+    proxy is restarted in it. A plain text file read fresh on every process
+    start sidesteps all of that — no shell profile, no sourcing, no need to
+    open a new window.
+
+    To use it: create a file named carto_api_key.txt in this same folder
+    (next to proxy.py) containing nothing but the key. Whitespace around it
+    is stripped. The env var still wins if both are set, so this never
+    changes behavior for a setup that already has the env var working.
+    Returns (key, source) where source is 'env', 'file', or None."""
+    env_key = os.environ.get("CARTO_API_KEY", "").strip()
+    if env_key:
+        return env_key, "env"
+    try:
+        key_path = os.path.join(SERVE_DIR, "carto_api_key.txt")
+        with open(key_path, "r") as _f:
+            file_key = _f.read().strip()
+        if file_key:
+            return file_key, "file"
+    except (FileNotFoundError, OSError):
+        pass
+    return "", None
 
 # SSL context that doesn't verify certs (for local dev)
 ssl_ctx = ssl.create_default_context()
@@ -97,9 +132,23 @@ def _mempool_cache_load():
         if os.path.exists(_MEMPOOL_CACHE_FILE):
             with open(_MEMPOOL_CACHE_FILE, "r") as f:
                 raw = json.load(f)
-            # Bodies are JSON text; stored as str, served as bytes
-            _mempool_cache = {k: (v[0], v[1].encode("utf-8"), v[2], v[3]) for k, v in raw.items()}
-            print(f"[mempool cache] restored {len(_mempool_cache)} entries from disk")
+            # Bodies (JSON text AND binary images) are stored base64-encoded
+            # so the round-trip through the JSON cache file is lossless for
+            # any byte sequence. Decode per-entry so one corrupted/legacy
+            # entry (e.g. from before this fix) can't take down the whole
+            # cache load -- it's just skipped and re-fetched live instead.
+            loaded = {}
+            skipped = 0
+            for k, v in raw.items():
+                try:
+                    loaded[k] = (v[0], base64.b64decode(v[1]), v[2], v[3])
+                except Exception:
+                    skipped += 1
+            _mempool_cache = loaded
+            msg = f"[mempool cache] restored {len(_mempool_cache)} entries from disk"
+            if skipped:
+                msg += f" ({skipped} corrupted/unreadable entries skipped)"
+            print(msg)
     except Exception as e:
         print(f"[mempool cache] disk load failed: {e}")
         _mempool_cache = {}
@@ -112,7 +161,10 @@ def _mempool_cache_save(force=False):
         return
     try:
         with _mempool_cache_lock:
-            raw = {k: [v[0], v[1].decode("utf-8", errors="replace"), v[2], v[3]] for k, v in _mempool_cache.items()}
+            # base64 round-trips ANY bytes losslessly (unlike utf-8 decode,
+            # which silently corrupts binary data like PNG bytes -- see the
+            # module-level comment above _mempool_cache_load).
+            raw = {k: [v[0], base64.b64encode(v[1]).decode("ascii"), v[2], v[3]] for k, v in _mempool_cache.items()}
             _mempool_cache_dirty = False
             _mempool_cache_last_save = now
         with open(_MEMPOOL_CACHE_FILE, "w") as f:
@@ -248,6 +300,279 @@ ALLOWED_ORIGINS = [
     "www.foxsports.com",
 ]
 
+
+# ── HRRR future radar frames (NOAA's short-term weather MODEL — a genuine
+# physics-based forecast, not pixel-extrapolation) ──
+#
+# Pure pixel-advection nowcasting (sliding existing radar echoes along
+# their current motion vector) only stays physically meaningful for
+# roughly 30-60 minutes — it can't predict storms forming, dissipating, or
+# changing direction. A "couple hours" forecast needs an actual model.
+# HRRR (High-Resolution Rapid Refresh) is NOAA's free, no-key, hourly-
+# updated, radar-assimilated 3km model, and — importantly — it natively
+# outputs a field called REFC (Composite Reflectivity, in dBZ): the SAME
+# physical quantity and units as the live MRMS radar this app already
+# shows, so future frames can share the live frames' color language
+# instead of needing a visually different bolt-on.
+#
+# Fetched via NOAA's NOMADS "grib-filter" CGI endpoint, which subsets a
+# single field + region server-side — this avoids downloading a full
+# multi-hundred-MB model file just to get one small field for one small
+# area. NOMADS asks that requests be paced (a short pause between them),
+# respected below.
+#
+# HONESTLY UNVERIFIED (no network, no pygrib in this sandbox — the same
+# category of limitation already flagged for the pysteps nowcasting work
+# earlier in this project): the exact sub-hourly file naming convention
+# (wrfsubhf{NN}.grib2 is a well-informed best guess, not confirmed against
+# a live NOMADS directory listing) and the real publish latency after a
+# run's nominal init hour. Both fail SAFELY though — a bad sub-hourly guess
+# just degrades to hourly-only steps (see _fetch_hrrr_grib_messages'
+# caller), and a bad latency guess just means _hrrr_candidate_runs tries a
+# few more hours back until one actually works. First live run is the real
+# check; if the sub-hourly step is silently missing from the frame list,
+# that file-naming guess is the first thing to inspect.
+try:
+    import numpy as _hrrr_np
+    _HRRR_NUMPY_OK = True
+except Exception:
+    _HRRR_NUMPY_OK = False
+
+try:
+    import pygrib as _pygrib
+    _HRRR_PYGRIB_OK = True
+except Exception:
+    _HRRR_PYGRIB_OK = False
+
+HRRR_AVAILABLE = _HRRR_NUMPY_OK and _HRRR_PYGRIB_OK
+
+import tempfile as _tempfile
+
+_HRRR_2D_FILTER_URL = "https://nomads.ncep.noaa.gov/cgi-bin/filter_hrrr_2d.pl"
+_HRRR_SUB_FILTER_URL = "https://nomads.ncep.noaa.gov/cgi-bin/filter_hrrr_sub.pl"
+_HRRR_HEADERS = {"User-Agent": "personal-dashboard contact@example.com", "Accept": "*/*"}
+# Conservative guess at how long after a run's nominal init hour NCEP has
+# actually finished publishing its surface fields. If the freshest guessed
+# run is consistently unavailable on a live check, widen this first.
+_HRRR_PUBLISH_LATENCY_MIN = 80
+_HRRR_MAX_RUN_LOOKBACK = 3   # try up to this many hours further back if the
+                             # freshest guess isn't actually published yet
+_HRRR_NOMADS_PAUSE_S = 1.5   # NOMADS asks callers to pace requests
+
+
+def _hrrr_candidate_runs(now_dt=None):
+    """Ordered list (newest first) of candidate HRRR run init datetimes to
+    try, most-likely-already-published first."""
+    now_dt = now_dt or datetime.now(timezone.utc)
+    guess = (now_dt - timedelta(minutes=_HRRR_PUBLISH_LATENCY_MIN)).replace(minute=0, second=0, microsecond=0)
+    return [guess - timedelta(hours=i) for i in range(_HRRR_MAX_RUN_LOOKBACK + 1)]
+
+
+def _hrrr_future_targets(run_dt, now_dt=None, total_minutes=180):
+    """Ordered list of {'valid_dt','elapsed_min','forecast_hour','subhourly'}
+    describing which HRRR outputs to fetch for one run: 15-min steps for
+    the portion of the first forecast hour that's still ahead of `now_dt`,
+    hourly beyond that, up to total_minutes past now_dt. Every HRRR output
+    step is some whole multiple of 15 minutes after run_dt (sub-hourly:
+    0/15/30/45/60, hourly beyond: 60/120/180/...); candidates before
+    `now_dt` are skipped, which is what naturally makes the returned list
+    start close to "now" even though run_dt itself is roughly
+    `_HRRR_PUBLISH_LATENCY_MIN` minutes in the past."""
+    now_dt = now_dt or datetime.now(timezone.utc)
+    end_dt = now_dt + timedelta(minutes=total_minutes)
+    out = []
+    elapsed = 0
+    while True:
+        valid_dt = run_dt + timedelta(minutes=elapsed)
+        if valid_dt > end_dt:
+            break
+        if valid_dt >= now_dt:
+            out.append({
+                'valid_dt': valid_dt,
+                'elapsed_min': elapsed,
+                'forecast_hour': elapsed // 60,
+                'subhourly': elapsed <= 60 and elapsed % 60 != 0,
+            })
+        elapsed += 15 if elapsed < 60 else 60
+    return out
+
+
+def _hrrr_run_dir(run_dt):
+    return f"/hrrr.{run_dt.strftime('%Y%m%d')}/conus"
+
+
+def _hrrr_2d_url(run_dt, forecast_hour, bbox):
+    lon_min, lat_min, lon_max, lat_max = bbox
+    return (f"{_HRRR_2D_FILTER_URL}?dir={_hrrr_run_dir(run_dt)}"
+            f"&file=hrrr.t{run_dt.strftime('%H')}z.wrfsfcf{forecast_hour:02d}.grib2"
+            f"&var_REFC=on&subregion="
+            f"&toplat={lat_max}&bottomlat={lat_min}&leftlon={lon_min}&rightlon={lon_max}")
+
+
+def _hrrr_sub_url(run_dt, forecast_hour, bbox):
+    lon_min, lat_min, lon_max, lat_max = bbox
+    return (f"{_HRRR_SUB_FILTER_URL}?dir={_hrrr_run_dir(run_dt)}"
+            f"&file=hrrr.t{run_dt.strftime('%H')}z.wrfsubhf{forecast_hour:02d}.grib2"
+            f"&var_REFC=on&subregion="
+            f"&toplat={lat_max}&bottomlat={lat_min}&leftlon={lon_min}&rightlon={lon_max}")
+
+
+def _fetch_hrrr_grib_messages(url):
+    """Fetch a NOMADS grib-filter response and return pygrib message
+    objects from it. Writes to a temp file since pygrib needs a real
+    filesystem path, not bytes."""
+    req = urllib.request.Request(url, headers=_HRRR_HEADERS)
+    data, _ct = _fetch_with_deadline(req, ssl_ctx, 12, 25)
+    if not data or len(data) < 50:
+        raise ValueError("empty HRRR grib response")
+    fd, path = _tempfile.mkstemp(suffix=".grib2")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        grbs = _pygrib.open(path)
+        messages = list(grbs)
+        grbs.close()
+        return messages
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _hrrr_pick_message_by_time(messages, valid_dt):
+    """Match a specific sub-hourly message by its OWN reported valid time
+    rather than assuming message order/index — the sub-hourly file's
+    internal structure is the single least-certain part of this
+    integration, so trust pygrib's own per-message metadata over a
+    positional guess."""
+    for msg in messages:
+        try:
+            msg_valid = msg.validDate
+            if msg_valid.tzinfo is None:
+                msg_valid = msg_valid.replace(tzinfo=timezone.utc)
+            if abs((msg_valid - valid_dt).total_seconds()) < 60:
+                return msg
+        except Exception:
+            continue
+    return None
+
+
+# NWS-style composite reflectivity color scale (dBZ -> RGB), approximating
+# the standard scale NOAA's own MRMS renderer uses, so a future HRRR frame
+# doesn't look like a visually different product from the live frames
+# right before it in the same loop.
+_HRRR_DBZ_RAMP = [
+    (5, (100, 180, 255)),
+    (15, (60, 140, 255)),
+    (25, (60, 200, 90)),
+    (35, (250, 230, 60)),
+    (45, (250, 150, 40)),
+    (55, (230, 50, 50)),
+    (65, (200, 40, 180)),
+    (75, (255, 255, 255)),
+]
+
+
+def _hrrr_dbz_to_rgba(arr):
+    """arr: 2D numpy array (or masked array) of dBZ values. Returns an
+    (H,W,4) uint8 RGBA array — masked/NaN/below-first-threshold pixels are
+    fully transparent, same "unknown is not the same as clear" reasoning
+    used for the nowcast NaN-edge handling elsewhere in this project."""
+    filled = _hrrr_np.ma.filled(arr, _hrrr_np.nan) if _hrrr_np.ma.isMaskedArray(arr) else _hrrr_np.asarray(arr, dtype='float64')
+    h, w = filled.shape
+    out = _hrrr_np.zeros((h, w, 4), dtype=_hrrr_np.uint8)
+    valid = ~_hrrr_np.isnan(filled)
+    below_first = valid & (filled < _HRRR_DBZ_RAMP[0][0])
+    out[~valid | below_first, 3] = 0
+    for i, (thresh, (r, g, b)) in enumerate(_HRRR_DBZ_RAMP):
+        hi = _HRRR_DBZ_RAMP[i + 1][0] if i + 1 < len(_HRRR_DBZ_RAMP) else float('inf')
+        band = valid & (filled >= thresh) & (filled < hi)
+        out[band, 0] = r
+        out[band, 1] = g
+        out[band, 2] = b
+        out[band, 3] = 200
+    return out
+
+
+_HRRR_CACHE = {}
+_HRRR_CACHE_LOCK = threading.Lock()
+_HRRR_COMPUTE_LOCKS = {}
+_HRRR_CACHE_TTL = 70 * 60  # a bit past HRRR's own ~hourly update cadence
+
+
+def _hrrr_compute_lock(key):
+    with _HRRR_CACHE_LOCK:
+        lk = _HRRR_COMPUTE_LOCKS.get(key)
+        if lk is None:
+            lk = threading.Lock()
+            _HRRR_COMPUTE_LOCKS[key] = lk
+        return lk
+
+
+def _hrrr_cache_get(key, ttl=_HRRR_CACHE_TTL):
+    with _HRRR_CACHE_LOCK:
+        entry = _HRRR_CACHE.get(key)
+        if entry and (_time.time() - entry[0]) < ttl:
+            return entry[1]
+    return None
+
+
+def _hrrr_cache_set(key, value):
+    with _HRRR_CACHE_LOCK:
+        _HRRR_CACHE[key] = (_time.time(), value)
+        if len(_HRRR_CACHE) > 30:
+            oldest = sorted(_HRRR_CACHE.items(), key=lambda kv: kv[1][0])[:15]
+            for k, _ in oldest:
+                del _HRRR_CACHE[k]
+
+
+def _compute_hrrr_future(lat, lon, w, h, total_minutes=180):
+    """Find the freshest published HRRR run, fetch REFC for each target
+    valid time, and render each to a color-mapped PNG at the requested
+    size. Returns {'run_init_ms', 'frames': [{'valid_ms','png'}, ...]}."""
+    if not HRRR_AVAILABLE:
+        raise RuntimeError("HRRR dependencies (pygrib/numpy) not installed")
+    from PIL import Image
+    bbox = ProxyHandler._radar_bbox(lat, lon, w, h)
+    now_dt = datetime.now(timezone.utc)
+
+    last_err = None
+    for run_dt in _hrrr_candidate_runs(now_dt):
+        try:
+            targets = _hrrr_future_targets(run_dt, now_dt, total_minutes)
+            if not targets:
+                continue
+            frames = []
+            subh_cache = {}  # multiple 15-min targets share ONE sub-hourly file
+            for tgt in targets:
+                if tgt['subhourly']:
+                    fh = tgt['forecast_hour']
+                    if fh not in subh_cache:
+                        subh_cache[fh] = _fetch_hrrr_grib_messages(_hrrr_sub_url(run_dt, fh, bbox))
+                        _time.sleep(_HRRR_NOMADS_PAUSE_S)
+                    msg = _hrrr_pick_message_by_time(subh_cache[fh], tgt['valid_dt'])
+                else:
+                    messages = _fetch_hrrr_grib_messages(_hrrr_2d_url(run_dt, tgt['forecast_hour'], bbox))
+                    _time.sleep(_HRRR_NOMADS_PAUSE_S)
+                    msg = messages[0] if messages else None
+                if msg is None:
+                    continue
+                rgba = _hrrr_dbz_to_rgba(msg.values)
+                img = Image.fromarray(rgba, mode="RGBA").resize((w, h), Image.LANCZOS)
+                buf = io.BytesIO()
+                img.save(buf, format="PNG")
+                frames.append({'valid_ms': int(tgt['valid_dt'].timestamp() * 1000), 'png': buf.getvalue()})
+            if frames:
+                return {'run_init_ms': int(run_dt.timestamp() * 1000), 'frames': frames}
+            last_err = RuntimeError("no frames could be parsed for this run")
+        except Exception as e:
+            last_err = e
+            print(f"[hrrr] run {run_dt.isoformat()} failed: {e}", flush=True)
+            continue
+    raise last_err or RuntimeError("no HRRR run available")
+
+
 class ProxyHandler(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=SERVE_DIR, **kwargs)
@@ -284,6 +609,10 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             self.handle_radar_frame()
         elif self.path.startswith("/radar-basemap"):
             self.handle_radar_basemap()
+        elif self.path.startswith("/radar-future-meta"):
+            self.handle_radar_future_meta()
+        elif self.path.startswith("/radar-future-frame"):
+            self.handle_radar_future_frame()
         elif self.path.startswith("/reader?"):
             self.handle_reader()
         elif self.path.startswith("/financials"):
@@ -2743,9 +3072,12 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                     result = (int(ext[0]), int(ext[1]))
                     _RADAR_META_CACHE['extent'] = (now, result)
                     return result
+                print(f"[radar] {base}: response had no usable timeExtent")
             except Exception as e:
+                print(f"[radar] time-extent fetch failed for {base}: {e}", flush=True)
                 last_err = e
                 continue
+        print(f"[radar] time extent unavailable from any mirror — last error: {last_err}", flush=True)
         raise last_err or RuntimeError("no radar time extent available from any mirror")
 
     @staticmethod
@@ -2776,12 +3108,37 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         try:
             start_ms, end_ms = self._radar_time_extent()
             step_ms = 15 * 60 * 1000
+            # NOAA's advertised time extent runs slightly ahead of when the
+            # mosaic tiles for that exact timestamp are actually finished
+            # compositing. Requesting a time right at (or within a few
+            # minutes of) the advertised "latest" often returns a valid,
+            # error-free, but EMPTY image — no reflectivity data anywhere in
+            # the bbox — because that slice hasn't finished building yet.
+            # This surfaces as the newest frame(s) in the loop rendering as
+            # a blank basemap with nothing over it, right after a frame just
+            # 15 min older shows real storm data — a data-availability lag,
+            # not a fetch failure, so it never raises and never hits the
+            # except branch below. Cap how recent a frame we'll ever offer
+            # by a fixed buffer so we don't serve timestamps NOAA hasn't
+            # actually finished compositing yet. 10 min is a conservative
+            # estimate of typical MRMS mosaic latency; if blank latest-
+            # frames are still seen, this is the first value to increase.
+            RADAR_LAG_BUFFER_MS = 10 * 60 * 1000
+            now_ms = int(_time.time() * 1000)
+            capped_end_ms = min(end_ms, now_ms - RADAR_LAG_BUFFER_MS)
+            # Don't let the cap collapse the window to nothing if the
+            # advertised extent is already narrower than the buffer (e.g.
+            # right after NOAA's own service restarts) — fall back to the
+            # uncapped end rather than return zero frames.
+            if capped_end_ms < start_ms:
+                capped_end_ms = end_ms
             frames = []
-            t = end_ms
+            t = capped_end_ms
             while t >= start_ms and len(frames) < 17:
                 frames.append(t)
                 t -= step_ms
             frames.reverse()
+
             self.json_response({
                 "frames": frames,
                 "lat": lat,
@@ -2791,6 +3148,7 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                 "coverage": "US only (CONUS/AK/HI/PR/Guam)",
             })
         except Exception as e:
+            print(f"[radar] /radar-meta failed for lat={lat} lon={lon}: {e}", flush=True)
             self.send_response(502)
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
@@ -2850,41 +3208,198 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                 self.wfile.write(data)
                 return
             except Exception as e:
+                print(f"[radar] frame fetch failed for {base} (lat={lat} lon={lon} t={t_ms}): {e}", flush=True)
                 last_err = e
                 continue
+        print(f"[radar] frame unavailable from any mirror for lat={lat} lon={lon} t={t_ms}: {last_err}", flush=True)
         self.send_response(502)
         self.send_header("Content-Type", "application/json")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(json.dumps({"error": f"radar frame unavailable: {last_err}"}).encode())
 
-    # ── Radar basemap (Esri — free, no API key) ──
+    # ── Radar basemap (CARTO Dark Matter — free, no API key) ──
     #
-    # Gives the radar loop visual context (city names, roads, water) instead
-    # of storm cells floating on a flat background. Uses the same
-    # bbox/bboxSR/imageSR "export" REST convention as the NOAA ImageServer
-    # above (Esri MapServer supports the identical parameter set), and
-    # reuses _radar_bbox with the SAME lat/lon/w/h a caller passes to
-    # /radar-frame so the two images line up pixel-for-pixel with no extra
-    # alignment math needed client-side. Unlike radar frames, a basemap tile
-    # for a given location doesn't change, so it's cached far longer (24h).
+    # Gives the radar loop visual context (state/country borders, coastline,
+    # water, roads) instead of storm cells floating on a flat background.
+    # Reuses _radar_bbox with the SAME lat/lon/w/h a caller passes to
+    # /radar-frame so the two images cover the same ground extent. Unlike
+    # radar frames, a basemap for a given location doesn't change, so it's
+    # cached far longer (24h).
+    #
+    # v2.9.43 — switched off Esri (Canvas/World_Dark_Gray_Base + _Reference,
+    # World_Street_Map) after actually reading Esri's own live service
+    # descriptions rather than assuming: World_Dark_Gray_Reference's
+    # description says, verbatim, "This layer provides labels for selected
+    # cities and towns ... in support of the World Dark Gray Base map" — it
+    # is ONLY a labels layer, not boundaries/coastline/roads, so every prior
+    # version compositing it over Base (v2.9.17 - v2.9.42) could only ever
+    # add unwanted text, never the state/coastline lines that were actually
+    # the point — explaining exactly the two symptoms reported (light/
+    # unlined main map, labeled-but-still-unlined mini map). Esri has no
+    # separate "boundaries + water, no labels" service to pair with Base
+    # instead — their boundary reference layers bundle labels in with the
+    # lines. CARTO's Dark Matter basemap is built specifically to split into
+    # a "dark_all" (labeled) / "dark_nolabels" (identical cartography, label
+    # layer switched off) pair, which is exactly what's needed for a
+    # labeled main map + unlabeled-but-still-lined mini preview, so this
+    # replaces the Esri approach rather than continuing to extend something
+    # that structurally can't do it. Free, standard OSM+CARTO attribution
+    # (see the credit line next to the modal's radar section) — CARTO's
+    # anonymous no-key tier now requires a free API key as of their recent
+    # policy change (confirmed via CARTO's own current FAQ,
+    # docs.carto.com/faqs/carto-basemaps): requests without one still
+    # return a normal, correctly-typed PNG — no fetch error, nothing this
+    # code could detect on its own — but the tile is stamped with a
+    # repeated "API key required" watermark in place of usable cartography,
+    # which is exactly what "map lines/ocean lines are gone" looks like.
+    # Get a free key (no CARTO account needed, ~1 minute) at
+    # https://carto.com/basemaps/apikey and set CARTO_API_KEY — see
+    # _CARTO_API_KEY below.
+    #
+    # CARTO serves this as 256px Web Mercator XYZ tiles, not a single
+    # bbox->image export, so _build_basemap_image() fetches every tile
+    # touching _radar_bbox()'s lat/lon box at a zoom level chosen to roughly
+    # match the requested pixel width, stitches them with Pillow, and crops
+    # to the exact bbox before resizing to w x h. Web Mercator's vertical
+    # scale differs slightly from the plain equirectangular bbox the NOAA
+    # radar frame itself is rendered in (bboxSR=4326, no reprojection), but
+    # over the ~280-mile-wide window this app uses (_radar_bbox's default
+    # half_miles=140) that difference is a small fraction of one percent —
+    # not visible layered under a semi-transparent radar overlay. Requires
+    # Pillow (`pip install Pillow`), same dependency the old approach added.
     #
     # Two styles, selected by ?style=:
-    #   (default)  World_Street_Map — full labels (city/state names, roads),
-    #              used by the modal's larger Live Radar view where the
-    #              context is actually legible and useful.
-    #   plain      Canvas/World_Dark_Gray_Base — Esri's label-free "canvas"
-    #              basemap (paired with a separate Reference layer for
-    #              labels, which we deliberately don't add here), used by
-    #              the small header preview where any text just renders as
-    #              illegible clutter at that size.
-    _BASEMAP_URL = "https://services.arcgisonline.com/arcgis/rest/services/World_Street_Map/MapServer/export"
-    _BASEMAP_PLAIN_URL = "https://services.arcgisonline.com/arcgis/rest/services/Canvas/World_Dark_Gray_Base/MapServer/export"
-    _BASEMAP_HEADERS = {"User-Agent": "personal-dashboard contact@example.com", "Accept": "*/*"}
+    #   (default)  dark_all      — labels included (city/state names),
+    #              used by the modal's larger Live Radar view where labels
+    #              are legible and wanted.
+    #   plain      dark_nolabels — the SAME borders/coastline/water/roads,
+    #              label layer off, used by the small header mini-preview
+    #              where text is illegible at 40x30px and was just noise.
+    _CARTO_TILE_URL = "https://{s}.basemaps.cartocdn.com/{style}/{z}/{x}/{y}.png"
+    _CARTO_SUBDOMAINS = ["a", "b", "c", "d"]
+    _CARTO_HEADERS = {"User-Agent": "personal-dashboard contact@example.com", "Accept": "image/png,*/*"}
+    _CARTO_MAX_TILES = 30  # sanity cap — a bad zoom pick should error, not fetch hundreds of tiles
+    # CARTO's anonymous (no-key) raster tile endpoint now returns a valid,
+    # correctly-typed PNG even without a key — it just has a repeated
+    # "API key required" watermark stamped over the cartography instead of
+    # the actual state/coastline/road lines. That's why this silently
+    # "worked" (no fetch error, no code bug) while still visually showing
+    # no lines. A free key removes the watermark; get one (no CARTO account
+    # needed, ~1 minute) at https://carto.com/basemaps/apikey and set
+    # CARTO_API_KEY. Runs without one — same graceful-when-unset pattern as
+    # FMP_API_KEY above — but the tiles will carry that watermark until set.
+    # Resolved via _load_carto_api_key() (env var, then carto_api_key.txt
+    # fallback — see that function's docstring) rather than os.environ.get
+    # directly, since the env-var-only path has been the actual recurring
+    # failure point in practice, not this fetch/cache logic below it.
+    _CARTO_API_KEY, _CARTO_API_KEY_SOURCE = _load_carto_api_key()
+
+    @staticmethod
+    def _lonlat_to_tilepx(lon, lat, zoom):
+        """Fractional (x, y) pixel coordinates in this zoom's full tile
+        mosaic (256px tiles, standard OSM/Web Mercator slippy-map
+        convention: x grows eastward from the antimeridian, y grows
+        southward from the north pole)."""
+        import math
+        lat = max(min(lat, 85.05112878), -85.05112878)  # Web Mercator's valid range
+        n = 2.0 ** zoom
+        x = (lon + 180.0) / 360.0 * n * 256.0
+        lat_rad = math.radians(lat)
+        y = (1.0 - math.log(math.tan(lat_rad) + 1.0 / math.cos(lat_rad)) / math.pi) / 2.0 * n * 256.0
+        return x, y
+
+    @staticmethod
+    def _pick_carto_zoom(lon_min, lon_max, target_w):
+        """Smallest zoom whose tile grid gives at least target_w pixels
+        across the bbox's longitude span, so the final crop is a downscale
+        (sharp) rather than an upscale (blurry). Capped to CARTO's
+        documented 0-20 zoom range."""
+        span = max(lon_max - lon_min, 1e-6)
+        for z in range(2, 19):
+            px_span = span / 360.0 * (2 ** z) * 256.0
+            if px_span >= target_w:
+                return z
+        return 18
+
+    @classmethod
+    def _fetch_carto_tile(cls, z, x, y, style):
+        """Fetch one 256x256 tile, trying each subdomain in turn. Raises
+        if all of them fail."""
+        last_err = None
+        for sd in cls._CARTO_SUBDOMAINS:
+            url = cls._CARTO_TILE_URL.format(s=sd, style=style, z=z, x=x, y=y)
+            if cls._CARTO_API_KEY:
+                url += f"?key={cls._CARTO_API_KEY}"
+            try:
+                req = urllib.request.Request(url, headers=cls._CARTO_HEADERS)
+                data, ct = _fetch_with_deadline(req, ssl_ctx, 5, 8)
+                if not data or len(data) < 100:
+                    raise ValueError(f"tile {z}/{x}/{y}: empty response")
+                if not (ct or '').startswith('image/'):
+                    raise ValueError(f"tile {z}/{x}/{y}: non-image response (Content-Type={ct!r})")
+                return data
+            except Exception as e:
+                last_err = e
+                continue
+        raise last_err or RuntimeError(f"tile {z}/{x}/{y} unavailable from any CARTO subdomain")
+
+    @classmethod
+    def _build_basemap_image(cls, lat, lon, w, h, carto_style):
+        """Fetch and stitch the CARTO tiles covering _radar_bbox(lat,lon,w,h),
+        crop to the exact bbox, and resize to (w, h). Returns PNG bytes."""
+        from PIL import Image
+        bbox = cls._radar_bbox(lat, lon, w, h)  # (lon_min, lat_min, lon_max, lat_max)
+        zoom = cls._pick_carto_zoom(bbox[0], bbox[2], w)
+        # y is inverted vs lat (Web Mercator y grows southward), so the
+        # NORTH edge (lat_max) maps to the SMALLER y pixel coordinate.
+        x0_px, y0_px = cls._lonlat_to_tilepx(bbox[0], bbox[3], zoom)  # top-left    (lon_min, lat_max)
+        x1_px, y1_px = cls._lonlat_to_tilepx(bbox[2], bbox[1], zoom)  # bottom-right(lon_max, lat_min)
+        tx0, ty0 = int(x0_px // 256), int(y0_px // 256)
+        tx1, ty1 = int(x1_px // 256), int(y1_px // 256)
+        n_tiles_side = int(2 ** zoom)
+        tile_count = (tx1 - tx0 + 1) * (ty1 - ty0 + 1)
+        if tile_count < 1 or tile_count > cls._CARTO_MAX_TILES:
+            raise ValueError(f"basemap would need {tile_count} tiles at zoom {zoom} — bbox/zoom math is off")
+        canvas = Image.new("RGB", ((tx1 - tx0 + 1) * 256, (ty1 - ty0 + 1) * 256))
+        for ty in range(ty0, ty1 + 1):
+            if not (0 <= ty < n_tiles_side):
+                continue  # off the top/bottom of the mosaic — never happens for a US radar location
+            for tx in range(tx0, tx1 + 1):
+                wrapped_tx = tx % n_tiles_side  # antimeridian wrap, harmless no-op for US locations
+                tile_data = cls._fetch_carto_tile(zoom, wrapped_tx, ty, carto_style)
+                tile_img = Image.open(io.BytesIO(tile_data)).convert("RGB")
+                canvas.paste(tile_img, ((tx - tx0) * 256, (ty - ty0) * 256))
+        crop_box = (
+            int(round(x0_px - tx0 * 256)),
+            int(round(y0_px - ty0 * 256)),
+            int(round(x1_px - tx0 * 256)),
+            int(round(y1_px - ty0 * 256)),
+        )
+        cropped = canvas.crop(crop_box)
+        resized = cropped.resize((w, h), Image.LANCZOS)
+        out = io.BytesIO()
+        resized.save(out, format="PNG")
+        return out.getvalue()
 
     def handle_radar_basemap(self):
         """Proxy a static basemap image for the same location/size a radar
-        frame is requested at, so it can be layered underneath."""
+        frame is requested at, so it can be layered underneath.
+
+        IMPORTANT: every response below sends Cache-Control: no-store, even
+        though this server already has its own internal cache (via
+        _mempool_cache, keyed by lat/lon/size/style AND whether a CARTO key
+        is configured — see cache_key below). That's deliberate, not an
+        oversight: a long browser-side cache (this used to send
+        `public, max-age=86400`) caused a real bug — a browser that loaded
+        a watermarked tile before CARTO_API_KEY was set would keep serving
+        that same broken image from ITS OWN cache for a full day,
+        completely unaffected by fixing the key, restarting the proxy, or
+        even reverting the whole file. No-store makes the server (whose own
+        cache already self-invalidates correctly on key changes) the single
+        source of truth, instead of two independent caches that can
+        disagree.
+        """
         params = parse_qs(urlparse(self.path).query)
         try:
             lat = float(params.get('lat', [None])[0])
@@ -2899,10 +3414,17 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             w, h = 300, 220
         style = (params.get('style', [''])[0] or '').strip().lower()
         plain = style == 'plain'
-        base_url = self._BASEMAP_PLAIN_URL if plain else self._BASEMAP_URL
-        source_tag = "esri-dark-gray-canvas" if plain else "esri-world-street-map"
+        carto_style = "dark_nolabels" if plain else "dark_all"
+        source_tag = f"carto-{carto_style}"
 
-        cache_key = f"radar-basemap:{'plain' if plain else 'street'}:{round(lat,2)}:{round(lon,2)}:{w}x{h}"
+        # cache key versioned (":v4:") so this fix isn't masked by a stale
+        # 24h-cached watermarked image from before CARTO_API_KEY was set —
+        # also folds in whether a key is actually configured right now, so
+        # setting/unsetting CARTO_API_KEY self-invalidates immediately
+        # instead of serving a stale watermarked (or stale keyed) tile for
+        # up to a day after the env var changes.
+        keyed_tag = 'keyed' if self._CARTO_API_KEY else 'unkeyed'
+        cache_key = f"radar-basemap:{'plain' if plain else 'street'}:v4:{keyed_tag}:{round(lat,2)}:{round(lon,2)}:{w}x{h}"
         cached = _mempool_cache_get(cache_key, ttl=86400)
         if cached:
             data, ct, _src = cached
@@ -2910,38 +3432,36 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             self.send_header("Content-Type", ct or "image/png")
             self.send_header("Content-Length", str(len(data)))
             self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Cache-Control", "public, max-age=86400")
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(data)
             return
 
-        bbox = self._radar_bbox(lat, lon, w, h)
         try:
-            url = (f"{base_url}?bbox={bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]}"
-                   f"&bboxSR=4326&imageSR=4326&size={w},{h}&format=png&f=image")
-            req = urllib.request.Request(url, headers=self._BASEMAP_HEADERS)
-            data, ct = _fetch_with_deadline(req, ssl_ctx, 6, 9)
-            if not data or len(data) < 100:
-                raise ValueError("empty basemap image response")
-            _mempool_cache_set(cache_key, data, ct or "image/png", source_tag)
+            data = self._build_basemap_image(lat, lon, w, h, carto_style)
+            ct = "image/png"
+            _mempool_cache_set(cache_key, data, ct, source_tag)
             self.send_response(200)
-            self.send_header("Content-Type", ct or "image/png")
+            self.send_header("Content-Type", ct)
             self.send_header("Content-Length", str(len(data)))
             self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Cache-Control", "public, max-age=86400")
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(data)
         except Exception as e:
-            # Stale cache beats an error — a day-old street map is still
-            # correct (streets don't move), unlike a stale radar frame.
+            hint = " — run: pip install Pillow" if isinstance(e, ImportError) else ""
+            print(f"[radar] basemap fetch failed for lat={lat} lon={lon}: {e}{hint}", flush=True)
+            # Stale cache beats an error — a day-old basemap is still
+            # correct (streets/borders don't move), unlike a stale radar frame.
             stale = _mempool_cache_get_stale(cache_key)
             if stale:
+                print(f"[radar] basemap: serving stale cache for lat={lat} lon={lon}", flush=True)
                 data, ct, _src = stale
                 self.send_response(200)
                 self.send_header("Content-Type", ct or "image/png")
                 self.send_header("Content-Length", str(len(data)))
                 self.send_header("Access-Control-Allow-Origin", "*")
-                self.send_header("Cache-Control", "public, max-age=86400")
+                self.send_header("Cache-Control", "no-store")
                 self.end_headers()
                 self.wfile.write(data)
                 return
@@ -2951,6 +3471,121 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps({"error": f"basemap unavailable: {e}"}).encode())
 
+
+    # ── HRRR future radar (composite reflectivity model forecast) ──
+    #
+    # Companion to /radar-frame (past+live) and the disk archive above —
+    # this covers the FUTURE side of the same timeline. /radar-future-meta
+    # is cheap (schedule math only, no HRRR fetch) so the frontend can
+    # check availability and get the exact target times before committing
+    # to the heavier /radar-future-frame calls.
+    def handle_radar_future_meta(self):
+        if not HRRR_AVAILABLE:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "available": False,
+                "reason": "HRRR dependencies not installed on this proxy (pygrib/numpy)",
+            }).encode())
+            return
+        params = parse_qs(urlparse(self.path).query)
+        try:
+            lat = float(params.get('lat', [None])[0])
+            lon = float(params.get('lon', [None])[0])
+        except (TypeError, ValueError):
+            self.send_error(400, "lat and lon are required")
+            return
+        now_dt = datetime.now(timezone.utc)
+        for run_dt in _hrrr_candidate_runs(now_dt):
+            targets = _hrrr_future_targets(run_dt, now_dt, total_minutes=180)
+            if targets:
+                self.json_response({
+                    "available": True,
+                    "frames": [int(t['valid_dt'].timestamp() * 1000) for t in targets],
+                    "run_init_ms": int(run_dt.timestamp() * 1000),
+                    "source": "NOAA HRRR (High-Resolution Rapid Refresh) — composite reflectivity model forecast",
+                    "disclaimer": "Model forecast, not an observation — accuracy naturally decreases further out. Updates roughly hourly as new HRRR runs publish.",
+                })
+                return
+        self.json_response({"available": False, "reason": "no usable HRRR run schedule could be built"})
+
+    def handle_radar_future_frame(self):
+        """Serve one HRRR-forecast PNG for a specific target time. All
+        target times for a location are computed together (one run's worth
+        of fetches) and cached; a per-location lock means concurrent
+        requests for different steps of the SAME forecast share one
+        computation instead of each triggering a redundant set of NOMADS
+        fetches."""
+        if not HRRR_AVAILABLE:
+            self.send_response(503)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "HRRR forecast not available on this proxy"}).encode())
+            return
+        params = parse_qs(urlparse(self.path).query)
+        try:
+            lat = float(params.get('lat', [None])[0])
+            lon = float(params.get('lon', [None])[0])
+            t_ms = int(params.get('t', [None])[0])
+        except (TypeError, ValueError):
+            self.send_error(400, "lat, lon and t are required")
+            return
+        try:
+            w = max(60, min(int(params.get('w', ['300'])[0] or 300), 900))
+            h = max(60, min(int(params.get('h', ['220'])[0] or 220), 700))
+        except ValueError:
+            w, h = 300, 220
+
+        cache_key = f"hrrr-future:{round(lat,2)}:{round(lon,2)}:{w}x{h}"
+        result = _hrrr_cache_get(cache_key)
+        if result is None:
+            lock = _hrrr_compute_lock(cache_key)
+            with lock:
+                result = _hrrr_cache_get(cache_key)
+                if result is None:
+                    try:
+                        result = _compute_hrrr_future(lat, lon, w, h)
+                        _hrrr_cache_set(cache_key, result)
+                    except Exception as e:
+                        print(f"[hrrr] compute failed for lat={lat} lon={lon}: {e}", flush=True)
+                        self.send_response(502)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Access-Control-Allow-Origin", "*")
+                        self.end_headers()
+                        self.wfile.write(json.dumps({"error": f"HRRR forecast unavailable: {e}"}).encode())
+                        return
+
+        # Match the closest computed frame within a tolerance, rather than
+        # requiring an exact millisecond match — the frontend gets exact
+        # valid_ms values from /radar-future-meta so this should normally
+        # be exact, but a tolerance avoids a hard failure over a rounding
+        # difference between requests.
+        match = None
+        for f in result['frames']:
+            if abs(f['valid_ms'] - t_ms) < 8 * 60 * 1000:
+                match = f
+                break
+        if not match:
+            self.send_response(404)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "requested time is not in this run's forecast schedule"}).encode())
+            return
+
+        data = match['png']
+        self.send_response(200)
+        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Cache-Control", "public, max-age=600")
+        self.send_header("X-HRRR-Run-Init-Ms", str(result['run_init_ms']))
+        self.send_header("X-HRRR-Valid-Ms", str(match['valid_ms']))
+        self.end_headers()
+        self.wfile.write(data)
 
     # ── Yahoo Finance quoteSummary (no-crumb approach, works from home IPs) ──
 
@@ -4204,6 +4839,13 @@ if __name__ == "__main__":
     print(f"  Serving files from: {SERVE_DIR}")
     print(f"  Supports: Yahoo Finance · Multi-category News · Miner API · BTC Hashrate")
     print(f"  Financial data: Financial Modeling Prep (set FMP_API_KEY env var)")
+    if ProxyHandler._CARTO_API_KEY:
+        _carto_status = f"keyed, via {ProxyHandler._CARTO_API_KEY_SOURCE}"
+    else:
+        _carto_status = ("no key set — tiles show a watermark. Get one free at "
+                          "https://carto.com/basemaps/apikey, then either set CARTO_API_KEY "
+                          "or save it to a carto_api_key.txt file next to proxy.py")
+    print(f"  Radar basemap: CARTO ({_carto_status})")
     print(f"  Press Ctrl+C to stop")
     print(f"")
     with ThreadingHTTPServer(("127.0.0.1", PORT), ProxyHandler) as httpd:
