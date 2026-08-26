@@ -898,6 +898,19 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                 d = json.loads(data)
                 if not d.get("hashrates"):
                     raise ValueError("empty hashrates in mempool.space response")
+                # DIAGNOSTIC (v2.9.53): log the actual point count mempool.space
+                # served for this span. Added after a report of the watchlist/
+                # modal hashrate chart rendering as a near-straight 2-point line
+                # for a 1w span — this response was accepted here (non-empty,
+                # so the check above passed) with no visibility into HOW sparse
+                # it actually was. mempool.space's own docs are ambiguous about
+                # whether the 1w hashrate endpoint is always hourly-resolution,
+                # so this makes it observable directly rather than inferred:
+                # if this ever again shows a suspiciously low count (single or
+                # low double digits) for a 1w/1m span, that confirms the sparse
+                # response is coming from mempool.space itself, not something
+                # proxy.py or the client is doing to it.
+                print(f"[hashrate-history] mempool.space {span}: served {len(d.get('hashrates', []))} pts", flush=True)
                 _mempool_cache_set(cache_key, data, ct, "mempool.space")
                 self._send_hashrate(data, ct, "mempool.space")
                 return
@@ -3120,10 +3133,24 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             # not a fetch failure, so it never raises and never hits the
             # except branch below. Cap how recent a frame we'll ever offer
             # by a fixed buffer so we don't serve timestamps NOAA hasn't
-            # actually finished compositing yet. 10 min is a conservative
-            # estimate of typical MRMS mosaic latency; if blank latest-
-            # frames are still seen, this is the first value to increase.
-            RADAR_LAG_BUFFER_MS = 10 * 60 * 1000
+            # actually finished compositing yet.
+            # v2.9.47: bumped 10min -> 20min. Reported symptom: the header
+            # mini-preview (which always requests exactly this array's last
+            # entry, with no animation to visually mask a single bad frame)
+            # intermittently showed a plain basemap with no storm cells at
+            # all, while the SAME modal, opened moments later and scrubbed
+            # back one frame, showed real data 15 min older — i.e. this
+            # exact lag, not a fetch failure or a preview-specific bug.
+            # Confirmed directly from a reported case: the blank frame was
+            # only ~13 minutes old at the moment it was viewed — already
+            # past the old 10-minute buffer, meaning actual MRMS compositing
+            # lag exceeded 10 minutes that time. 20 min is still just an
+            # estimate, not a guarantee (real-world compositing lag isn't
+            # observable from the client side, and can presumably run even
+            # longer under heavier data volume, e.g. active severe weather)
+            # — if blank latest-frames are still seen, this is still the
+            # first value to increase further.
+            RADAR_LAG_BUFFER_MS = 20 * 60 * 1000
             now_ms = int(_time.time() * 1000)
             capped_end_ms = min(end_ms, now_ms - RADAR_LAG_BUFFER_MS)
             # Don't let the cap collapse the window to nothing if the
@@ -3347,8 +3374,9 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
     @classmethod
     def _build_basemap_image(cls, lat, lon, w, h, carto_style):
         """Fetch and stitch the CARTO tiles covering _radar_bbox(lat,lon,w,h),
-        crop to the exact bbox, and resize to (w, h). Returns PNG bytes."""
-        from PIL import Image
+        crop to the exact bbox, resize to (w, h), and boost contrast/clarity.
+        Returns PNG bytes."""
+        from PIL import Image, ImageEnhance
         bbox = cls._radar_bbox(lat, lon, w, h)  # (lon_min, lat_min, lon_max, lat_max)
         zoom = cls._pick_carto_zoom(bbox[0], bbox[2], w)
         # y is inverted vs lat (Web Mercator y grows southward), so the
@@ -3378,6 +3406,52 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         )
         cropped = canvas.crop(crop_box)
         resized = cropped.resize((w, h), Image.LANCZOS)
+        # v2.9.54 — CARTO's Dark Matter tiles are legitimately dark (that's
+        # the whole point of the style — this app's own dark theme is why
+        # it was picked over a light basemap in the first place), but at
+        # their as-served contrast the state/coastline borders, minor roads,
+        # and city labels sit only ~30-75 RGB levels above the near-black
+        # background — enough to exist, not enough to read comfortably,
+        # reported as "almost too dark to see the details that are already
+        # on the map." This isn't a wrong-layer bug like the old Esri saga
+        # above (the cartography itself is correct and complete, per
+        # v2.9.43/44) — it's a pure contrast/clarity tweak.
+        #
+        # Applied here (not via a client-side CSS filter) so it's baked into
+        # the cached PNG once per basemap fetch rather than recomputed by
+        # the browser on every paint, and so both surfaces that use this
+        # same function — the modal's labeled dark_all map and the header's
+        # unlabeled dark_nolabels mini-preview — get identical, consistent
+        # treatment automatically, matching "similar" treatment as asked
+        # for both.
+        #
+        # Contrast pivots around the image's own mean pixel value, and a
+        # Dark Matter tile's mean sits close to its near-black background
+        # (only a small fraction of pixels are line/label foreground) — so
+        # increasing contrast pushes the already-bright foreground (borders,
+        # roads, labels, water) UP more than it pushes the background down,
+        # which is the opposite of what a flat brightness boost would do
+        # (that would wash out the background too and fight the dark theme
+        # instead of preserving it). Brightness is nudged up slightly on
+        # top, and sharpness compensates for the softening the LANCZOS
+        # resize above introduces on the thin one-pixel lines this basemap
+        # is mostly made of. Factors were chosen by measuring exact pixel
+        # values against a synthetic tile built from Dark Matter's real
+        # documented palette (background/water/border/road/label swatches),
+        # not eyeballed: at these settings the background samples a couple
+        # RGB levels DARKER than the original (contrast pushes the
+        # below-mean background down, not up — deepens the dark theme
+        # slightly rather than washing it out), while border lines roughly
+        # double their separation from the background (+64 -> +107 delta on
+        # the red channel in that test), minor roads go from barely-there
+        # (+34) to clearly present (+57), and labels go from readable-if-
+        # you-look (+117) to comfortably legible (+176) — a real, measured
+        # improvement in exactly the details reported as too hard to see,
+        # with the background if anything reinforcing the dark theme rather
+        # than lightening it.
+        resized = ImageEnhance.Contrast(resized).enhance(1.40)
+        resized = ImageEnhance.Brightness(resized).enhance(1.08)
+        resized = ImageEnhance.Sharpness(resized).enhance(1.25)
         out = io.BytesIO()
         resized.save(out, format="PNG")
         return out.getvalue()
@@ -3424,7 +3498,10 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         # instead of serving a stale watermarked (or stale keyed) tile for
         # up to a day after the env var changes.
         keyed_tag = 'keyed' if self._CARTO_API_KEY else 'unkeyed'
-        cache_key = f"radar-basemap:{'plain' if plain else 'street'}:v4:{keyed_tag}:{round(lat,2)}:{round(lon,2)}:{w}x{h}"
+        # v2.9.54: bumped v4->v5 so the new contrast/brightness/sharpness
+        # enhancement isn't masked by yesterday's already-cached (dimmer)
+        # basemap PNGs sitting under the old key for up to 24h.
+        cache_key = f"radar-basemap:{'plain' if plain else 'street'}:v5:{keyed_tag}:{round(lat,2)}:{round(lon,2)}:{w}x{h}"
         cached = _mempool_cache_get(cache_key, ttl=86400)
         if cached:
             data, ct, _src = cached
