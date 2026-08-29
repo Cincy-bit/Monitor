@@ -23,6 +23,7 @@ from urllib.parse import urlparse, parse_qs, urljoin
 import http.client
 from email.utils import parsedate_to_datetime
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 PORT = 8082
 SERVE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -69,6 +70,11 @@ ssl_ctx.verify_mode = ssl.CERT_NONE
 # Tiny and short-lived — just avoids hitting NOAA's metadata endpoint on every
 # single /radar-meta poll when the underlying window barely moves.
 _RADAR_META_CACHE = {}
+
+# NWS grid-office lookup cache — see _nws_points() below. Grid assignment
+# for a fixed lat/lon is effectively permanent, so a long TTL is safe.
+_NWS_POINTS_CACHE = {}
+_NWS_POINTS_TTL = 7 * 24 * 3600
 
 # Article date cache: url -> first-seen ISO pubDate
 # Prevents re-stamped podcast/feature articles from always appearing as "just now"
@@ -3006,6 +3012,219 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         except Exception as e:
             self.json_response({"error": str(e), "html": "", "url": url})
 
+    # ── NWS (National Weather Service) augmentation ──────────────────────
+    #
+    # Reported: temperature/wind/humidity all noticeably diverging from
+    # Apple Weather for the same US location — confirmed NOT a coding bug
+    # (renderWxModal/wxCurrentObs pass Open-Meteo's fields through with no
+    # double conversion, no stale merge — the divergence is a genuine
+    # forecast-MODEL difference between Open-Meteo's default US blend and
+    # Apple's WeatherKit, which leans on NWS data for US points). Per
+    # explicit direction: temperature/wind/humidity/precipitation are now
+    # overridden with real NWS data (api.weather.gov, free, no key, US-only)
+    # for locations NWS covers, since that's the same source family behind
+    # most US weather apps. NWS has NO air-quality or UV-index data at all
+    # (AQI is EPA/AirNow's domain; UV isn't part of NWS's forecast product)
+    # — those two fields intentionally stay Open-Meteo-sourced regardless.
+    #
+    # Every step below is independently wrapped so ANY failure (non-US
+    # location, timeout, a station reporting nothing usable, an unexpected
+    # response shape) leaves the Open-Meteo baseline for that field
+    # completely untouched — this is a pure enhancement layer that can
+    # never take the widget down or blank out data Open-Meteo already
+    # supplied.
+    NWS_HEADERS = {"User-Agent": "personal-dashboard contact@example.com", "Accept": "application/geo+json"}
+    _NWS_COMPASS = {
+        'N': 0, 'NNE': 22.5, 'NE': 45, 'ENE': 67.5, 'E': 90, 'ESE': 112.5, 'SE': 135, 'SSE': 157.5,
+        'S': 180, 'SSW': 202.5, 'SW': 225, 'WSW': 247.5, 'W': 270, 'WNW': 292.5, 'NW': 315, 'NNW': 337.5,
+    }
+
+    def _nws_points(self, lat, lon):
+        """Resolve (lat,lon) -> NWS forecast/forecastHourly/observationStations
+        URLs, cached long-term (grid assignment is effectively permanent for
+        a fixed point). Returns None for out-of-US-coverage points or any
+        transient failure — caller treats that as "skip NWS entirely"."""
+        key = (round(lat, 3), round(lon, 3))
+        cached = _NWS_POINTS_CACHE.get(key)
+        if cached and (_time.time() - cached[0]) < _NWS_POINTS_TTL:
+            return cached[1]
+        try:
+            data = self._fetch_json(f"https://api.weather.gov/points/{lat:.4f},{lon:.4f}", headers=self.NWS_HEADERS)
+            props = data.get('properties') or {}
+            result = {
+                'forecast': props.get('forecast'),
+                'forecastHourly': props.get('forecastHourly'),
+                'observationStations': props.get('observationStations'),
+            }
+            if not (result['forecast'] and result['forecastHourly'] and result['observationStations']):
+                result = None
+        except urllib.error.HTTPError:
+            # 404 = genuinely outside NWS/US coverage — cache the negative
+            # result too, so a non-US location doesn't re-hit this every request.
+            result = None
+        except Exception as e:
+            print(f"[nws] points lookup failed for {lat},{lon}: {e}")
+            return None  # transient failure — don't cache, just retry next time
+        _NWS_POINTS_CACHE[key] = (_time.time(), result)
+        return result
+
+    def _nws_current_obs(self, points):
+        """Nearest real station's latest observation: temp/humidity/wind.
+        Returns None if the station has no usable fresh reading at all."""
+        try:
+            stations = self._fetch_json(points['observationStations'], headers=self.NWS_HEADERS)
+            feats = stations.get('features') or []
+            if not feats:
+                return None
+            station_id = feats[0]['properties']['stationIdentifier']
+            obs = self._fetch_json(f"https://api.weather.gov/stations/{station_id}/observations/latest", headers=self.NWS_HEADERS)
+            p = obs.get('properties') or {}
+
+            def val(field):
+                v = (p.get(field) or {}).get('value')
+                return v if isinstance(v, (int, float)) else None
+
+            temp_c = val('temperature')
+            rh = val('relativeHumidity')
+            wind_kmh = val('windSpeed')
+            wind_dir = val('windDirection')
+            if temp_c is None and rh is None and wind_kmh is None:
+                return None  # station reporting nothing usable — treat as a failed attempt
+            return {
+                'temperature_2m': round(temp_c * 9 / 5 + 32, 1) if temp_c is not None else None,
+                'relative_humidity_2m': round(rh) if rh is not None else None,
+                'wind_speed_10m': round(wind_kmh * 0.621371, 1) if wind_kmh is not None else None,
+                'wind_direction_10m': wind_dir,
+            }
+        except Exception as e:
+            print(f"[nws] current-obs failed: {e}")
+            return None
+
+    def _nws_apply_current(self, current, obs):
+        """Overwrites only the fields NWS actually returned a value for.
+        Returns True iff temperature was overwritten — the caller uses this
+        to decide whether Open-Meteo's minutely_15 blend (which otherwise
+        silently out-prioritizes this in wxCurrentObs()) needs dropping."""
+        temp_overwritten = False
+        for field in ('temperature_2m', 'relative_humidity_2m', 'wind_speed_10m', 'wind_direction_10m'):
+            v = obs.get(field)
+            if v is not None:
+                current[field] = v
+                if field == 'temperature_2m':
+                    temp_overwritten = True
+        return temp_overwritten
+
+    def _nws_hourly(self, points):
+        """Returns a list of (utc_epoch_seconds, tempF, windMph, windDirDeg,
+        popPercent) tuples from NWS's hourly forecast, or None on failure."""
+        try:
+            url = points['forecastHourly']
+            url += ('&' if '?' in url else '?') + 'units=us'
+            data = self._fetch_json(url, headers=self.NWS_HEADERS)
+            periods = (data.get('properties') or {}).get('periods') or []
+            out = []
+            for per in periods:
+                start = per.get('startTime')
+                if not start:
+                    continue
+                try:
+                    epoch = datetime.fromisoformat(start).timestamp()
+                except Exception:
+                    continue
+                temp = per.get('temperature')
+                if temp is not None and per.get('temperatureUnit') == 'C':
+                    temp = temp * 9 / 5 + 32
+                wind_mph = None
+                nums = [int(n) for n in re.findall(r'\d+', per.get('windSpeed') or '')]
+                if nums:
+                    wind_mph = max(nums)  # a gusty range like "5 to 10 mph" reports the higher bound
+                wind_dir = self._NWS_COMPASS.get((per.get('windDirection') or '').upper())
+                pop = (per.get('probabilityOfPrecipitation') or {}).get('value')
+                out.append((epoch, temp, wind_mph, wind_dir, pop))
+            return out or None
+        except Exception as e:
+            print(f"[nws] hourly fetch failed: {e}")
+            return None
+
+    def _nws_apply_hourly(self, om_hourly, nws_hourly, tz_name):
+        """Overlays NWS's per-hour temp/wind/precip-probability onto
+        Open-Meteo's own hourly arrays, matched by nearest timestamp within
+        a 40-minute tolerance (NWS periods land on the hour and should
+        align almost exactly with Open-Meteo's own hourly grid). An index
+        with no close-enough NWS point keeps Open-Meteo's original value —
+        e.g. NWS's hourly horizon is shorter than Open-Meteo's 7-day one."""
+        if not nws_hourly or not om_hourly.get('time'):
+            return
+        try:
+            tz = ZoneInfo(tz_name) if tz_name and tz_name != 'auto' else None
+        except Exception:
+            tz = None
+        if tz is None:
+            return  # can't safely align timestamps without a real IANA tz name
+        TOL = 40 * 60
+        for i, t_str in enumerate(om_hourly['time']):
+            try:
+                epoch = datetime.fromisoformat(t_str).replace(tzinfo=tz).timestamp()
+            except Exception:
+                continue
+            best, best_diff = None, None
+            for cand in nws_hourly:
+                diff = abs(cand[0] - epoch)
+                if diff <= TOL and (best_diff is None or diff < best_diff):
+                    best, best_diff = cand, diff
+            if best is None:
+                continue
+            _, temp, wind_mph, wind_dir, pop = best
+            if temp is not None:
+                om_hourly['temperature_2m'][i] = temp
+            if wind_mph is not None and 'wind_speed_10m' in om_hourly:
+                om_hourly['wind_speed_10m'][i] = wind_mph
+            if wind_dir is not None and 'wind_direction_10m' in om_hourly:
+                om_hourly['wind_direction_10m'][i] = wind_dir
+            if pop is not None and 'precipitation_probability' in om_hourly:
+                om_hourly['precipitation_probability'][i] = pop
+
+    def _nws_daily(self, points):
+        """Returns (highs_by_date, lows_by_date) dicts keyed by 'YYYY-MM-DD'
+        local calendar date, or (None, None) on failure. NWS's startTime
+        already carries the correct local UTC offset, so the date portion
+        (before 'T') IS the correct local calendar date — no timezone math
+        needed here."""
+        try:
+            url = points['forecast']
+            url += ('&' if '?' in url else '?') + 'units=us'
+            data = self._fetch_json(url, headers=self.NWS_HEADERS)
+            periods = (data.get('properties') or {}).get('periods') or []
+            highs, lows = {}, {}
+            for per in periods:
+                start = per.get('startTime') or ''
+                date = start[:10]
+                temp = per.get('temperature')
+                if not date or temp is None:
+                    continue
+                if per.get('temperatureUnit') == 'C':
+                    temp = temp * 9 / 5 + 32
+                if per.get('isDaytime'):
+                    highs[date] = temp
+                else:
+                    lows[date] = temp
+            if not highs and not lows:
+                return None, None
+            return highs, lows
+        except Exception as e:
+            print(f"[nws] daily fetch failed: {e}")
+            return None, None
+
+    def _nws_apply_daily(self, om_daily, highs, lows):
+        dates = om_daily.get('time') or []
+        maxes = om_daily.get('temperature_2m_max')
+        mins = om_daily.get('temperature_2m_min')
+        for i, date in enumerate(dates):
+            if maxes is not None and highs and date in highs:
+                maxes[i] = highs[date]
+            if mins is not None and lows and date in lows:
+                mins[i] = lows[date]
+
     def handle_weather(self):
         """Fetch weather from Open-Meteo (free, no API key) using ZIP or lat/lon."""
         params = parse_qs(urlparse(self.path).query)
@@ -3065,6 +3284,39 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             wx['location'] = location_name
             wx['lat'] = lat
             wx['lon'] = lon
+
+            # ── NWS augmentation (temp/wind/humidity/precip only — see the
+            # helper methods above for full rationale). Never allowed to
+            # affect the response if anything about it fails.
+            try:
+                pts = self._nws_points(lat, lon)
+            except Exception as e:
+                print(f"[nws] augmentation skipped: {e}")
+                pts = None
+            if pts:
+                try:
+                    cur_obs = self._nws_current_obs(pts)
+                    if cur_obs and wx.get('current') is not None:
+                        if self._nws_apply_current(wx['current'], cur_obs):
+                            wx.pop('minutely_15', None)
+                except Exception as e:
+                    print(f"[nws] current-obs step failed: {e}")
+                try:
+                    hourly_list = self._nws_hourly(pts)
+                    if hourly_list and wx.get('hourly'):
+                        self._nws_apply_hourly(wx['hourly'], hourly_list, wx.get('timezone'))
+                except Exception as e:
+                    print(f"[nws] hourly step failed: {e}")
+                try:
+                    highs, lows = self._nws_daily(pts)
+                    if wx.get('daily'):
+                        self._nws_apply_daily(wx['daily'], highs, lows)
+                except Exception as e:
+                    print(f"[nws] daily step failed: {e}")
+                wx['nws_augmented'] = True
+            else:
+                wx['nws_augmented'] = False
+
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
