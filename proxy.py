@@ -16,6 +16,7 @@ import html
 import threading
 import io
 import time as _time
+import tempfile
 from socketserver import ThreadingMixIn
 import urllib.parse
 from urllib.parse import urlparse, parse_qs, urljoin
@@ -700,8 +701,33 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length)
             miners = json.loads(body)
-            with open(self.MINERS_FILE, "w") as f:
-                json.dump(miners, f)
+            # Write atomically: a concurrent GET (handle_miners_get, running
+            # on its own thread — this server is a ThreadingHTTPServer) can
+            # land in the middle of a plain `open(path,"w")`, which truncates
+            # the file to empty the instant it's opened, before json.dump has
+            # written anything back. A GET landing in that window would read
+            # an empty/partial file. The client already tolerates a failed or
+            # unparseable /miners response by keeping its existing in-memory
+            # miner list (see loadMinersFromServer's catch block), so this
+            # specific race was never observed to actually wipe the miner
+            # list client-side — but it's still a real, cheaply-avoided race
+            # on the file itself (found while investigating a related report
+            # of miners briefly appearing disconnected). Standard fix: write
+            # to a temp file in the same directory, then atomically replace
+            # the real file — a reader can only ever see the fully-old or
+            # fully-new content, never a partial write.
+            fd, tmp_path = tempfile.mkstemp(
+                dir=os.path.dirname(self.MINERS_FILE) or ".",
+                prefix=".miners.", suffix=".tmp"
+            )
+            try:
+                with os.fdopen(fd, "w") as f:
+                    json.dump(miners, f)
+                os.replace(tmp_path, self.MINERS_FILE)
+            except Exception:
+                try: os.unlink(tmp_path)
+                except OSError: pass
+                raise
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
