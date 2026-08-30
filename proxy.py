@@ -3034,6 +3034,19 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
     # never take the widget down or blank out data Open-Meteo already
     # supplied.
     NWS_HEADERS = {"User-Agent": "personal-dashboard contact@example.com", "Accept": "application/geo+json"}
+    # Per-call timeout for the individual api.weather.gov requests below
+    # (shorter than _fetch_json's generic 15s default used elsewhere in
+    # this file), plus a total wall-clock budget for the whole augmentation
+    # pass (points lookup + current-obs + hourly + daily combined) — see
+    # the ROOT CAUSE note above this class for why an unbounded chain of
+    # otherwise well-intentioned per-step timeouts could still add up to
+    # far more latency than a client is willing to wait on, even though
+    # every individual step was "only" 15s and every step already degrades
+    # gracefully on outright failure. _nws_points' own successful lookup is
+    # 7-day cached, so in practice this budget is only fully exercised on a
+    # cold cache for a given location.
+    _NWS_CALL_TIMEOUT = 5
+    _NWS_TOTAL_BUDGET = 8.0
     _NWS_COMPASS = {
         'N': 0, 'NNE': 22.5, 'NE': 45, 'ENE': 67.5, 'E': 90, 'ESE': 112.5, 'SE': 135, 'SSE': 157.5,
         'S': 180, 'SSW': 202.5, 'SW': 225, 'WSW': 247.5, 'W': 270, 'WNW': 292.5, 'NW': 315, 'NNW': 337.5,
@@ -3049,7 +3062,7 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         if cached and (_time.time() - cached[0]) < _NWS_POINTS_TTL:
             return cached[1]
         try:
-            data = self._fetch_json(f"https://api.weather.gov/points/{lat:.4f},{lon:.4f}", headers=self.NWS_HEADERS)
+            data = self._fetch_json(f"https://api.weather.gov/points/{lat:.4f},{lon:.4f}", headers=self.NWS_HEADERS, timeout=self._NWS_CALL_TIMEOUT)
             props = data.get('properties') or {}
             result = {
                 'forecast': props.get('forecast'),
@@ -3072,12 +3085,12 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         """Nearest real station's latest observation: temp/humidity/wind.
         Returns None if the station has no usable fresh reading at all."""
         try:
-            stations = self._fetch_json(points['observationStations'], headers=self.NWS_HEADERS)
+            stations = self._fetch_json(points['observationStations'], headers=self.NWS_HEADERS, timeout=self._NWS_CALL_TIMEOUT)
             feats = stations.get('features') or []
             if not feats:
                 return None
             station_id = feats[0]['properties']['stationIdentifier']
-            obs = self._fetch_json(f"https://api.weather.gov/stations/{station_id}/observations/latest", headers=self.NWS_HEADERS)
+            obs = self._fetch_json(f"https://api.weather.gov/stations/{station_id}/observations/latest", headers=self.NWS_HEADERS, timeout=self._NWS_CALL_TIMEOUT)
             p = obs.get('properties') or {}
 
             def val(field):
@@ -3120,7 +3133,7 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         try:
             url = points['forecastHourly']
             url += ('&' if '?' in url else '?') + 'units=us'
-            data = self._fetch_json(url, headers=self.NWS_HEADERS)
+            data = self._fetch_json(url, headers=self.NWS_HEADERS, timeout=self._NWS_CALL_TIMEOUT)
             periods = (data.get('properties') or {}).get('periods') or []
             out = []
             for per in periods:
@@ -3193,7 +3206,7 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         try:
             url = points['forecast']
             url += ('&' if '?' in url else '?') + 'units=us'
-            data = self._fetch_json(url, headers=self.NWS_HEADERS)
+            data = self._fetch_json(url, headers=self.NWS_HEADERS, timeout=self._NWS_CALL_TIMEOUT)
             periods = (data.get('properties') or {}).get('periods') or []
             highs, lows = {}, {}
             for per in periods:
@@ -3288,12 +3301,14 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             # ── NWS augmentation (temp/wind/humidity/precip only — see the
             # helper methods above for full rationale). Never allowed to
             # affect the response if anything about it fails.
+            nws_start = _time.time()
             try:
                 pts = self._nws_points(lat, lon)
             except Exception as e:
                 print(f"[nws] augmentation skipped: {e}")
                 pts = None
             if pts:
+                nws_deadline = nws_start + self._NWS_TOTAL_BUDGET
                 try:
                     cur_obs = self._nws_current_obs(pts)
                     if cur_obs and wx.get('current') is not None:
@@ -3301,18 +3316,24 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                             wx.pop('minutely_15', None)
                 except Exception as e:
                     print(f"[nws] current-obs step failed: {e}")
-                try:
-                    hourly_list = self._nws_hourly(pts)
-                    if hourly_list and wx.get('hourly'):
-                        self._nws_apply_hourly(wx['hourly'], hourly_list, wx.get('timezone'))
-                except Exception as e:
-                    print(f"[nws] hourly step failed: {e}")
-                try:
-                    highs, lows = self._nws_daily(pts)
-                    if wx.get('daily'):
-                        self._nws_apply_daily(wx['daily'], highs, lows)
-                except Exception as e:
-                    print(f"[nws] daily step failed: {e}")
+                if _time.time() < nws_deadline:
+                    try:
+                        hourly_list = self._nws_hourly(pts)
+                        if hourly_list and wx.get('hourly'):
+                            self._nws_apply_hourly(wx['hourly'], hourly_list, wx.get('timezone'))
+                    except Exception as e:
+                        print(f"[nws] hourly step failed: {e}")
+                else:
+                    print(f"[nws] hourly step skipped: over {self._NWS_TOTAL_BUDGET}s augmentation budget")
+                if _time.time() < nws_deadline:
+                    try:
+                        highs, lows = self._nws_daily(pts)
+                        if wx.get('daily'):
+                            self._nws_apply_daily(wx['daily'], highs, lows)
+                    except Exception as e:
+                        print(f"[nws] daily step failed: {e}")
+                else:
+                    print(f"[nws] daily step skipped: over {self._NWS_TOTAL_BUDGET}s augmentation budget")
                 wx['nws_augmented'] = True
             else:
                 wx['nws_augmented'] = False
@@ -3948,13 +3969,13 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
 
     # ── Financial data via SEC EDGAR + Stockanalysis (no API key, no rate limits) ──
 
-    def _fetch_json(self, url, headers=None):
+    def _fetch_json(self, url, headers=None, timeout=15):
         """Simple JSON fetch helper."""
         h = {"User-Agent": "Mozilla/5.0 (compatible; personal-dashboard/1.0)", "Accept": "application/json"}
         if headers:
             h.update(headers)
         req = urllib.request.Request(url, headers=h)
-        with urllib.request.urlopen(req, context=ssl_ctx, timeout=15) as r:
+        with urllib.request.urlopen(req, context=ssl_ctx, timeout=timeout) as r:
             return json.loads(r.read())
 
     def _get_cik(self, sym):
